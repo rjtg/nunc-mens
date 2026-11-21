@@ -19,7 +19,7 @@ Acceptance: `cargo run -- --help` and `cargo test` work from a clean checkout.
 - [ ] Roundtrip tests for Unicode, newlines, fenced code, duplicate text and concurrent writes.
 - [ ] **Dogfood:** create a temporary journal and log at least one actual implementation decision with the compiled CLI.
 
-Acceptance: writes are durable, human-readable, lossless and independent of Ollama.
+Acceptance: writes are durable, human-readable, lossless and independent of model inference.
 
 ## M2 — Searchable local index
 
@@ -29,17 +29,18 @@ Acceptance: writes are durable, human-readable, lossless and independent of Olla
 - [ ] Keyword `search --mode keyword`, `--limit`, and machine-readable `--json`.
 - [ ] **Dogfood:** search the M1 decision and verify stable ID and source path.
 
-Acceptance: empty/new journals work; deleted index can be rebuilt; exact tokens and identifiers are searchable without Ollama.
+Acceptance: empty/new journals work; deleted index can be rebuilt; exact tokens and identifiers are searchable without cached model files.
 
 ## M3 — Local semantics + hybrid search
 
-- [ ] Ollama embed client and test doubles; document required model setup.
+- [ ] Integrate Rust `fastembed` with a pinned, verified multilingual ONNX model and deterministic test doubles; document ONNX Runtime platform constraints.
+- [ ] Implement explicit `nunc models download` with a configurable local cache. Other commands must never trigger model downloads.
 - [ ] Generate/store vectors, record model and dimension, reject mismatches.
 - [ ] Cosine-ranked semantic search and hybrid fusion with keyword candidates.
-- [ ] Explicit fallbacks and actionable error messages when Ollama is offline.
-- [ ] **Dogfood:** search a real development note with paraphrased wording; report whether actual Ollama inference was available.
+- [ ] Explicit fallbacks and actionable error messages when the model is absent or fails to load.
+- [ ] **Dogfood:** search a real development note with paraphrased wording; report whether actual in-process fastembed inference was executed.
 
-Acceptance: semantic/hybrid search works when configured; keyword mode remains available when Ollama is absent; JSON identifies used mode.
+Acceptance: semantic/hybrid search works with a cached model; keyword mode remains available without any model files; JSON identifies used mode.
 
 ## M4 — Agent-ready release
 

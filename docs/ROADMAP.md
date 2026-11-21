@@ -23,29 +23,29 @@ Acceptance: writes are durable, human-readable, lossless and independent of mode
 
 ## M2 — Searchable local index
 
-- [ ] SQLite entry storage + FTS5 and schema migration/version marker.
+- [ ] SQLite entry/chunk storage with `f32` vector BLOBs and schema migration/version marker.
 - [ ] Parser of per-entry Markdown files and configured read-only sources; incremental `reindex` and `reindex --full`.
 - [ ] Handle file edits/deletions, stable IDs, stale-index diagnostics, safe full rebuild.
-- [ ] Keyword `search --mode keyword`, `--limit`, and machine-readable `--json`.
+- [ ] Semantic `search`, `--limit`, and machine-readable `--json` (requires cached model).
 - [ ] **Dogfood:** search the M1 decision and verify stable ID and source path.
 
-Acceptance: empty/new journals work; deleted index can be rebuilt; exact tokens and identifiers are searchable without cached model files.
+Acceptance: empty/new journals work; deleted index can be rebuilt; capture remains available without cached model files; search errors clearly until model is downloaded and records indexed.
 
-## M3 — Local semantics + hybrid search
+## M3 — Local fastembed semantic search
 
 - [ ] Integrate Rust `fastembed` with a pinned, verified multilingual ONNX model and deterministic test doubles; document ONNX Runtime platform constraints.
 - [ ] Implement explicit `nunc models download` with a configurable local cache. Other commands must never trigger model downloads.
 - [ ] Generate/store vectors, record model and dimension, reject mismatches.
-- [ ] Cosine-ranked semantic search and hybrid fusion with keyword candidates.
-- [ ] Explicit fallbacks and actionable error messages when the model is absent or fails to load.
+- [ ] Cosine-ranked semantic search with linear scan over SQLite-stored vectors.
+- [ ] Actionable errors when the model is absent or fails to load; writes persist and pending records can be indexed later.
 - [ ] **Dogfood:** search a real development note with paraphrased wording; report whether actual in-process fastembed inference was executed.
 
-Acceptance: semantic/hybrid search works with a cached model; keyword mode remains available without any model files; JSON identifies used mode.
+Acceptance: semantic search works with a cached model; writes remain available without model files; JSON identifies semantic mode.
 
 ## M4 — Agent-ready release
 
 - [ ] `doctor`, usage documentation and configuration examples.
-- [ ] Integration tests for errors, corrupt entries, no backend and JSON stability.
+- [ ] Integration tests for errors, corrupt entries, missing model and JSON stability.
 - [ ] CI, lint, release/build instructions, benchmark notes if measured.
 - [ ] Test that an agent can log a decision, reindex, find it later, and cite the file and entry ID.
 
@@ -54,4 +54,7 @@ Acceptance: README commands are genuine runnable commands; publish a concise ver
 ## Future ideas (not required for MVP)
 
 Optional MCP adapter, fast ANN index if measured scale demands it, configurable alternative embedding providers, contextual chunking for longer notes, and a `nunc sync` alias if it becomes valuable. Do not implement speculatively.
-NaN
+
+## MVP index location and search decision
+
+The index is **not inside Git**: `$XDG_STATE_HOME/nunc-mens/<repo-id>/index.sqlite3` (default `~/.local/state/nunc-mens/<repo-id>/index.sqlite3`), with model cache under XDG cache. `fastembed` generates embeddings but does not provide a search index. SQLite stores vector BLOBs, text and provenance; Rust scans vectors and ranks by cosine similarity. **Remove FTS5/BM25, keyword/hybrid modes and keyword fallback from MVP.** Add tests for top-k cosine ranking, model mismatch/dimensions, missing model, pending indexing, rebuild from files and repo separation. `nunc models download` is the only network-enabled model command.

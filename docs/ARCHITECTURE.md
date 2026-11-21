@@ -2,7 +2,7 @@
 
 ## Scope
 
-A minimal shell-accessible memory tool, built in Rust, for a human and coding agents. Authoritative data is human-readable Markdown; an optional local embedding service improves search relevance. **MCP support is deliberately out of scope for MVP.**
+A minimal shell-accessible memory tool, built in Rust, for a human and coding agents. Authoritative data is human-readable Markdown; an optional cached ONNX embedding model, executed in-process via Rust `fastembed`, improves search relevance. **MCP support is deliberately out of scope for MVP.**
 
 ## Data flow
 
@@ -27,7 +27,7 @@ Daily files: `YYYY-MM-DD.md`, sorted by timestamp and insertion order; no automa
 
 ## Embedding interface
 
-Start with HTTP calls to **locally configured Ollama**, using its current `/api/embed` request/response model. Provider should be isolated behind a trait or small module for tests and future replacement. Default local URL `http://127.0.0.1:11434`; never send private text to public services by default. Embeddings are optional for write and keyword operations; failures must be visible.
+Use the **Rust `fastembed` crate** to load a small multilingual Hugging Face ONNX embedding model directly in the CLI process (ONNX Runtime is a native dependency). No Ollama, embedding server, HTTP inference or daemon. Pin the model ID and revision after verifying support in the chosen crate version. Cache models locally; only the explicit `nunc models download` command may access the network to fetch model artifacts. `log`, `reindex`, `search`, and `doctor` never download. Keep the embedding interface isolated for deterministic tests. Logging and keyword search never need model files. Model loading may incur startup latency; lazy-load only for indexing and semantic/hybrid queries.
 
 ## Ranking
 
@@ -36,7 +36,7 @@ Keyword = SQLite FTS5 BM25. Semantic = query embedding + cosine similarity over 
 ## Explicit non-goals for MVP
 
 - MCP server or background process
-- Hosted/vector SaaS, remote telemetry and auto-sync
+- Hosted/vector SaaS, remote telemetry, Ollama and auto-sync
 - QMD dependency or heavy local reranking LLM
 - Distributed multiuser journal, cloud backup, automatic AI summarization
 - Automatic indexing of arbitrary directories
@@ -44,4 +44,4 @@ Keyword = SQLite FTS5 BM25. Semantic = query embedding + cosine similarity over 
 
 ## Implementation guidance
 
-Keep dependency and binary footprint modest; synchronous HTTP is adequate. Ensure no network/model dependency for fast capture, good error messages, and fully isolated unit/integration tests. Document actual latency and footprint only after measuring, not as promises.
+Keep dependency and binary footprint modest; check ONNX Runtime distribution, model licensing and cross-platform build support. Ensure no network/model dependency for fast capture, good error messages, and fully isolated unit/integration tests. Document actual latency and footprint only after measuring, not as promises.

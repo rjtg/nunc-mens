@@ -47,6 +47,8 @@ nunc consolidate candidates "deploy clock synchronization" --json
 
 Use `consolidate apply` to save a summary you provide and archive its originals. Use `search --raw` to inspect archived history. `forget --dry-run` shows dependencies before an explicit deletion. To back up these relationships, retain both your Markdown entries and `.nunc/ledger.json`. [CLI reference](docs/CLI.md)
 
+If the disposable index is out of sync, run `nunc doctor --deep` or preview repair with `nunc repair --dry-run`.
+
 ## Build and test
 
 Use Rust 1.89 or newer, Git, a C/C++ toolchain, and the system TLS development libraries (OpenSSL on Linux). The default ONNX Runtime build targets are glibc Linux on x86-64 or AArch64 and macOS on Apple Silicon. The first build may retrieve the CPU ONNX Runtime distribution. Runtime model downloads are initiated separately by `nunc models download`.

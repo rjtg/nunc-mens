@@ -127,7 +127,19 @@ enum Action {
     /// Show repository and data paths.
     Status,
     /// Check local configuration and prerequisites.
-    Doctor,
+    Doctor {
+        #[arg(long)]
+        deep: bool,
+        #[arg(long, requires = "deep")]
+        json: bool,
+    },
+    /// Inspect and reconcile the disposable search index.
+    Repair {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -425,7 +437,16 @@ fn execute(action: Action) -> Result<()> {
         } => {
             println!("Model available at {}", model::download(&repo)?.display());
         }
-        Action::Status | Action::Doctor => status(&repo, matches!(action, Action::Doctor))?,
+        Action::Status => status(&repo, false)?,
+        Action::Doctor { deep: false, .. } => status(&repo, true)?,
+        Action::Doctor { deep: true, json } => {
+            crate::index::health::run(&repo, false, false)?
+                .print(&mut io::stdout().lock(), json)?;
+        }
+        Action::Repair { dry_run, json } => {
+            crate::index::health::run(&repo, true, dry_run)?
+                .print(&mut io::stdout().lock(), json)?;
+        }
     }
     Ok(())
 }

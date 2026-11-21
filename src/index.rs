@@ -13,6 +13,9 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+#[path = "index_health.rs"]
+pub(crate) mod health;
+
 const INDEX_NAME: &str = "index.sqlite3";
 const VERSION: u32 = 2;
 const BATCH: usize = 16;
@@ -343,33 +346,16 @@ fn update_rows(
             }
         };
         report.documents += layout.len();
-        let mut occurrences = HashMap::new();
         let mut changed = Vec::new();
-        for chunk in &layout {
-            let text = parent
-                .text
-                .get(chunk.span.clone())
-                .context("invalid cached chunk span")?;
-            let digest = hash(text.as_bytes());
-            let occurrence = occurrences.entry(digest.clone()).or_insert(0);
-            let id = format!(
-                "chunk:{}",
-                hash(format!("{id}\0{digest}\0{occurrence}").as_bytes())
-            );
-            *occurrence += 1;
-            transaction.execute("INSERT INTO seen VALUES (?1)", [&id])?;
+        for data in chunk_rows(parent, &layout)? {
+            transaction.execute("INSERT INTO seen VALUES (?1)", [&data.provenance.id])?;
             let existing: Option<Vec<u8>> = transaction
                 .query_row(
                     "SELECT vector FROM documents WHERE hash=?1 LIMIT 1",
-                    [&digest],
+                    [&data.provenance.content_hash],
                     |row| row.get(0),
                 )
                 .optional()?;
-            let data = ChunkData {
-                provenance: MatchedChunk::new(id, digest, parent, chunk),
-                text,
-                chunk,
-            };
             if let Some(vector) = existing {
                 store(&transaction, parent, &data, &vector)?;
             } else {
@@ -409,6 +395,32 @@ struct ChunkData<'a> {
     provenance: MatchedChunk,
     text: &'a str,
     chunk: &'a Chunk,
+}
+
+fn chunk_rows<'a>(parent: &'a Document, layout: &'a [Chunk]) -> Result<Vec<ChunkData<'a>>> {
+    let parent_id = &parent.provenance.id;
+    let mut occurrences = HashMap::new();
+    layout
+        .iter()
+        .map(|chunk| {
+            let text = parent
+                .text
+                .get(chunk.span.clone())
+                .context("invalid cached chunk span")?;
+            let digest = hash(text.as_bytes());
+            let occurrence = occurrences.entry(digest.clone()).or_insert(0);
+            let id = format!(
+                "chunk:{}",
+                hash(format!("{parent_id}\0{digest}\0{occurrence}").as_bytes())
+            );
+            *occurrence += 1;
+            Ok(ChunkData {
+                provenance: MatchedChunk::new(id, digest, parent, chunk),
+                text,
+                chunk,
+            })
+        })
+        .collect()
 }
 
 fn store(

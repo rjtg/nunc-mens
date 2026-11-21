@@ -59,7 +59,7 @@ pub(crate) struct Provenance {
     pub visibility: Option<Visibility>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct MatchedChunk {
     pub id: String,
     pub parent_id: String,

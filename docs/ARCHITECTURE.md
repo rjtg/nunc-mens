@@ -40,3 +40,7 @@ Freshness checks and polling reread eligible files. Search scans selected vector
 - Undo toggles the durable association and leaves the summary raw-only. Nested associations retain history. A forgotten source remains an ID marker with no retained body.
 - Forget commits all tombstones together before removing any files or index rows. If interrupted, search and import consult the tombstone immediately. Retry forget or run reindex to remove pending files and rows. Physical erasure and copies outside the selected entries are outside this guarantee.
 - Reindex refreshes SQLite from surviving Markdown and configured sources. Archive status comes from the ledger in both normal and raw search. Back up the ledger with entry Markdown to preserve state.
+
+## Index health
+
+The deep audit acquires existing shared locks without creating runtime files. It derives expected chunk IDs and content from the same layout and identity code used by reindex. Ledger validity is checked independently of SQLite integrity. Repairs take locks in the same order as reindex and rebuild through the same staged database publication path. Offline repair removes known bad derived rows transactionally and leaves missing vectors pending. Authoritative files remain untouched, and visibility continues to come from the ledger in every search.

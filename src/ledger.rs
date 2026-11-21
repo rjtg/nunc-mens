@@ -146,6 +146,16 @@ impl Ledger {
         Ok(archives)
     }
 
+    pub(crate) fn lineage(&self) -> impl Iterator<Item = (Uuid, &[Uuid])> + '_ {
+        self.summaries
+            .iter()
+            .map(|(&id, summary)| (id, summary.sources.as_slice()))
+    }
+
+    pub(crate) fn tombstones(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.forgotten.keys().copied()
+    }
+
     pub fn forgotten(&self, id: Uuid) -> bool {
         self.forgotten.contains_key(&id)
     }

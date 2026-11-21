@@ -1136,3 +1136,147 @@ fn upgrades_default_privacy_ignore_without_overwriting_custom_rules() -> Result<
     assert_eq!(fs::read_to_string(&ignore)?, "custom-pattern\n");
     Ok(())
 }
+
+#[test]
+fn index_health_dry_run_on_fresh_worktree_creates_nothing() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let report = fixture.json(&["repair", "--dry-run", "--json"])?;
+    assert_eq!(report["index_state"], "missing");
+    assert_eq!(report["findings"]["INDEX_MISSING"]["count"], 1);
+    assert!(!fixture.local().exists());
+    assert!(!fixture.state.exists());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn audit_and_repair_disposable_index_while_preserving_durable_visibility() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let archived = fixture.log_id("Archived memory on project coordination.")?;
+    let forgotten = fixture.log_id("Forgotten memory on project coordination.")?;
+    let summary = fixture.summary(&archived, "Summary of project coordination.")?;
+    let active = fixture.log_id("Active memory on project coordination.")?;
+    fs::write(
+        fixture.repo.join("known.md"),
+        "# Coordination\n\nLocal sources for the coordination design.",
+    )?;
+    fixture.run(&["reindex", "--source", "known.md"])?;
+    let healthy = fixture.json(&["doctor", "--deep", "--json"])?;
+    assert_eq!(healthy["action"], "none");
+    assert_eq!(healthy["findings"], serde_json::json!({}));
+
+    let index = fs::read_dir(&fixture.state)?
+        .next()
+        .context("missing state")??
+        .path()
+        .join("index.sqlite3");
+    let conn = rusqlite::Connection::open(&index)?;
+    let mut record = conn.prepare("SELECT id FROM documents WHERE parent_id=?1")?;
+    let active_chunk: String = record.query_row([&active], |row| row.get(0))?;
+    drop(record);
+    conn.execute(
+        "UPDATE documents SET vector=X'01' WHERE parent_id=?1",
+        [&archived],
+    )?;
+    conn.execute("DELETE FROM documents WHERE id=?1", [&active_chunk])?;
+    conn.execute(
+        "UPDATE documents SET line_end=999 WHERE parent_id=?1",
+        [&summary],
+    )?;
+    drop(conn);
+    fs::remove_file(fixture.repo.join("known.md"))?;
+    // Simulate interruption after a tombstone but before unlinking the Markdown
+    // or pruning its indexed vector.
+    let ledger = fixture.local().join("ledger.json");
+    let mut data: Value = serde_json::from_slice(&fs::read(&ledger)?)?;
+    data["forgotten"][&forgotten] = serde_json::json!({});
+    fs::write(&ledger, serde_json::to_vec(&data)?)?;
+    let durable = fs::read(&ledger)?;
+    let archived_bytes = fixture.entry_bytes(&archived)?;
+    let forgotten_bytes = fixture.entry_bytes(&forgotten)?;
+    let index_bytes = fs::read(&index)?;
+    let dry = fixture.json(&["repair", "--dry-run", "--json"])?;
+    for code in [
+        "INVALID_EMBEDDING",
+        "MISSING_CHUNK",
+        "STALE_CHUNK",
+        "ORPHAN_PARENT",
+        "FORGOTTEN_INDEX_ROWS",
+        "FORGET_FILE_PENDING",
+    ] {
+        assert!(
+            dry["findings"][code]["count"]
+                .as_u64()
+                .is_some_and(|n| n > 0),
+            "missing {code}"
+        );
+    }
+    assert_eq!(fs::read(&index)?, index_bytes);
+
+    let cache = std::mem::replace(&mut fixture.cache, fixture._dir.path().join("empty-cache"));
+    let offline = fixture.json(&["repair", "--json"])?;
+    assert_eq!(offline["action"], "removed_stale_rows_embeddings_pending");
+    let conn = rusqlite::Connection::open(&index)?;
+    for id in [&forgotten, &archived, &summary] {
+        let count: usize = conn.query_row(
+            "SELECT count(*) FROM documents WHERE parent_id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0);
+    }
+    drop(conn);
+    fixture.cache = cache;
+
+    let mut writer = fixture
+        .nunc(&["log", "Concurrent durable memory"])
+        .stdout(Stdio::null())
+        .spawn()?;
+    let rebuilt = fixture.json(&["repair", "--json"])?;
+    assert!(writer.wait()?.success());
+    assert_eq!(rebuilt["action"], "rebuilt_index");
+    assert_eq!(fs::read(&ledger)?, durable);
+    assert_eq!(fixture.entry_bytes(&archived)?, archived_bytes);
+    assert_eq!(fixture.entry_bytes(&forgotten)?, forgotten_bytes);
+    let final_report = fixture.json(&["repair", "--json"])?;
+    // A direct log may race with the first snapshot and get picked up by this run.
+    assert!(matches!(
+        final_report["action"].as_str(),
+        Some("none" | "rebuilt_index")
+    ));
+    assert_eq!(fixture.json(&["repair", "--json"])?["action"], "none");
+    let normal = fixture.json(&["search", "--json", "--limit", "30", "project coordination"])?;
+    let raw = fixture.json(&[
+        "search",
+        "--raw",
+        "--json",
+        "--limit",
+        "30",
+        "project coordination",
+    ])?;
+    assert!(
+        normal["results"]
+            .as_array()
+            .context("results")?
+            .iter()
+            .all(|hit| hit["id"] != archived && hit["id"] != forgotten)
+    );
+    let all = raw["results"].as_array().context("raw results")?;
+    assert!(
+        all.iter()
+            .any(|hit| hit["id"] == archived && hit["status"] == "archived")
+    );
+    assert!(all.iter().all(|hit| hit["id"] != forgotten));
+
+    fs::write(&index, b"corrupted SQLite file")?;
+    assert_eq!(
+        fixture.json(&["doctor", "--deep", "--json"])?["findings"]["INDEX_UNREADABLE"]["count"],
+        1
+    );
+    assert_eq!(
+        fixture.json(&["repair", "--json"])?["action"],
+        "rebuilt_index"
+    );
+    Ok(())
+}

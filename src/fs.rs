@@ -83,6 +83,22 @@ pub(crate) fn lockfile(path: &Path) -> Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("open lock {}", path.display()))?;
+    validate_lock(file, path)
+}
+
+pub(crate) fn existing_lockfile(path: &Path) -> Result<Option<File>> {
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => validate_lock(file, path).map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("open lock {}", path.display())),
+    }
+}
+
+fn validate_lock(file: File, path: &Path) -> Result<File> {
     let meta = file.metadata()?;
     ensure!(
         meta.is_file() && meta.uid() == effective_uid() && meta.mode() & 0o077 == 0,

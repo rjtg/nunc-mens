@@ -115,3 +115,18 @@ Forget validates every target, warns about direct and transitive dependent summa
 `Saved <id> <path>` means the Markdown file was durably published. `Queued for FIFO delivery` confirms the client wrote its frame to the FIFO. Use `log` when the caller requires a durable receipt.
 
 Exit status is 0 on success, 2 for CLI syntax or argument parsing errors, and 1 for invalid input detected after parsing or operational failures. Model, database, and filesystem errors go to stderr.
+
+## Diagnose and repair the search index
+
+```sh
+nunc doctor --deep
+nunc doctor --deep --json
+nunc repair --dry-run --json
+nunc repair
+```
+
+Deep diagnostics and repair dry runs open the index read-only and do not download the model. They compare the durable snapshot with indexed parents, chunk identities and hashes, path and line provenance, and embedding shape and validity. The audit also checks ledger lineage and reports leftover files from interrupted forget operations. JSON includes stable finding codes, severities, counts, sample identifiers, and the proposed action. Findings are a report and can be present when the command exits successfully.
+
+Repair rebuilds the disposable SQLite index atomically when the cached model is available. When inference is unavailable, it can remove demonstrably stale, orphaned, invalid, or forgotten rows from a compatible index. Run `nunc models download` if needed, then retry repair to restore missing vectors. A malformed ledger or a missing consolidation target requires manual restoration or correction. The index uses rollback journaling. Unexpected WAL or shared-memory files require inspection before repair will replace the index. Repair does not edit or delete memory Markdown, including files left by interrupted forget. Retry the explicit forget operation to finish its durable file cleanup.
+
+The audit detects wrong model metadata, mismatches between indexed text and its durable source, and invalid vector sizes or values. A finite vector with the correct size and matching provenance cannot be authenticated by this audit. No keyword index is present in the current schema.

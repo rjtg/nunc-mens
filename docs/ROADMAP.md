@@ -1,25 +1,31 @@
-# Implementation roadmap
+# Roadmap
 
-The MVP implementation follows [the implementation plan](IMPLEMENTATION_PLAN.md). The verified command outputs and progressive development use are in [the dogfooding report](DOGFOODING.md).
+## Current capabilities
 
-| Milestone | Deliverable |
-| --- | --- |
-| C–D | Git/standalone scope, configuration and durable one-file Markdown capture |
-| E | Foreground FIFO, byte-preserving framing, cooperative clients and restart recovery |
-| F | Read-only source snapshots, incremental SQLite vectors and staged full rebuild |
-| G | Explicit pinned ONNX download, local FastEmbed inference and cosine-ranked search |
-| H | Automatic polling refresh, index diagnostics, CLI documentation and CI |
-| I | Real executable verification with a development conversation journal and source changes |
+The 0.2.0 release provides worktree-local Markdown capture, FIFO writing with an optional foreground server, and local FastEmbed search over a rebuildable SQLite index. It supports registered read-only sources, structural and semantic chunks, context and provenance, recency and explanations, exact and semantic duplicate discovery, Git history and hook ingestion, external-summary consolidation, and explicit forget. The durable ledger owns archive and tombstone state. Issues #1–#7 are complete. [MVP plan](IMPLEMENTATION_PLAN.md) · [Milestone plan](M5_M9_PLAN.md) · [Verified workflows](DOGFOODING.md)
 
-Subsequent milestones are tracked in [the M5–M9 plan](M5_M9_PLAN.md).
+## Implementation order
 
-| Issue | Deliverable |
-| --- | --- |
-| [#2](https://github.com/rjtg/nunc-mens/issues/2) | Structural and optional semantic chunks with section and parent context |
-| [#3](https://github.com/rjtg/nunc-mens/issues/3) | Recency ranking and explanations |
-| [#4](https://github.com/rjtg/nunc-mens/issues/4) | Exact and semantic duplicate discovery |
-| [#5](https://github.com/rjtg/nunc-mens/issues/5) | Shared Git commit ingestion, history import and an optional hook |
-| [#6](https://github.com/rjtg/nunc-mens/issues/6) | Recoverable consolidation, archived search and undo |
-| [#7](https://github.com/rjtg/nunc-mens/issues/7) | Explicit forget with dependency warnings and tombstones |
+| Milestone | Scope and dependency order | Priority |
+| --- | --- | --- |
+| Trustworthy local storage | #10 deep diagnostics and repair are complete. #21 extends the existing ledger for reversible archive. #37 defines and exercises standalone consistency after those changes, then adds persistent-transport and cache coverage when #30 or #31 lands. | Critical path |
+| Retrieval evidence | #8 compares QMD and nunc on a distributable labeled corpus. #29 measures latency and resource use across sizes, starting with standalone semantic baselines and adding modes and transports when available. #13 feeds opt-in judgments back into the benchmark without changing production ranking. | #8 and initial #29 unblock performance choices. Corpus work can run independently of ledger features. |
+| Precise, composable output | #25 completes source eligibility and exact-file filters. #23 adds ranked shell IDs, #22 adds a model-free durable diff, and #17 extends duplicate review using that workflow. #11 budgets attributed retrieval before #24 adds Markdown rendering. #14 establishes timestamps and timeline before #15 derives topics. #26 adds related-entry discovery over the same ranking path. #28 extends explanations as those stages become available. | Exact filtering, budgets and shell composition have direct agent value. Diff and IDs can ship independently. |
+| Retrieval modes and transport | Prototype #9 only with evidence from #8 and durable-index parity from #10. Compare it with the semantic baseline before changing defaults. #30 should reuse the existing foreground server and shared search service after #37's standalone contract and the initial #29 baseline. #12 is a thin adapter once the CLI services and consistency contract stabilize. | Evidence-gated retrieval changes. Adapters follow the application services they expose. |
+| Documentation and distribution | #36 documents verified workflows incrementally. Publish #35 with GitHub Pages after the core examples are executable and the domain and Pages settings are available. | Docs and static site preparation can advance independently. Publishing depends on external DNS/Pages control. |
+| Optional external synthesis | #18 defines stdout-only synthesis over explicit entry IDs. #19 and #20 extend model discovery and user-level configuration only as needed for the selected backend. The current external-summary workflow remains available. | Optional. Resolve backend availability, portability and configuration boundaries before adding native inference dependencies. |
+| Measured optimizations | #32 and #33 follow #25 and #29. #31 follows #30 plus measured repeat-query benefit and tested invalidation from #37. #27 requires a quality gain on #8. #34 requires evidence that exact scanning remains a bottleneck after simpler changes. | Skip optimizations without a measurable benefit. |
 
-Possible later work includes an event-driven watcher for larger repositories, packaged binaries and larger-corpus performance measurements.
+## Audit notes and risks
+
+- #25 is partly implemented through repeatable component-safe source prefixes. Exact-file syntax and useful diagnostics for invalid paths remain. #28 already has per-hit scores and model provenance from #3. Pipeline counts and skipped-stage reasons remain.
+- #17 builds on existing pairwise duplicate discovery. #21 builds on the existing archive ledger. #37 already has some process-level FIFO, consolidation, and forget coverage. An explicit transport contract and concurrent search tests remain.
+- #8 and #29 serve different purposes. An internal four-query chunking comparison exists, but QMD and scaling measurements remain open. #18–#20 overlap as one synthesis workflow, so they should share one provider/configuration boundary. No open issue was found to be fully obsolete or a duplicate.
+- Search and indexing remain usable without generative inference. Preserve existing stdout contracts and keep maintenance actions explicit. Keep Git distribution scoped to intentional project content.
+- The ledger and Markdown must survive damaged SQLite, interrupted writes, archived visibility, and interrupted forget. Repair may discard derived data. Invalid durable metadata requires operator review.
+- Benchmark results depend on corpus, relevance labels, model setup, cache temperature, and hardware. Report these separately. Local transport adds permissions, backpressure, and snapshot-freshness questions. Query-result caching adds invalidation risk.
+- DNS ownership, Pages configuration, optional backend installation, and model availability are external prerequisites for their respective workflows. Continue independent local work if those prerequisites are unavailable.
+
+## In progress
+
+[#10](https://github.com/rjtg/nunc-mens/issues/10) added deep diagnostics and read-only repair previews, recovery of corrupt SQLite, and offline pruning of known bad rows. The next critical-path issue is [#21](https://github.com/rjtg/nunc-mens/issues/21), explicit reversible archive through the durable ledger.

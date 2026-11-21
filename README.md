@@ -35,7 +35,7 @@ Markdown originals live at `.nunc/entries/<uuid>.md`. The index lives under XDG 
 
 ## Work with project history
 
-The current source supports semantic retrieval of Markdown chunks with section and parent context, optional recency, and ranking explanations. It also supports duplicate discovery, Git import, and explicit memory lifecycle operations.
+Version 0.2.0 adds semantic retrieval of Markdown chunks with section and parent context, optional recency, and ranking explanations. It also adds duplicate discovery, Git import, and explicit memory lifecycle operations. Run `nunc reindex` to rebuild a version 0.1.0 index for chunked retrieval.
 
 ```sh
 nunc search --context section --explain "Why did authentication fail?"

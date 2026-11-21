@@ -71,6 +71,8 @@ Four labeled queries ran against the repository's pre-milestone architecture, CL
 
 The questions covered FIFO serialization, the distinction between durable Markdown and the vector cache, program-readable provenance, and milestones that run without a model. Both strategies missed the expected architecture heading on the second query. These measurements support retaining structural chunking as the default for this release. Chunk context keeps the response focused on the ranked passage. Switching to section or parent context changes returned text while preserving the ranked passage.
 
+This benchmark measured two `nunc` configurations. The comparison with QMD is tracked separately in [issue #8](https://github.com/rjtg/nunc-mens/issues/8).
+
 ### Git and durable lifecycle
 
 The separate benchmark worktree also verified history import, hook capture and sync. With no hook installed, `nunc git import --all --dry-run` reported one commit and `nunc git import --all` saved it. After `nunc git hook install`, a normal Git commit captured the decision to keep archive relationships durable. `nunc git sync` reported `2 selected, 0 saved, 2 existing, 0 forgotten`. A paraphrased query found the hook-captured commit at rank 1 with its original committer timestamp and `choice.md` path.

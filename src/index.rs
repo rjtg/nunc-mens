@@ -31,7 +31,8 @@ const SCHEMA: &str = "
         hash TEXT NOT NULL,
         vector BLOB NOT NULL,
         CHECK ((kind = 'memory' AND timestamp IS NOT NULL AND line_start IS NULL AND line_end IS NULL)
-             OR (kind = 'source' AND timestamp IS NULL AND line_start >= 1 AND line_end >= line_start))
+             OR (kind = 'source' AND timestamp IS NULL AND line_start IS NOT NULL
+                 AND line_end IS NOT NULL AND line_start >= 1 AND line_end >= line_start))
     ) STRICT;
 ";
 
@@ -167,7 +168,10 @@ fn existing_private_file(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             ensure!(
-                meta.is_file() && meta.uid() == effective_uid() && meta.mode() & 0o077 == 0,
+                meta.is_file()
+                    && meta.uid() == effective_uid()
+                    && meta.mode() & 0o077 == 0
+                    && meta.nlink() == 1,
                 "index artifact must be a private regular file: {}",
                 path.display()
             );
@@ -322,7 +326,8 @@ impl Reader {
     pub(crate) fn scan(
         &self,
         kind: Option<Kind>,
-        mut visit: impl FnMut(&str, &[f32], &Row<'_>) -> Result<()>,
+        include: impl Fn(&str) -> bool,
+        mut visit: impl FnMut(IndexedRow<'_, '_>, &[f32]) -> Result<()>,
     ) -> Result<()> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, path, timestamp, line_start, line_end, text, vector
@@ -331,25 +336,41 @@ impl Reader {
         let mut rows = stmt.query([kind.map(Kind::as_str)])?;
         while let Some(row) = rows.next()? {
             let path: &str = row.get_ref(2)?.as_str()?;
+            if !include(path) {
+                continue;
+            }
             let blob = row.get_ref(7)?.as_blob()?;
             let vector = vectors::decode(blob, self.dimensions).with_context(|| {
                 format!("invalid indexed vector at {path}; run nunc reindex --full")
             })?;
-            visit(path, &vector, row)?;
+            visit(IndexedRow { row }, &vector)
+                .with_context(|| format!("inspect indexed vector at {path}"))?;
         }
         Ok(())
     }
 }
 
-pub(crate) fn provenance(row: &Row<'_>) -> Result<Provenance> {
-    Ok(Provenance {
-        id: row.get(0)?,
-        kind: Kind::parse(row.get_ref(1)?.as_str()?)?,
-        path: row.get(2)?,
-        timestamp: row.get(3)?,
-        line_start: row.get(4)?,
-        line_end: row.get(5)?,
-    })
+pub(crate) struct IndexedRow<'row, 'stmt> {
+    row: &'row Row<'stmt>,
+}
+
+impl IndexedRow<'_, '_> {
+    pub(crate) fn id(&self) -> Result<&str> {
+        Ok(self.row.get_ref(0)?.as_str()?)
+    }
+
+    pub(crate) fn document(&self) -> Result<(Provenance, String)> {
+        let row = self.row;
+        let source = Provenance {
+            id: row.get(0)?,
+            kind: Kind::parse(row.get_ref(1)?.as_str()?)?,
+            path: row.get(2)?,
+            timestamp: row.get(3)?,
+            line_start: row.get(4)?,
+            line_end: row.get(5)?,
+        };
+        Ok((source, row.get(6)?))
+    }
 }
 
 #[cfg(test)]
@@ -423,15 +444,19 @@ mod tests {
         let next = index.refresh(&mut model, false)?;
         assert_eq!((next.documents, next.embedded, next.deleted), (1, 1, 1));
         let reader = index.read(MODEL)?.context("no index")?;
-        reader.scan(None, |path, vector, row| {
-            assert_eq!(path, "design.md");
-            assert_eq!(vector, [1.0, -0.5]);
-            let source = provenance(row)?;
-            assert_eq!(source.line_start, Some(1));
-            assert_eq!(source.kind, Kind::Source);
-            assert_eq!(row.get::<_, String>(6)?, "Modified source\n");
-            Ok(())
-        })?;
+        reader.scan(
+            None,
+            |_| true,
+            |row, vector| {
+                assert_eq!(vector, [1.0, -0.5]);
+                let (source, text) = row.document()?;
+                assert_eq!(source.path, "design.md");
+                assert_eq!(source.line_start, Some(1));
+                assert_eq!(source.kind, Kind::Source);
+                assert_eq!(text, "Modified source\n");
+                Ok(())
+            },
+        )?;
         drop(reader);
         fs::write(index.path(), b"corrupt database")?;
         assert!(index.read(MODEL).is_err());

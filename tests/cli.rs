@@ -230,3 +230,95 @@ fn restarts_after_forced_exit_and_discards_incomplete_stream() -> Result<()> {
     restarted.stop()?;
     Ok(())
 }
+
+#[test]
+fn missing_model_is_actionable_while_capture_still_works() -> Result<()> {
+    let fixture = Fixture::new()?;
+    for args in [
+        &["search", "--json", "earlier design"][..],
+        &["reindex"][..],
+    ] {
+        let output = fixture.nunc(args).output()?;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("model unavailable"));
+        assert!(stderr.contains("nunc models download"));
+    }
+    assert!(!fixture.cache.exists());
+    fixture.run(&["log", "a durable entry before embeddings"])?;
+    assert_eq!(fixture.entries()?.len(), 1);
+    Ok(())
+}
+
+fn real_model_cache() -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        std::env::var_os("NUNC_TEST_MODEL_CACHE").context(
+            "set NUNC_TEST_MODEL_CACHE to an absolute cache prepared with nunc models download",
+        )?,
+    ))
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn real_fastembed_semantic_search_and_json_provenance() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let cache = real_model_cache()?;
+    let nunc = |args: &[&str]| -> Result<Output> {
+        checked(
+            fixture
+                .nunc(args)
+                .env("NUNC_MODEL_CACHE_DIR", &cache)
+                .output()?,
+        )
+    };
+    let note = "Staging authentication failed because the deployment machine's clock drifted and its signed tokens expired.";
+    nunc(&["log", note])?;
+    nunc(&[
+        "log",
+        "Raspberry bushes thrive in sunny locations with acidic soil.",
+    ])?;
+    fs::create_dir(fixture.repo.join("docs"))?;
+    fs::write(
+        fixture.repo.join("docs/policies.md"),
+        "Authentication policy\nSynchronize clocks with NTP.\n",
+    )?;
+    nunc(&["reindex", "--source", "docs"])?;
+    let result: Value = serde_json::from_slice(
+        &nunc(&[
+            "search",
+            "--json",
+            "--type",
+            "memory",
+            "--limit",
+            "1",
+            "Warum wurde die Anmeldung in der Testumgebung abgelehnt?",
+        ])?
+        .stdout,
+    )?;
+    assert_eq!(result["mode_used"], "semantic");
+    assert_eq!(result["warnings"].as_array().map(Vec::len), Some(0));
+    let hit = &result["results"][0];
+    assert_eq!(hit["text"], note);
+    assert_eq!(hit["kind"], "memory");
+    let id = hit["id"].as_str().context("missing entry id")?;
+    assert_eq!(hit["path"], format!(".nunc/entries/{id}.md"));
+    assert_eq!(hit["rank"], 1);
+    assert!(hit["timestamp"].is_string());
+    let source: Value = serde_json::from_slice(
+        &nunc(&[
+            "search",
+            "--json",
+            "--source",
+            "unselected",
+            "--source",
+            "docs",
+            "time synchronization",
+        ])?
+        .stdout,
+    )?;
+    assert_eq!(source["results"][0]["path"], "docs/policies.md");
+    assert_eq!(source["results"][0]["line_start"], 1);
+    assert_eq!(source["results"][0]["line_end"], 2);
+    Ok(())
+}

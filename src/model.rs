@@ -1,0 +1,240 @@
+use crate::fs::{lockfile, private_dir, read_regular, sync_dir};
+use crate::repo::Repo;
+use crate::vectors::{self, Embedder, Model};
+use anyhow::{Context, Result, ensure};
+use fastembed::{
+    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
+};
+use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+
+pub(crate) const MODEL: Model = Model {
+    id: "intfloat/multilingual-e5-small",
+    revision: "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+    dimensions: 384,
+};
+
+const CONTEXT: usize = 512;
+
+struct Artifact {
+    name: &'static str,
+    remote: &'static str,
+    size: usize,
+    sha256: Option<&'static str>,
+}
+
+const WEIGHTS: Artifact = Artifact {
+    name: "model.onnx",
+    remote: "onnx/model.onnx",
+    size: 470_268_510,
+    sha256: Some("ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665"),
+};
+const TOKENIZER: Artifact = Artifact {
+    name: "tokenizer.json",
+    remote: "tokenizer.json",
+    size: 17_082_730,
+    sha256: Some("0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39"),
+};
+const CONFIG: Artifact = Artifact {
+    name: "config.json",
+    remote: "config.json",
+    size: 655,
+    sha256: None,
+};
+const SPECIAL: Artifact = Artifact {
+    name: "special_tokens_map.json",
+    remote: "special_tokens_map.json",
+    size: 167,
+    sha256: None,
+};
+const TOK_CONFIG: Artifact = Artifact {
+    name: "tokenizer_config.json",
+    remote: "tokenizer_config.json",
+    size: 443,
+    sha256: None,
+};
+const ARTIFACTS: &[Artifact] = &[WEIGHTS, TOKENIZER, CONFIG, SPECIAL, TOK_CONFIG];
+
+pub(crate) struct LocalModel(TextEmbedding);
+
+impl LocalModel {
+    pub(crate) fn load(repo: &Repo) -> Result<Self> {
+        let dir = model_dir(repo)?;
+        ready(&dir)?;
+        Self::from_dir(&dir)
+    }
+
+    fn from_dir(dir: &Path) -> Result<Self> {
+        let tokenizer = TokenizerFiles {
+            tokenizer_file: TOKENIZER.read(dir)?,
+            config_file: CONFIG.read(dir)?,
+            special_tokens_map_file: SPECIAL.read(dir)?,
+            tokenizer_config_file: TOK_CONFIG.read(dir)?,
+        };
+        let model = UserDefinedEmbeddingModel::new(WEIGHTS.read(dir)?, tokenizer)
+            .with_pooling(Pooling::Mean);
+        let options = InitOptionsUserDefined::default()
+            .with_max_length(CONTEXT)
+            .with_intra_threads(4);
+        let embedding = TextEmbedding::try_new_from_user_defined(model, options)
+            .with_context(|| format!("load FastEmbed/ONNX model from {}", dir.display()))?;
+        Ok(Self(embedding))
+    }
+
+    pub(crate) fn query(&mut self, text: &str) -> Result<Vec<f32>> {
+        let mut embeddings = self
+            .0
+            .embed([format!("query: {text}")], Some(1))
+            .context("embed search query")?;
+        ensure!(
+            embeddings.len() == 1,
+            "model returned the wrong number of query embeddings"
+        );
+        embeddings
+            .pop()
+            .context("model returned no query embedding")
+    }
+}
+
+impl Embedder for LocalModel {
+    fn model(&self) -> Model {
+        MODEL
+    }
+
+    fn passages(&mut self, passages: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let input: Vec<_> = passages
+            .iter()
+            .map(|text| format!("passage: {text}"))
+            .collect();
+        self.0
+            .embed(input, Some(4))
+            .context("embed passages with FastEmbed")
+    }
+}
+
+fn model_dir(repo: &Repo) -> Result<PathBuf> {
+    Ok(repo
+        .model_cache()?
+        .join(format!("multilingual-e5-small-{}", MODEL.revision)))
+}
+
+pub(crate) fn check_cache(repo: &Repo) -> Result<()> {
+    ready(&model_dir(repo)?)
+}
+
+fn ready(dir: &Path) -> Result<()> {
+    let check = || -> Result<()> {
+        ensure!(
+            fs::symlink_metadata(dir)?.is_dir(),
+            "expected a model directory"
+        );
+        for artifact in ARTIFACTS {
+            let meta = fs::symlink_metadata(dir.join(artifact.name))
+                .with_context(|| format!("inspect {}", artifact.name))?;
+            ensure!(
+                meta.is_file() && meta.len() == artifact.size as u64,
+                "invalid {}",
+                artifact.name
+            );
+        }
+        Ok(())
+    };
+    check().with_context(|| format!("model unavailable at {}; run nunc models download (move an incomplete cache aside first)", dir.display()))
+}
+
+pub(crate) fn download(repo: &Repo) -> Result<PathBuf> {
+    let dir = model_dir(repo)?;
+    let cache = dir.parent().context("missing model cache parent")?;
+    fs::create_dir_all(cache)?;
+    private_dir(cache)?;
+    let lock = lockfile(&cache.join("download.lock"))?;
+    lock.lock().context("lock model download")?;
+
+    match fs::symlink_metadata(&dir) {
+        Ok(_) => {
+            ready(&dir)?;
+            validate_model(&dir)?;
+            return Ok(dir);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
+        Err(err) => return Err(err).context("inspect model cache"),
+    }
+    let stage = tempfile::tempdir_in(cache)?;
+    let tls = TlsConfig::builder()
+        .provider(TlsProvider::NativeTls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(tls)
+        .https_only(true)
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_global(Some(Duration::from_secs(600)))
+        .build()
+        .into();
+
+    for artifact in ARTIFACTS {
+        eprintln!("Downloading {} ({} bytes)", artifact.remote, artifact.size);
+        artifact
+            .fetch(&agent, stage.path())
+            .with_context(|| format!("download {}", artifact.remote))?;
+    }
+    validate_model(stage.path())?;
+    sync_dir(stage.path())?;
+    fs::rename(stage.path(), &dir)
+        .with_context(|| format!("publish model cache {}", dir.display()))?;
+    sync_dir(cache)?;
+    Ok(dir)
+}
+
+fn validate_model(dir: &Path) -> Result<()> {
+    let mut model = LocalModel::from_dir(dir)?;
+    vectors::norm(&model.query("validate local model")?, MODEL.dimensions)?;
+    Ok(())
+}
+
+impl Artifact {
+    fn read(&self, dir: &Path) -> Result<Vec<u8>> {
+        let bytes = read_regular(&dir.join(self.name), self.size)?;
+        ensure!(bytes.len() == self.size, "unexpected size of {}", self.name);
+        Ok(bytes)
+    }
+
+    fn fetch(&self, agent: &ureq::Agent, dir: &Path) -> Result<()> {
+        let url = format!(
+            "https://huggingface.co/{}/resolve/{}/{}?download=true",
+            MODEL.id, MODEL.revision, self.remote
+        );
+        let mut response = agent.get(&url).call()?;
+        let mut stream = response.body_mut().as_reader().take(self.size as u64 + 1);
+        let mut file = File::create(dir.join(self.name))?;
+        let mut digest = Sha256::new();
+        let mut bytes = [0_u8; 64 * 1024];
+        let mut size = 0;
+        loop {
+            let count = stream.read(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+            size += count;
+            digest.update(&bytes[..count]);
+            file.write_all(&bytes[..count])?;
+        }
+        ensure!(
+            size == self.size,
+            "expected {} artifact bytes, got {size}",
+            self.size
+        );
+        if let Some(expected) = self.sha256 {
+            ensure!(
+                format!("{:x}", digest.finalize()) == expected,
+                "artifact checksum mismatch"
+            );
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+}

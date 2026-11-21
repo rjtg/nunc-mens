@@ -177,7 +177,7 @@ fn source_files(repo: &Repo, roots: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
             (!path.is_empty()).then(|| PathBuf::from(path))
         }));
     } else {
-        let mut walk = ignore::WalkBuilder::new(&repo.root.join(present[0]));
+        let mut walk = ignore::WalkBuilder::new(repo.root.join(present[0]));
         for root in present.iter().skip(1) {
             walk.add(repo.root.join(root));
         }

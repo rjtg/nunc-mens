@@ -40,8 +40,11 @@ pub(crate) fn decode(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>> {
         "invalid embedding BLOB length"
     );
     Ok(bytes
-        .chunks_exact(4)
-        .map(|part| f32::from_le_bytes([part[0], part[1], part[2], part[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(f32::from_le_bytes)
         .collect())
 }
 

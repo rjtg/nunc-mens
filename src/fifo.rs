@@ -210,10 +210,7 @@ fn read_frames(pipe: &mut File, stop: &AtomicBool, boundary: &Boundary, repo: &R
                 if matches!(
                     err.kind(),
                     io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) =>
-            {
-                ()
-            }
+                ) => {}
             Err(err) => return Err(err).context("read FIFO"),
         }
         if stop.load(Ordering::Relaxed) {

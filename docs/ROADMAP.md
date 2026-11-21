@@ -54,3 +54,4 @@ Acceptance: README commands are genuine runnable commands; publish a concise ver
 ## Future ideas (not required for MVP)
 
 Optional MCP adapter, fast ANN index if measured scale demands it, configurable alternative embedding providers, contextual chunking for longer notes, and a `nunc sync` alias if it becomes valuable. Do not implement speculatively.
+NaN

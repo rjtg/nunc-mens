@@ -14,17 +14,17 @@ Acceptance: `cargo run -- --help` and `cargo test` work from a clean checkout.
 ## M1 — Reliable journal
 
 - [ ] `nunc log TEXT...`, `nunc "TEXT..."`, and `nunc log --stdin`.
-- [ ] Daily Markdown files with timezone-aware timestamps and persistent unique entry IDs.
+- [ ] One `.nunc/entries/<id>.md` file per memory with timezone-aware timestamp and persistent unique ID.
 - [ ] Optional tags, best-effort Git context, configuration and collision-safe append.
 - [ ] Roundtrip tests for Unicode, newlines, fenced code, duplicate text and concurrent writes.
-- [ ] **Dogfood:** create a temporary journal and log at least one actual implementation decision with the compiled CLI.
+- [ ] **Dogfood:** create a temporary Git repository, start `nunc serve`, and ingest at least one actual implementation decision with the compiled CLI.
 
 Acceptance: writes are durable, human-readable, lossless and independent of model inference.
 
 ## M2 — Searchable local index
 
 - [ ] SQLite entry storage + FTS5 and schema migration/version marker.
-- [ ] Parser of journal entry format, incremental `reindex` and `reindex --full`.
+- [ ] Parser of per-entry Markdown files and configured read-only sources; incremental `reindex` and `reindex --full`.
 - [ ] Handle file edits/deletions, stable IDs, stale-index diagnostics, safe full rebuild.
 - [ ] Keyword `search --mode keyword`, `--limit`, and machine-readable `--json`.
 - [ ] **Dogfood:** search the M1 decision and verify stable ID and source path.

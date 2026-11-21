@@ -28,7 +28,7 @@ An incremental refresh reuses unchanged embeddings, updates metadata, and delete
 
 FastEmbed 5.15.0 runs `intfloat/multilingual-e5-small` at revision `614241f622f53c4eeff9890bdc4f31cfecc418b3` with CPU ONNX Runtime 1.24, mean pooling, and the model's `query: ` and `passage: ` prefixes. The explicit HTTPS downloader verifies artifact sizes and the weights/tokenizer checksums, probes inference, and atomically publishes the revision directory. Inference initializes from local files and sends no project text over the network.
 
-Freshness checks and polling reread eligible files. Search scans selected vectors linearly. Duplicate discovery uses exact hashes first and can compare stored chunks pairwise. Both suit modest corpora. Long memories retain their full bodies in durable Markdown and are indexed as multiple model-sized passages.
+Freshness checks and polling reread eligible files. Search scans selected vectors linearly. Duplicate discovery groups normalized hashes and records pairwise evidence for semantic candidates. Cleanup suggestions compare current Markdown bytes under the shared ledger lock and protect consolidation lineage. Semantic scanning and duplicate review suit modest corpora. Long memories retain their full bodies in durable Markdown and are indexed as multiple model-sized passages.
 
 ## Durable operations
 

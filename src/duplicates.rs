@@ -1,4 +1,5 @@
 use crate::documents::{Document, MatchedChunk, Snapshot};
+use crate::entries::EntryKind;
 use crate::index::Index;
 use crate::ledger::Guard;
 use crate::model::{self, LocalModel, MODEL};
@@ -6,7 +7,10 @@ use crate::repo::{Repo, hash};
 use crate::vectors::{self, Embedder};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+mod groups;
+use groups::Group;
 
 pub(crate) const DEFAULT_THRESHOLD: f64 = 0.90;
 
@@ -14,6 +18,8 @@ pub(crate) const DEFAULT_THRESHOLD: f64 = 0.90;
 pub(crate) struct Report {
     pub warnings: Vec<String>,
     pub matches: Vec<Pair>,
+    pub groups: Vec<Group>,
+    pub suggested_forget_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -32,6 +38,10 @@ pub(crate) struct Item {
     pub timestamp: Option<String>,
     pub excerpt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_kind: Option<EntryKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk: Option<MatchedChunk>,
 }
 
@@ -43,6 +53,8 @@ impl Item {
             path: p.path.clone(),
             timestamp: p.timestamp.clone(),
             excerpt: excerpt(text),
+            content_hash: Some(parent.hash.clone()),
+            entry_kind: p.entry_kind,
             chunk,
         }
     }
@@ -154,16 +166,41 @@ pub(crate) fn find(
         limit,
         pairs: Vec::new(),
     };
-    for group in groups.values().filter(|members| members.len() > 1) {
+    let archives = guard.ledger.archives()?;
+    let protected: BTreeSet<_> = guard.ledger.consolidation_sources().collect();
+    let active = |doc: &Document| {
+        uuid::Uuid::parse_str(&doc.provenance.id)
+            .is_ok_and(|id| !guard.ledger.hidden(&archives, id) && !protected.contains(&id))
+    };
+    let mut review = Vec::new();
+    for (&digest, group) in groups.iter().filter(|(_, members)| members.len() > 1) {
+        if id.is_some_and(|id| !group.iter().any(|doc| doc.provenance.id == id)) {
+            continue;
+        }
+        if review.len() < limit {
+            review.push(groups::exact(digest, group, &active));
+        }
+        let mut eligible_pairs = 0;
         for (position, left) in group.iter().enumerate() {
             for right in &group[position + 1..] {
                 if id.is_some_and(|id| id != left.provenance.id && id != right.provenance.id) {
                     continue;
                 }
                 top.offer(exact_pair(left, right));
+                eligible_pairs += 1;
+                if eligible_pairs == limit {
+                    break;
+                }
+            }
+            if eligible_pairs == limit {
+                break;
             }
         }
     }
+    let mut semantic_top = Top {
+        limit,
+        pairs: Vec::new(),
+    };
     let mut warnings = Vec::new();
     if !exact {
         let semantic = || -> Result<_> {
@@ -214,7 +251,7 @@ pub(crate) fn find(
                             } else {
                                 (other, item)
                             };
-                            top.offer(Pair {
+                            semantic_top.offer(Pair {
                                 detection: "semantic",
                                 scope: if *whole && *other_whole {
                                     "entry"
@@ -232,9 +269,27 @@ pub(crate) fn find(
             Err(error) => warnings.push(format!("Semantic duplicate check unavailable: {error:#}")),
         }
     }
+    review.extend(groups::semantic(&semantic_top.pairs, &parents, id));
+    review.truncate(limit);
+    let references: BTreeSet<_> = review
+        .iter()
+        .map(|group| group.reference.id.clone())
+        .collect();
+    let mut suggested_forget_ids = Vec::new();
+    for group in &mut review {
+        group
+            .suggested_forget_ids
+            .retain(|id| !references.contains(id));
+        suggested_forget_ids.extend(group.suggested_forget_ids.iter().cloned());
+    }
+    for pair in semantic_top.pairs {
+        top.offer(pair);
+    }
     Ok(Report {
         warnings,
         matches: top.pairs,
+        groups: review,
+        suggested_forget_ids,
     })
 }
 
@@ -258,6 +313,8 @@ pub(crate) fn check_write(repo: &Repo, text: &str, threshold: f64) -> Result<Rep
         path: String::new(),
         timestamp: None,
         excerpt: excerpt(text),
+        content_hash: None,
+        entry_kind: None,
         chunk: None,
     };
     let mut top = Top {
@@ -330,5 +387,7 @@ pub(crate) fn check_write(repo: &Repo, text: &str, threshold: f64) -> Result<Rep
     Ok(Report {
         warnings,
         matches: top.pairs,
+        groups: Vec::new(),
+        suggested_forget_ids: Vec::new(),
     })
 }

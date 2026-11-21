@@ -64,6 +64,9 @@ enum Action {
         limit: u32,
         #[arg(long)]
         exact: bool,
+        /// Print verified exact duplicate IDs for explicit cleanup.
+        #[arg(long, requires = "exact", conflicts_with_all = ["json", "raw"])]
+        forget_ids: bool,
         #[arg(long)]
         raw: bool,
         #[arg(long)]
@@ -338,6 +341,7 @@ fn execute(action: Action) -> Result<ExitCode> {
             threshold,
             limit,
             exact,
+            forget_ids,
             raw,
             json,
         } => {
@@ -347,8 +351,15 @@ fn execute(action: Action) -> Result<ExitCode> {
             if json {
                 serde_json::to_writer(&mut out, &report)?;
                 writeln!(out)?;
+            } else if forget_ids {
+                for warning in report.warnings {
+                    eprintln!("nunc: {warning}");
+                }
+                for id in report.suggested_forget_ids {
+                    writeln!(out, "{id}")?;
+                }
             } else {
-                print_duplicates(report, &mut out)?;
+                print_duplicate_groups(report, &mut out)?;
             }
         }
         Action::Reindex { full, source } => {
@@ -561,6 +572,68 @@ fn print_duplicates(report: duplicates::Report, out: &mut impl Write) -> Result<
             writeln!(out, "  {} {} {}", item.id, item.path, item.excerpt)?;
         }
     }
+    Ok(())
+}
+
+fn print_duplicate_groups(report: duplicates::Report, out: &mut impl Write) -> Result<()> {
+    for warning in report.warnings {
+        eprintln!("nunc: {warning}");
+    }
+    for group in report.groups {
+        let exact = group.detection == "exact";
+        if let Some(hash) = group.normalized_hash {
+            writeln!(out, "{} group (normalized SHA-256 {hash})", group.detection)?;
+        } else {
+            writeln!(out, "semantic group (review only)")?;
+        }
+        print_duplicate_item(
+            out,
+            if exact { "KEEP" } else { "REFERENCE" },
+            &group.reference,
+        )?;
+        for member in group.members {
+            let label = if group.suggested_forget_ids.contains(&member.item.id) {
+                "DUPLICATE"
+            } else if exact {
+                "REVIEW"
+            } else {
+                "POSSIBLE"
+            };
+            let mut relation = format!(
+                "{label} ({}, {:.4} to {})",
+                member.scope, member.similarity, group.reference_id
+            );
+            if let Some(chunk) = member.reference_chunk {
+                relation.push_str(&format!(
+                    " [reference lines {}–{}]",
+                    chunk.line_start, chunk.line_end
+                ));
+            }
+            if member.byte_identical == Some(false) {
+                relation.push_str(" [normalized text only]");
+            }
+            print_duplicate_item(out, &relation, &member.item)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_duplicate_item(out: &mut impl Write, label: &str, item: &duplicates::Item) -> Result<()> {
+    write!(out, "  {label} {} {}", item.id, item.path)?;
+    if let Some(chunk) = &item.chunk {
+        write!(out, ":{}-{}", chunk.line_start, chunk.line_end)?;
+    }
+    if let Some(timestamp) = &item.timestamp {
+        write!(out, " [{timestamp}]")?;
+    }
+    writeln!(
+        out,
+        " {}",
+        item.excerpt
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    )?;
     Ok(())
 }
 

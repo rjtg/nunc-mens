@@ -125,3 +125,9 @@ Formatting, Clippy, and 36 default tests passed. The opt-in `search_ids_orders_u
 In a temporary Git repository, the compiled CLI logged two revisions of a real duplicate-review decision. `nunc diff "$old_id" "$new_id" > review.patch` exited 1 with two UUID headers and the expected changed line. GNU `patch` applied the output to the first body, and `cmp` confirmed byte-for-byte agreement with the second body. The fixture never created an index or model cache.
 
 Formatting, Clippy, and 39 default tests passed. Diff coverage includes identical entries, archived entries, empty and missing files, restored files with forgotten tombstones, Unicode, long lines, fenced code, CRLF, missing final LF, and large changed regions. Some Rust LSP responses were stale or timed out, so Cargo verified the final sources.
+
+## Duplicate group review and cleanup preview
+
+An isolated Git repository captured a real cleanup-policy note twice and a whitespace variant once. `nunc duplicates --exact` printed one group with the first capture as `KEEP`, the second as `DUPLICATE`, and the variant as `REVIEW`. Piping `nunc duplicates --exact --forget-ids` into `xargs -r nunc forget --dry-run --json` sent exactly the second UUID. All three files remained after the preview.
+
+Formatting, Clippy, and 41 default tests passed. Tests exercised timestamp ordering, normalized-only matches, raw archive visibility, forgotten entries, consolidation lineage, and overlapping semantic groups with direct evidence. The opt-in `real_context_explanations_duplicates_and_lifecycle` test passed in 73.77 s with the cached ONNX model. It confirmed that the actual paraphrase appeared as a review-only semantic match with provenance on both sides and no suggested cleanup IDs. Several Rust LSP responses timed out, and Cargo supplied final verification.

@@ -8,7 +8,7 @@
 | `nunc TEXT...` | Shorthand for `log` when the first argument is ordinary text and does not name a command. |
 | `nunc write TEXT...` or `nunc write --stdin` | Queues capture via a live FIFO or saves directly when the server is unavailable. |
 | `nunc serve [--boundary TOKEN] [--source PATH]...` | Runs the foreground FIFO and refreshes the index from local files. |
-| `nunc duplicates [ID] [--threshold N] [--limit N] [--exact] [--raw] [--json]` | Finds candidate exact or semantic duplicates. |
+| `nunc duplicates [ID] [--threshold N] [--limit N] [--exact] [--raw] [--json\|--forget-ids]` | Reviews duplicate groups or emits verified cleanup candidates. |
 | `nunc diff OLD NEW` | Compares the original Markdown bodies of two selected memories. |
 | `nunc git ingest\|import\|sync\|hook` | Captures selected commit history or manages the post-commit hook. |
 | `nunc consolidate candidates\|apply\|undo` | Retrieves full candidate entries, commits an external summary, or undoes an archive. |
@@ -99,7 +99,15 @@ Both strategies preserve CommonMark heading paths and group blocks within a sect
 
 ### Duplicate discovery
 
-`nunc duplicates [ID] --json` compares current parent content using a whitespace-normalized, case-sensitive SHA-256. Without an ID it inspects all eligible entries and configured source files. With an ID it limits results to pairs involving that parent. `--exact` skips the index and model. By default, duplicate discovery and write-time checks exclude archived and undone entries. Use `duplicates --raw` to inspect them. Forgotten entries remain excluded. With the default 0.90 threshold, indexed passage comparisons can find paraphrases and similar passages. A `chunk` match establishes similarity between two fragments. High similarity can also flag conflicting revisions. Every match includes excerpts, IDs, paths, timestamps and chunk provenance when applicable.
+`nunc duplicates [ID] --json` groups exact matches by whitespace-normalized, case-sensitive SHA-256. Each group includes its stable ID, a reference entry, individual members and evidence, and suggested cleanup IDs. The reference is the oldest timestamped member by absolute time, with the ID breaking ties and untimestamped sources sorted last. The original `matches` array remains available for pairwise consumers. Passing an ID selects its exact group and restricts semantic pairs to that parent. An explicit ID serves as the semantic reference for those pairs.
+
+With the default 0.90 threshold, indexed passage comparisons can find paraphrases and similar passages. Each semantic member has direct evidence against its reference, with both matched chunk locations where applicable. A parent can appear in more than one group because two matches through a shared parent do not establish a third match. High similarity can flag conflicting revisions. Semantic matches are for review. `--limit` caps both group count and the retained pair list. `--exact` works without an index or model. Default discovery omits archived and undone entries. `--raw` includes them for review. Forgotten entries are always omitted.
+
+```sh
+nunc duplicates --exact --forget-ids | xargs -r nunc forget --dry-run
+```
+
+Cleanup candidates require an active ordinary journal entry with a body byte-identical to the active ordinary reference. References, source files, Git records, archived entries, and entries referenced by a consolidation are excluded from suggestions. The IDs output requires `--exact` and emits only UUIDs, one per line, with no output when none qualify. Read the preview before issuing an explicit forget. Even byte-identical bodies can have different capture metadata, and forgetting still uses its own dependency checks and confirmation.
 
 `nunc write --check-duplicates [--threshold N]` reports candidates on stderr before normal capture. Capture continues if the model or index is unavailable. Neither duplicate command suppresses entries. Semantic all-pairs comparisons scale quadratically with indexed chunks.
 

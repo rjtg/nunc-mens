@@ -206,6 +206,12 @@ impl Ledger {
         self.manual_archived.iter().copied()
     }
 
+    pub fn consolidation_sources(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.summaries
+            .values()
+            .flat_map(|summary| summary.sources.iter().copied())
+    }
+
     fn status(&self, archives: &BTreeMap<Uuid, Uuid>, id: Uuid) -> &'static str {
         let summary = self.summaries.get(&id);
         if archives.contains_key(&id) || self.manual_archived.contains(&id) {

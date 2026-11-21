@@ -560,6 +560,87 @@ fn duplicate_check_works_without_cached_embeddings() -> Result<()> {
 }
 
 #[test]
+fn duplicate_groups_export_only_verified_active_non_lineage_ids() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let body = "Approval window is sixty seconds.";
+    let keep = fixture.log_id(body)?;
+    let candidate = fixture.log_id(body)?;
+    let lineage = fixture.log_id(body)?;
+    let archived = fixture.log_id(body)?;
+    let forgotten = fixture.log_id(body)?;
+    let whitespace_variant = fixture.log_id("Approval window is\nsixty seconds.")?;
+    let entries = fixture.local().join("entries");
+    for (day, id) in [
+        &keep,
+        &candidate,
+        &lineage,
+        &archived,
+        &forgotten,
+        &whitespace_variant,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let path = entries.join(format!("{id}.md"));
+        let content = fs::read_to_string(&path)?;
+        let (header, markdown) = content
+            .strip_prefix("---\n")
+            .context("front matter")?
+            .split_once("\n---\n")
+            .context("metadata terminator")?;
+        let mut metadata: Value = serde_json::from_str(header)?;
+        metadata["timestamp"] = format!("2026-01-0{}T12:00:00+00:00", day + 1).into();
+        fs::write(&path, format!("---\n{metadata}\n---\n{markdown}"))?;
+    }
+    let sibling = fixture.log_id("Migration decisions for middleware.")?;
+    let summary = fixture.summary(
+        &format!("{lineage},{sibling}"),
+        "External summary about migration.",
+    )?;
+    fixture.run(&["consolidate", "undo", &summary])?;
+    fixture.run(&["archive", &archived])?;
+    fixture.run(&["forget", &forgotten, "--yes"])?;
+
+    let report = fixture.json(&["duplicates", "--exact", "--json"])?;
+    let group = &report["groups"][0];
+    assert_eq!(group["reference_id"], keep);
+    assert_eq!(
+        group["suggested_forget_ids"],
+        serde_json::json!([candidate])
+    );
+    assert_eq!(group["members"].as_array().map(Vec::len), Some(3));
+    assert_eq!(group["members"][0]["id"], candidate);
+    assert_eq!(group["members"][0]["byte_identical"], true);
+    assert_eq!(group["members"][1]["id"], lineage);
+    assert_eq!(group["members"][2]["byte_identical"], false);
+    let human = String::from_utf8(fixture.run(&["duplicates", "--exact"])?.stdout)?;
+    assert!(human.contains(&format!("KEEP {keep}")));
+    assert!(human.contains(&format!("to {keep}) {candidate}")));
+    let raw = fixture.json(&["duplicates", "--exact", "--raw", "--json"])?;
+    let members = raw["groups"][0]["members"]
+        .as_array()
+        .context("missing members")?;
+    assert!(members.iter().any(|member| member["id"] == archived));
+    assert!(members.iter().all(|member| member["id"] != forgotten));
+    assert_eq!(raw["suggested_forget_ids"], serde_json::json!([candidate]));
+    let exported = fixture.run(&["duplicates", "--exact", "--forget-ids"])?;
+    assert_eq!(exported.stdout, format!("{candidate}\n").as_bytes());
+    assert!(exported.stderr.is_empty());
+    let preview = fixture.json(&["forget", &candidate, "--dry-run", "--json"])?;
+    assert_eq!(preview["targets"], serde_json::json!([candidate]));
+    assert!(entries.join(format!("{candidate}.md")).is_file());
+    for flags in [
+        &["duplicates", "--forget-ids"][..],
+        &["duplicates", "--exact", "--raw", "--forget-ids"][..],
+    ] {
+        let rejected = fixture.nunc(flags).output()?;
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(rejected.stdout.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn git_history_and_hook_share_idempotency_and_respect_existing_hooks() -> Result<()> {
     let fixture = Fixture::new()?;
     let first = fixture.commit("data", "Serialize writers")?;
@@ -941,11 +1022,31 @@ fn real_context_explanations_duplicates_and_lifecycle() -> Result<()> {
     ])?;
     assert_eq!(legacy["results"][0]["id"], distinct);
 
-    let pairs = fixture.json(&["duplicates", &parent, "--threshold", "0.86", "--json"])?;
-    let pairs = pairs["matches"].as_array().context("no duplicate list")?;
+    let duplicates = fixture.json(&["duplicates", &parent, "--threshold", "0.86", "--json"])?;
+    let pairs = duplicates["matches"]
+        .as_array()
+        .context("no duplicate list")?;
     assert!(pairs.iter().any(|pair| pair["detection"] == "semantic"
         && pair["scope"] == "chunk"
         && (pair["left"]["id"] == paraphrase || pair["right"]["id"] == paraphrase)));
+    let group = duplicates["groups"]
+        .as_array()
+        .context("missing duplicate groups")?
+        .iter()
+        .find(|group| group["detection"] == "semantic")
+        .context("missing semantic group")?;
+    assert_eq!(group["reference_id"], parent);
+    assert_eq!(group["suggested_forget_ids"], serde_json::json!([]));
+    assert!(
+        group["members"]
+            .as_array()
+            .context("missing group members")?
+            .iter()
+            .any(|member| member["id"] == paraphrase
+                && member["scope"] == "chunk"
+                && member["reference_chunk"]["parent_id"] == parent
+                && member["chunk"]["parent_id"] == paraphrase)
+    );
     // Similarity is heuristic. A more restrictive cutoff must exclude the distinct revision.
     let strict = fixture.json(&["duplicates", &parent, "--threshold", "0.96", "--json"])?;
     assert!(

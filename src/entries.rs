@@ -22,6 +22,38 @@ pub struct Metadata {
     pub timestamp: DateTime<FixedOffset>,
     pub repo: Option<String>,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "EntryKind::ordinary")]
+    pub kind: EntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<Commit>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EntryKind {
+    #[default]
+    Memory,
+    GitCommit,
+    Consolidation,
+}
+
+impl EntryKind {
+    fn ordinary(&self) -> bool {
+        *self == Self::Memory
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Commit {
+    pub sha: String,
+    pub author: String,
+    pub author_email: String,
+    pub authored_at: DateTime<FixedOffset>,
+    pub committed_at: DateTime<FixedOffset>,
+    pub paths: Vec<String>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub truncated: bool,
 }
 
 pub struct Entry {
@@ -42,10 +74,14 @@ pub fn validate_body(body: &str) -> Result<()> {
 }
 
 pub fn persist(repo: &Repo, body: &str, fields: ContextFields) -> Result<Receipt> {
-    validate_body(body)?;
-    let metadata = Metadata {
+    let metadata = metadata(repo, Uuid::new_v4(), fields);
+    persist_record(repo, body, metadata)
+}
+
+pub(crate) fn metadata(repo: &Repo, id: Uuid, fields: ContextFields) -> Metadata {
+    Metadata {
         version: 1,
-        id: Uuid::new_v4(),
+        id,
         timestamp: Local::now().fixed_offset(),
         repo: fields.repo.or_else(|| {
             repo.git
@@ -53,7 +89,27 @@ pub fn persist(repo: &Repo, body: &str, fields: ContextFields) -> Result<Receipt
                 .flatten()
         }),
         tags: fields.tags,
-    };
+        kind: EntryKind::Memory,
+        commit: None,
+    }
+}
+
+pub(crate) fn path(repo: &Repo, id: Uuid) -> PathBuf {
+    repo.entries().join(format!("{id}.md"))
+}
+
+pub(crate) fn durable_id(bytes: &[u8]) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(bytes);
+    let mut id = [0; 16];
+    id.copy_from_slice(&hash[..16]);
+    id[6] = (id[6] & 0x0f) | 0x80;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(id)
+}
+
+pub(crate) fn persist_record(repo: &Repo, body: &str, metadata: Metadata) -> Result<Receipt> {
+    validate_body(body)?;
     let header = serde_json::to_string(&metadata)?;
     ensure!(
         header.len() <= MAX_HEADER,
@@ -61,7 +117,7 @@ pub fn persist(repo: &Repo, body: &str, fields: ContextFields) -> Result<Receipt
     );
     let bytes = format!("---\n{header}\n---\n{body}");
     repo.prepare()?;
-    let path = repo.entries().join(format!("{}.md", metadata.id));
+    let path = path(repo, metadata.id);
     atomic_write(&path, bytes.as_bytes(), false)?;
     Ok(Receipt {
         id: metadata.id,

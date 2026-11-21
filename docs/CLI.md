@@ -8,6 +8,10 @@
 | `nunc TEXT...` | Shorthand for `log` when the first argument is ordinary text and does not name a command. |
 | `nunc write TEXT...` or `nunc write --stdin` | Queues capture via a live FIFO or saves directly when the server is unavailable. |
 | `nunc serve [--boundary TOKEN] [--source PATH]...` | Runs the foreground FIFO and refreshes the index from local files. |
+| `nunc duplicates [ID] [--threshold N] [--limit N] [--exact] [--json]` | Finds candidate exact or semantic duplicates. |
+| `nunc git ingest\|import\|sync\|hook` | Captures selected commit history or manages the post-commit hook. |
+| `nunc consolidate candidates\|apply\|undo` | Retrieves full candidate entries, commits an external summary, or undoes an archive. |
+| `nunc forget ID... [--dry-run\|--yes] [--json]` | Deletes only the specified entries after warning about dependencies. |
 | `nunc reindex [--full] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
 | `nunc search QUERY... [--limit N] [--json] [--type memory\|source] [--source PATH]...` | Ranks compatible indexed vectors by cosine similarity. |
 | `nunc models download` | Explicitly downloads and validates the pinned model and tokenizer. |
@@ -37,7 +41,74 @@ Use absolute overrides outside the worktree. The index is `<state>/<repo-id>/ind
 
 Default limit is 5, with a range of 1–1000. `--type` selects memories or sources. Repeatable `--source` filters by exact repository-relative paths or directory prefixes and selects source results. Deleted paths remain usable as filters while the existing index is stale. An empty result set is successful.
 
-`--json` prints one object with `mode_used` (always `semantic`), `repo_id`, `warnings`, and `results`. Result fields are `id`, `kind`, `path`, `timestamp`, `line_start`, `line_end`, `text`, `score`, and `rank`. Source ranges are one-based and inclusive. Missing provenance values are null. Memory text is the original body and source text is the original chunk. Rank starts at one, with descending cosine and ascending ID for exact ties. Search reports stale or unverifiable snapshots in `warnings` (stderr in human mode). Use `reindex` for fresh offline results.
+- `--context chunk` returns the matched slice and is the default. `section` returns its enclosing Markdown section up to the next heading. `parent` returns the original full note body or source file. For plain text, section context is the full file. These options change the returned text while ranking the same chunks.
+- `--sort semantic` orders by the final similarity score. `--sort recent` uses the original timestamp first, then score, with undated sources last. Exact ties use the stable chunk ID.
+- `--recency-boost` enables a maximum contribution of 0.05. Specify `--recency-boost=0.1` for a different maximum, with 0 disabling it and 0.2 as the limit. The contribution is `maximum × 2^(-age_days / half_life_days)`, with a default half-life of 90 days. Future timestamps are treated as age zero. Missing timestamps contribute zero. The final score is cosine plus the contribution and can exceed 1.
+- `--explain` exposes the matched text, provenance, model ID/revision/dimensions, chunk strategy, context, sort, cosine, recency contribution and final score. The CLI takes one reference time per search.
+- `--raw` includes archived and undone memories. Forgotten entries are excluded in every context.
+
+`--json` returns `mode_used`, `repo_id`, `warnings` and `results`. The original hit fields are retained. `matched_chunk` adds its ID, parent ID, chunk and parent SHA-256, heading hierarchy, one-based inclusive lines and zero-based half-open byte range. Memory locations are relative to the body after front matter. Memory rows keep their parent UUID as `id`. Git results include original commit provenance under `git` and `entry_kind: "git-commit"`. Memory rows expose status, optional archive target and originating source IDs. Search reports stale or unverifiable snapshots in `warnings`.
+
+### Configuration
+
+```toml
+sources = ["docs", "src"]
+
+[chunking]
+strategy = "structural" # or "semantic"
+tokens = 384             # 32–480; leaves room for model framing
+semantic_threshold = 0.80
+
+[search]
+recency_boost = 0.0
+half_life_days = 90.0
+
+[git]
+message_bytes = 16384
+max_paths = 64
+diff_context_bytes = 0
+```
+
+Both strategies preserve CommonMark heading paths and group blocks within a section. Semantic splitting checks cosine between adjacent blocks and adds a boundary below the configured threshold. Use `nunc reindex` after changing chunk settings.
+
+### Duplicate discovery
+
+`nunc duplicates [ID] --json` compares current parent content using a whitespace-normalized, case-sensitive SHA-256. Without an ID it inspects all eligible entries and configured source files. With an ID it limits results to pairs involving that parent. `--exact` skips the index and model. With the default 0.90 threshold, indexed passage comparisons can find paraphrases and similar passages. A `chunk` match establishes similarity between two fragments. High similarity can also flag conflicting revisions. Every match includes excerpts, IDs, paths, timestamps and chunk provenance when applicable.
+
+`nunc write --check-duplicates [--threshold N]` reports candidates on stderr before normal capture. Capture continues if the model or index is unavailable. Neither duplicate command suppresses entries. Semantic all-pairs comparisons scale quadratically with indexed chunks.
+
+## Git history
+
+```sh
+nunc git ingest HEAD
+nunc git import --all --dry-run
+nunc git import --limit 100 --since 2026-01-01
+nunc git import --range HEAD~50..HEAD
+nunc git sync
+nunc git hook install
+nunc git hook status
+nunc git hook uninstall
+```
+
+Default import and sync walk current HEAD ancestry in Git's descendants-first topological order. `--all` considers commits reachable from all refs. `--range A..B` takes commits reachable from B and excludes those reachable from A. Range and all are mutually exclusive. Date (UTC midnight, Git committer date) and positive limit can narrow any scope. Merges produce their own memory and use first-parent changes. Sync walks HEAD but opens commit details only for unseen IDs. Rewritten commits with new hashes are new memories. Existing Markdown from earlier commits remains available. Interrupted imports can be rerun and dry runs create no durable files.
+
+The optional managed post-commit hook invokes the installed CLI path and leaves Git commit success independent of ingestion. An existing or shared hook is preserved, with instructions to chain `nunc git ingest HEAD` explicitly. The command honors worktree-local `core.hooksPath`. Entries include full SHA, author, both dates, bounded messages and filtered changed paths/statistics. Binary bodies and patch hunks are omitted by default. Enabling `git.diff_context_bytes` adds bounded, heuristically redacted text for included paths. Inspect imported content before sharing it. Capture works without a model or server. Cached inference reconciles after runs selecting up to 256 commits. For larger runs, use the watcher or run `nunc reindex` after capture.
+
+## Consolidation and forget
+
+```sh
+nunc consolidate candidates "FIFO concurrency" --json
+nunc consolidate apply --entries "$first,$second" --summary "An external summary."
+nunc consolidate apply --entries "$first,$second" --summary-from-file summary.md
+nunc consolidate apply --entries "$first,$second" --summary-stdin < summary.md
+nunc consolidate undo "$summary"
+nunc forget "$first" --dry-run --json
+nunc forget "$first" "$second" --yes
+```
+
+The three summary inputs are alternatives for a single operation. Generate the summary text externally. Candidates return one best match per active parent with full body and revision. Pass repeating `--revision ID=HASH` preconditions using the candidate parent hash for stale-write protection. Applying an identical summary to unchanged entries can safely be retried. A nested summary must be undone from the outside inward. Undo restores surviving originals and leaves the old summary in `--raw` with status `undone`.
+
+Forget validates every target, warns about direct and transitive dependent summaries, and requires typing `yes` in an interactive terminal or using `--yes`. Both modes show dependency warnings. A dry run writes nothing. Forget deletes only explicitly named UUIDs and retains no deleted body in its tombstone. Surviving summaries remain byte-for-byte unchanged and display forgotten-source markers. Git backfill respects tombstones. Forgetting a summary explicitly preserves its archive associations until that consolidation is undone. Git history, backups, filesystem remnants, and text copied into surviving summaries may still retain the information.
 
 ## Receipts and exit status
 

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 pub(crate) fn private_dir(path: &Path) -> Result<()> {
@@ -31,9 +31,15 @@ pub(crate) fn sync_dir(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
+    atomic_write_mode(path, bytes, replace, 0o600)
+}
+
+pub(crate) fn atomic_write_mode(path: &Path, bytes: &[u8], replace: bool, mode: u32) -> Result<()> {
     let parent = path.parent().context("publication path has no parent")?;
     let publish = || -> Result<()> {
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(mode))?;
         tmp.write_all(bytes)?;
         tmp.as_file().sync_all()?;
         if replace {

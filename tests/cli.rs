@@ -468,3 +468,671 @@ fn real_watcher_reconciles_changes_deletions_and_restart() -> Result<()> {
     server.stop()?;
     Ok(())
 }
+
+impl Fixture {
+    fn json(&self, args: &[&str]) -> Result<Value> {
+        Ok(serde_json::from_slice(&self.run(args)?.stdout)?)
+    }
+
+    fn log_id(&self, text: &str) -> Result<String> {
+        String::from_utf8(self.run(&["log", text])?.stdout)?
+            .split_whitespace()
+            .nth(1)
+            .map(str::to_owned)
+            .context("missing receipt ID")
+    }
+
+    fn git(&self, args: &[&str]) -> Result<Output> {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.repo)
+            .args([
+                "-c",
+                "user.name=Test Agent",
+                "-c",
+                "user.email=agent@example.test",
+            ])
+            .args(args)
+            .env("NUNC_STATE_DIR", &self.state)
+            .env("NUNC_MODEL_CACHE_DIR", &self.cache);
+        checked(cmd.output()?)
+    }
+
+    fn commit(&self, body: &str, message: &str) -> Result<String> {
+        fs::write(self.repo.join("note.txt"), body)?;
+        self.git(&["add", "note.txt"])?;
+        self.git(&["commit", "-qm", message])?;
+        Ok(String::from_utf8(self.git(&["rev-parse", "HEAD"])?.stdout)?
+            .trim()
+            .to_owned())
+    }
+
+    fn entry_bytes(&self, id: &str) -> Result<Vec<u8>> {
+        Ok(fs::read(
+            self.local().join("entries").join(format!("{id}.md")),
+        )?)
+    }
+
+    fn summary(&self, ids: &str, body: &str) -> Result<String> {
+        let response = self.json(&[
+            "consolidate",
+            "apply",
+            "--entries",
+            ids,
+            "--summary",
+            body,
+            "--json",
+        ])?;
+        response["summary_id"]
+            .as_str()
+            .map(str::to_owned)
+            .context("missing summary ID")
+    }
+}
+
+#[test]
+fn duplicate_check_works_without_cached_embeddings() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let first = fixture.log_id("Writer lock controls interleaving.")?;
+    let second = fixture.log_id("Writer  lock\ncontrols interleaving. ")?;
+    fixture.log_id("Writer lock changes owner after restart.")?;
+    let result = fixture.json(&["duplicates", &first, "--json"])?;
+    assert_eq!(result["matches"].as_array().map(Vec::len), Some(1));
+    let found = &result["matches"][0];
+    assert_eq!(found["detection"], "exact");
+    assert_eq!(found["scope"], "entry");
+    assert!(
+        ["left", "right"]
+            .iter()
+            .any(|side| found[*side]["id"] == second)
+    );
+    assert!(
+        !result["warnings"]
+            .as_array()
+            .context("missing duplicate warnings")?
+            .is_empty()
+    );
+    let written = fixture.run(&[
+        "write",
+        "--check-duplicates",
+        "Writer lock controls interleaving.",
+    ])?;
+    assert!(String::from_utf8(written.stderr)?.contains("exact entry"));
+    assert_eq!(fixture.entries()?.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn git_history_and_hook_share_idempotency_and_respect_existing_hooks() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let first = fixture.commit("data", "Serialize writers")?;
+    let second = fixture.commit("new data", "Keep model assets local")?;
+    let dry = fixture.run(&["git", "import", "--all", "--limit", "1", "--dry-run"])?;
+    assert!(String::from_utf8(dry.stdout)?.contains(&format!("{second} would import")));
+    assert!(!fixture.local().exists());
+    assert!(
+        fixture
+            .nunc(&[
+                "git",
+                "import",
+                "--all",
+                "--range",
+                &format!("{first}..{second}")
+            ])
+            .output()?
+            .status
+            .code()
+            == Some(2)
+    );
+    fixture.run(&["git", "import", "--range", &format!("{first}..{second}")])?;
+    assert_eq!(fixture.entries()?.len(), 1);
+    fixture.run(&["git", "import", "--all"])?;
+    fixture.run(&["git", "sync"])?;
+    fixture.run(&["git", "ingest", &first])?;
+    fixture.run(&["git", "import", "--since", "2999-01-01"])?;
+    assert_eq!(fixture.entries()?.len(), 2);
+    let metadata = fixture
+        .entries()?
+        .into_iter()
+        .map(|entry| {
+            let metadata = entry
+                .strip_prefix("---\n")
+                .and_then(|s| s.split_once("\n---\n"))
+                .context("missing front matter")?
+                .0;
+            Ok(serde_json::from_str::<Value>(metadata)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert!(metadata.iter().any(|entry| entry["kind"] == "git-commit"
+        && entry["commit"]["sha"] == second
+        && entry["commit"]["paths"][0] == "note.txt"
+        && entry["commit"]["committed_at"] == entry["timestamp"]));
+
+    fs::create_dir(fixture.repo.join("hooks"))?;
+    fixture.git(&["config", "core.hooksPath", "hooks"])?;
+    let hook = fixture.repo.join("hooks/post-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 0\n")?;
+    assert!(
+        !fixture
+            .nunc(&["git", "hook", "install"])
+            .output()?
+            .status
+            .success()
+    );
+    assert_eq!(fs::read_to_string(&hook)?, "#!/bin/sh\nexit 0\n");
+    fs::remove_file(&hook)?;
+    fixture.run(&["git", "hook", "install"])?;
+    assert!(
+        String::from_utf8(fixture.run(&["git", "hook", "status"])?.stdout)?.contains("installed")
+    );
+    fixture.commit("third", "Move capture off the embedding path")?;
+    fixture.git(&["commit", "--amend", "-qm", "Amended capture design"])?;
+    assert_eq!(fixture.entries()?.len(), 4);
+    fixture.run(&["git", "sync"])?;
+    assert_eq!(fixture.entries()?.len(), 4);
+    fixture.run(&["git", "hook", "uninstall"])?;
+    assert!(!hook.exists());
+    Ok(())
+}
+
+#[test]
+fn consolidation_validates_revisions_handles_all_inputs_and_forgets_only_targets() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let original = fixture.log_id("Original FIFO lock design")?;
+    let second = fixture.log_id("A concurrent writer test")?;
+    let ids = format!("{original},{second}");
+    let input_file = fixture.repo.join("summary.md");
+    fs::write(&input_file, "File summary\r\n\nPreserve all input.")?;
+    let file_name = input_file.to_str().context("invalid fixture filename")?;
+    let invalid = fixture
+        .nunc(&[
+            "consolidate",
+            "apply",
+            "--entries",
+            &ids,
+            "--summary",
+            "s",
+            "--summary-stdin",
+        ])
+        .output()?;
+    assert_eq!(invalid.status.code(), Some(2));
+    let stale = fixture
+        .nunc(&[
+            "consolidate",
+            "apply",
+            "--entries",
+            &ids,
+            "--summary",
+            "s",
+            "--revision",
+            &format!("{original}=stale"),
+        ])
+        .output()?;
+    assert!(!stale.status.success());
+    assert_eq!(fixture.entries()?.len(), 2);
+    let first = fixture.json(&[
+        "consolidate",
+        "apply",
+        "--entries",
+        &ids,
+        "--summary-from-file",
+        file_name,
+        "--json",
+    ])?;
+    let first_id = first["summary_id"]
+        .as_str()
+        .context("missing file summary ID")?;
+    assert_eq!(first["status"], "applied");
+    assert!(
+        fixture
+            .entry_bytes(first_id)?
+            .ends_with(b"File summary\r\n\nPreserve all input.")
+    );
+    let retry = fixture.json(&[
+        "consolidate",
+        "apply",
+        "--entries",
+        &ids,
+        "--summary-from-file",
+        file_name,
+        "--json",
+    ])?;
+    assert_eq!(retry["summary_id"], first_id);
+    assert_eq!(retry["status"], "already-applied");
+
+    let mut child = fixture
+        .nunc(&[
+            "consolidate",
+            "apply",
+            "--entries",
+            first_id,
+            "--summary-stdin",
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("missing stdin")?
+        .write_all(b"Stdin summary")?;
+    let nested: Value = serde_json::from_slice(&checked(child.wait_with_output()?)?.stdout)?;
+    let nested_id = nested["summary_id"]
+        .as_str()
+        .context("missing nested summary ID")?;
+    assert!(
+        !fixture
+            .nunc(&["consolidate", "undo", first_id])
+            .output()?
+            .status
+            .success()
+    );
+
+    let before = fixture.entry_bytes(nested_id)?;
+    let dry = fixture.json(&["forget", &original, "--dry-run", "--json"])?;
+    let dependencies = dry["dependencies"]
+        .as_array()
+        .context("missing dependencies")?;
+    assert!(
+        dependencies
+            .iter()
+            .any(|dep| dep["summary_id"] == first_id && dep["direct"] == true)
+    );
+    assert!(
+        dependencies
+            .iter()
+            .any(|dep| dep["summary_id"] == nested_id && dep["direct"] == false)
+    );
+    assert_eq!(fixture.entries()?.len(), 4);
+    assert!(
+        !fixture
+            .nunc(&["forget", &original])
+            .stdin(Stdio::null())
+            .output()?
+            .status
+            .success()
+    );
+    let outcome = fixture.json(&["forget", &original, "--yes", "--json"])?;
+    assert_eq!(outcome["targets"][0], original);
+    assert_eq!(fixture.entry_bytes(nested_id)?, before);
+    assert!(fixture.entry_bytes(&original).is_err());
+    assert!(fixture.entry_bytes(&second).is_ok());
+    assert_eq!(
+        fixture.json(&["forget", &original, "--yes", "--json"])?["already_forgotten"][0],
+        original
+    );
+    assert!(
+        !fixture
+            .nunc(&["forget", "00000000-0000-0000-0000-000000000010", "--yes"])
+            .output()?
+            .status
+            .success()
+    );
+    fixture.run(&["consolidate", "undo", nested_id])?;
+    fixture.run(&["consolidate", "undo", first_id])?;
+    let inline = fixture.summary(&second, "Replacement inline summary")?;
+    assert!(
+        fixture
+            .entry_bytes(&inline)?
+            .ends_with(b"Replacement inline summary")
+    );
+    let outcome = fixture.json(&["forget", first_id, &inline, "--yes", "--json"])?;
+    assert_eq!(outcome["targets"].as_array().map(Vec::len), Some(2));
+    assert!(fixture.entry_bytes(first_id).is_err());
+    assert!(fixture.entry_bytes(&inline).is_err());
+    assert!(fixture.entry_bytes(nested_id).is_ok());
+    assert!(fixture.entry_bytes(&second).is_ok());
+    Ok(())
+}
+
+#[test]
+fn forgotten_git_commit_cannot_be_restored_by_sync_import_or_hook_command() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let _sha = fixture.commit("fixture", "Never reuse a removed lease record")?;
+    fixture.run(&["git", "import", "--all"])?;
+    let entry = fs::read_dir(fixture.local().join("entries"))?
+        .next()
+        .context("missing Git note")??
+        .path();
+    let id = entry
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .context("missing ID")?;
+    fixture.run(&["forget", id, "--yes"])?;
+    for args in [
+        &["git", "import", "--all"][..],
+        &["git", "sync"][..],
+        &["git", "ingest", "HEAD"][..],
+    ] {
+        let result = fixture.run(args)?;
+        assert!(String::from_utf8(result.stdout)?.contains("1 forgotten"));
+    }
+    fixture.run(&["git", "hook", "install"])?;
+    let hook = Command::new(fixture.repo.join(".git/hooks/post-commit"))
+        .current_dir(&fixture.repo)
+        .env("NUNC_STATE_DIR", &fixture.state)
+        .env("NUNC_MODEL_CACHE_DIR", &fixture.cache)
+        .output()?;
+    assert!(hook.status.success());
+    assert!(String::from_utf8(hook.stderr)?.contains("1 forgotten"));
+    assert!(fixture.entries()?.is_empty());
+    assert!(!fs::read_to_string(fixture.local().join("ledger.json"))?.contains("Never reuse"));
+    Ok(())
+}
+
+#[test]
+fn overlapping_consolidations_serialize() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let id = fixture.log_id("A shared candidate")?;
+    let spawn = |text: &str| -> Result<Child> {
+        Ok(fixture
+            .nunc(&[
+                "consolidate",
+                "apply",
+                "--entries",
+                &id,
+                "--summary",
+                text,
+                "--json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?)
+    };
+    let a = spawn("First concurrent summary")?;
+    let b = spawn("Second concurrent summary")?;
+    let (a, b) = (a.wait_with_output()?, b.wait_with_output()?);
+    assert_ne!(a.status.success(), b.status.success());
+    assert_eq!(fixture.entries()?.len(), 2);
+    assert!(fixture.entry_bytes(&id).is_ok());
+    let failed = if a.status.success() { b } else { a };
+    assert!(String::from_utf8(failed.stderr)?.contains("already archived"));
+    Ok(())
+}
+
+#[test]
+fn git_merge_reports_changes_relative_to_first_parent() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.commit("base", "Base commit")?;
+    let main = String::from_utf8(fixture.git(&["branch", "--show-current"])?.stdout)?;
+    fixture.git(&["checkout", "-qb", "side"])?;
+    fs::write(fixture.repo.join("side.md"), "Added on side")?;
+    fixture.git(&["add", "side.md"])?;
+    fixture.git(&["commit", "-qm", "Side commit"])?;
+    fixture.git(&["checkout", "-q", main.trim()])?;
+    fixture.commit("main updated", "Main change")?;
+    fixture.git(&["merge", "--no-ff", "side", "-qm", "Merge decisions"])?;
+    fixture.run(&["git", "import", "--all"])?;
+    let records = fixture.entries()?;
+    assert_eq!(records.len(), 4);
+    let merge = records
+        .iter()
+        .find(|entry| entry.contains("Merge decisions"))
+        .context("missing merge memory")?;
+    let metadata: Value = serde_json::from_str(
+        merge
+            .split_once("\n---\n")
+            .context("missing merge metadata")?
+            .0
+            .trim_start_matches("---\n"),
+    )?;
+    assert_eq!(metadata["commit"]["paths"], serde_json::json!(["side.md"]));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn real_context_explanations_duplicates_and_lifecycle() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let long = format!(
+        "# Architecture\n\n{}\n\n## Writer serialization\n\nCooperative FIFO writers acquire an advisory interprocess lock before sending a frame.\n\n```sh\nnunc write \"hello\"\n```\n",
+        "Garden soil can retain moisture. ".repeat(180)
+    );
+    let parent = fixture.log_id(&long)?;
+    let paraphrase = fixture
+        .log_id("Senders serialize writes to the named pipe using an advisory process lock.")?;
+    let distinct = fixture.log_id(
+        "Revised design: the capture process accepts only one sender. There is no writer lock.",
+    )?;
+    fixture.run(&["reindex"])?;
+    let query = "How do different processes take turns sending messages through the pipe?";
+    let hits = fixture.json(&[
+        "search",
+        "--context",
+        "section",
+        "--recency-boost=0.05",
+        "--explain",
+        "--json",
+        "--limit",
+        "10",
+        query,
+    ])?;
+    let hit = hits["results"]
+        .as_array()
+        .context("no search results")?
+        .iter()
+        .find(|v| {
+            v["id"] == parent && v["matched_chunk"]["heading_path"][1] == "Writer serialization"
+        })
+        .context("missing long entry chunk")?;
+    assert!(
+        hit["matched_chunk"]["line_start"]
+            .as_u64()
+            .is_some_and(|line| line > 3)
+    );
+    assert!(
+        hit["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("nunc write") && !text.contains("Garden"))
+    );
+    let explanation = &hit["explanation"];
+    let number = |name: &str| {
+        explanation[name]
+            .as_f64()
+            .with_context(|| format!("missing {name}"))
+    };
+    assert!(
+        (number("similarity")? + number("recency_contribution")? - number("final_score")?).abs()
+            < 1e-12
+    );
+    assert!((0.0..=0.05).contains(&number("recency_contribution")?));
+    let legacy = fixture.json(&[
+        "search", "--json", "--sort", "recent", "--limit", "1", query,
+    ])?;
+    assert_eq!(legacy["results"][0]["id"], distinct);
+
+    let pairs = fixture.json(&["duplicates", &parent, "--threshold", "0.86", "--json"])?;
+    let pairs = pairs["matches"].as_array().context("no duplicate list")?;
+    assert!(pairs.iter().any(|pair| pair["detection"] == "semantic"
+        && pair["scope"] == "chunk"
+        && (pair["left"]["id"] == paraphrase || pair["right"]["id"] == paraphrase)));
+    // Similarity is heuristic. A more restrictive cutoff must exclude the distinct revision.
+    let strict = fixture.json(&["duplicates", &parent, "--threshold", "0.96", "--json"])?;
+    assert!(
+        strict["matches"]
+            .as_array()
+            .context("no strict list")?
+            .iter()
+            .all(|pair| pair["left"]["id"] != distinct && pair["right"]["id"] != distinct)
+    );
+
+    let candidates = fixture.json(&[
+        "consolidate",
+        "candidates",
+        query,
+        "--limit",
+        "10",
+        "--json",
+    ])?;
+    let selected = candidates["results"]
+        .as_array()
+        .context("no candidates")?
+        .iter()
+        .find(|v| v["id"] == parent)
+        .context("missing full candidate")?;
+    assert_eq!(selected["text"], long);
+    let revision = selected["matched_chunk"]["parent_hash"]
+        .as_str()
+        .context("no hash")?;
+    let summary = fixture.json(&[
+        "consolidate",
+        "apply",
+        "--entries",
+        &format!("{parent},{paraphrase}"),
+        "--summary",
+        "Advisory locks serialize FIFO writers across processes.",
+        "--revision",
+        &format!("{parent}={revision}"),
+        "--json",
+    ])?;
+    let id = summary["summary_id"].as_str().context("no summary ID")?;
+    let results = |raw: bool| -> Result<Vec<Value>> {
+        let mut args = vec!["search", "--json", "--limit", "100"];
+        if raw {
+            args.push("--raw");
+        }
+        args.push(query);
+        Ok(fixture.json(&args)?["results"]
+            .as_array()
+            .context("no results list")?
+            .clone())
+    };
+    assert!(
+        results(false)?
+            .iter()
+            .all(|hit| hit["id"] != parent && hit["id"] != paraphrase)
+    );
+    assert!(results(true)?.iter().any(|hit| hit["id"] == parent
+        && hit["status"] == "archived"
+        && hit["archived_into"] == id));
+    fixture.run(&["reindex", "--full"])?;
+    assert!(
+        results(false)?
+            .iter()
+            .any(|hit| hit["id"] == id && hit["status"] == "consolidated")
+    );
+    let bytes = fixture.entry_bytes(id)?;
+    fixture.run(&["forget", &paraphrase, "--yes"])?;
+    fixture.run(&["reindex", "--full"])?;
+    let raw = results(true)?;
+    assert!(raw.iter().all(|hit| hit["id"] != paraphrase));
+    assert!(raw.iter().any(|hit| hit["id"] == id
+        && hit["sources"].as_array().is_some_and(|refs| {
+            refs.iter()
+                .any(|r| r["id"] == paraphrase && r["forgotten"] == true)
+        })));
+    assert_eq!(fixture.entry_bytes(id)?, bytes);
+    fixture.run(&["consolidate", "undo", id])?;
+    assert!(results(false)?.iter().all(|hit| hit["id"] != id));
+    assert!(results(false)?.iter().any(|hit| hit["id"] == parent));
+    assert!(
+        results(true)?
+            .iter()
+            .any(|hit| hit["id"] == id && hit["status"] == "undone")
+    );
+
+    // Simulate interruption just after the durable forget intent was published.
+    let interrupted =
+        fixture.log_id("Disposable record left behind after durable forget intent")?;
+    fixture.run(&["reindex"])?;
+    let ledger = fixture.local().join("ledger.json");
+    let mut data: Value = serde_json::from_slice(&fs::read(&ledger)?)?;
+    data["forgotten"][&interrupted] = serde_json::json!({});
+    fs::write(&ledger, serde_json::to_vec(&data)?)?;
+    assert!(fixture.entry_bytes(&interrupted).is_ok());
+    assert!(results(true)?.iter().all(|hit| hit["id"] != interrupted));
+    fixture.run(&["reindex"])?;
+    assert!(fixture.entry_bytes(&interrupted).is_err());
+    Ok(())
+}
+
+#[test]
+fn git_capture_bounds_diff_content_and_redacts_obvious_credentials() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fs::write(
+        fixture.repo.join(".env"),
+        "PRIVATE_EXAMPLE=secret-content\n",
+    )?;
+    fs::write(
+        fixture.repo.join("service.txt"),
+        "Normal context line\npassword=unsafe-fixture-value\n",
+    )?;
+    fixture.git(&["add", ".env", "service.txt"])?;
+    fixture.git(&[
+        "commit",
+        "-qm",
+        "Update context",
+        "-m",
+        "Authorization: unsafe-fixture-token",
+    ])?;
+    fixture.run(&["init"])?;
+    fs::write(
+        fixture.local().join("config.toml"),
+        "[git]\ndiff_context_bytes = 512\n",
+    )?;
+    fixture.run(&["git", "ingest", "HEAD"])?;
+    let notes = fixture.entries()?;
+    assert_eq!(notes.len(), 1);
+    let note = &notes[0];
+    assert!(note.contains("Normal context line"));
+    assert!(note.contains("[redacted]"));
+    assert!(!note.contains(".env"));
+    assert!(!note.contains("secret-content"));
+    assert!(!note.contains("unsafe-fixture"));
+    Ok(())
+}
+
+#[test]
+fn concurrent_forget_is_idempotent_and_preserves_unrelated_entries() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let target = fixture.log_id("Explicit concurrent forget target")?;
+    let keep = fixture.log_id("Unrelated note")?;
+    let spawn = || -> Result<Child> {
+        Ok(fixture
+            .nunc(&["forget", &target, "--yes", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?)
+    };
+    let children = [spawn()?, spawn()?];
+    let mut deleted = 0;
+    let mut idempotent = 0;
+    for child in children {
+        let report: Value = serde_json::from_slice(&checked(child.wait_with_output()?)?.stdout)?;
+        deleted += report["targets"]
+            .as_array()
+            .context("missing forget targets")?
+            .len();
+        idempotent += report["already_forgotten"]
+            .as_array()
+            .context("missing idempotency report")?
+            .len();
+    }
+    assert_eq!((deleted, idempotent), (1, 1));
+    assert!(fixture.entry_bytes(&target).is_err());
+    assert!(fixture.entry_bytes(&keep).is_ok());
+    Ok(())
+}
+
+#[test]
+fn upgrades_default_privacy_ignore_without_overwriting_custom_rules() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.run(&["init"])?;
+    let ignore = fixture.local().join(".gitignore");
+    fs::write(
+        &ignore,
+        "/entries/\n/input.fifo\n/session.json\n/*.lock\n/.tmp*\n",
+    )?;
+    fixture.log_id("Upgrade old ignore rules")?;
+    assert!(
+        fs::read_to_string(&ignore)?
+            .lines()
+            .any(|line| line == "/ledger.json")
+    );
+    fs::write(&ignore, "custom-pattern\n")?;
+    fixture.log_id("Preserve custom rules")?;
+    assert_eq!(fs::read_to_string(&ignore)?, "custom-pattern\n");
+    Ok(())
+}

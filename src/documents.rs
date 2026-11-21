@@ -1,10 +1,12 @@
-use crate::entries;
+use crate::chunk::{Chunk, Settings};
+use crate::entries::{self, Commit, EntryKind};
 use crate::fs::{bounded_read, private_dir};
+use crate::ledger::{Ledger, Visibility};
 use crate::repo::{Repo, excluded, hash};
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use rustix::fs::{Mode, OFlags, openat};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -14,8 +16,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SOURCE_LIMIT: usize = 2 * 1024 * 1024;
-const CHUNK_BYTES: usize = 1200;
-const CHUNKER: &str = "line-bytes-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -49,21 +49,62 @@ pub(crate) struct Provenance {
     pub timestamp: Option<String>,
     pub line_start: Option<usize>,
     pub line_end: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_chunk: Option<MatchedChunk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_kind: Option<EntryKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<Commit>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<Visibility>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct MatchedChunk {
+    pub id: String,
+    pub parent_id: String,
+    pub content_hash: String,
+    pub parent_hash: String,
+    pub heading_path: Vec<String>,
+    pub line_start: usize,
+    pub line_end: usize,
+    #[serde(default)]
+    pub byte_start: usize,
+    #[serde(default)]
+    pub byte_end: usize,
+}
+
+impl MatchedChunk {
+    pub fn new(id: String, hash: String, parent: &Document, chunk: &Chunk) -> Self {
+        Self {
+            id,
+            parent_id: parent.provenance.id.clone(),
+            content_hash: hash,
+            parent_hash: parent.hash.clone(),
+            heading_path: chunk.headings.clone(),
+            line_start: chunk.lines[0],
+            line_end: chunk.lines[1],
+            byte_start: chunk.span.start,
+            byte_end: chunk.span.end,
+        }
+    }
 }
 
 pub(crate) struct Document {
     pub provenance: Provenance,
     pub text: String,
     pub hash: String,
+    pub markdown: bool,
 }
 
 impl Document {
-    fn new(provenance: Provenance, text: String) -> Self {
+    fn new(provenance: Provenance, text: String, markdown: bool) -> Self {
         let hash = hash(text.as_bytes());
         Self {
             provenance,
             text,
             hash,
+            markdown,
         }
     }
 }
@@ -71,34 +112,48 @@ impl Document {
 pub(crate) struct Snapshot {
     pub documents: Vec<Document>,
     pub digest: String,
+    pub chunking: Settings,
 }
 
 impl Snapshot {
     pub(crate) fn read(repo: &Repo) -> Result<Self> {
         let config = repo.config()?;
-        let mut documents = memories(repo)?;
+        let ledger = Ledger::read(repo)?;
+        let mut documents = memories(repo, &ledger)?;
         for path in source_files(repo, &config.sources)? {
             if let Some(text) = read_source(&repo.root, &path)? {
                 let name = path.to_str().context("source path must be UTF-8")?;
-                for (ordinal, (text, first, last)) in chunks(&text).into_iter().enumerate() {
-                    let id = hash(format!("{CHUNKER}\0{name}\0{ordinal}").as_bytes());
+                let markdown = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ["md", "markdown", "mdown"]
+                            .iter()
+                            .any(|name| ext.eq_ignore_ascii_case(name))
+                    });
+                if !text.trim().is_empty() {
                     documents.push(Document::new(
                         Provenance {
-                            id: format!("source:{id}"),
+                            id: format!("source:{}", hash(name.as_bytes())),
                             kind: Kind::Source,
                             path: name.to_owned(),
                             timestamp: None,
-                            line_start: Some(first),
-                            line_end: Some(last),
+                            line_start: None,
+                            line_end: None,
+                            matched_chunk: None,
+                            entry_kind: None,
+                            git: None,
+                            visibility: None,
                         },
                         text,
+                        markdown,
                     ));
                 }
             }
         }
         documents.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
         let mut digest = Sha256::new();
-        digest.update(serde_json::to_vec(&config.sources)?);
+        digest.update(serde_json::to_vec(&(&config.sources, &config.chunking))?);
         for doc in &documents {
             digest.update(serde_json::to_vec(&doc.provenance)?);
             digest.update(doc.hash.as_bytes());
@@ -106,11 +161,12 @@ impl Snapshot {
         Ok(Self {
             documents,
             digest: format!("{:x}", digest.finalize()),
+            chunking: config.chunking,
         })
     }
 }
 
-fn memories(repo: &Repo) -> Result<Vec<Document>> {
+fn memories(repo: &Repo, ledger: &Ledger) -> Result<Vec<Document>> {
     let dir = repo.entries();
     match fs::symlink_metadata(&dir) {
         Ok(_) => private_dir(&dir)?,
@@ -123,7 +179,18 @@ fn memories(repo: &Repo) -> Result<Vec<Document>> {
         if path.extension().is_none_or(|extension| extension != "md") {
             continue;
         }
+        if path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| uuid::Uuid::parse_str(stem).ok())
+            .is_some_and(|id| ledger.forgotten(id))
+        {
+            continue;
+        }
         let entry = entries::read(&path)?;
+        if ledger.pending_summary(&entry) {
+            continue;
+        }
         let id = entry.metadata.id.to_string();
         result.push(Document::new(
             Provenance {
@@ -133,8 +200,13 @@ fn memories(repo: &Repo) -> Result<Vec<Document>> {
                 timestamp: Some(entry.metadata.timestamp.to_rfc3339()),
                 line_start: None,
                 line_end: None,
+                matched_chunk: None,
+                entry_kind: Some(entry.metadata.kind),
+                git: entry.metadata.commit,
+                visibility: None,
             },
             entry.body,
+            true,
         ));
     }
     Ok(result)
@@ -246,41 +318,6 @@ fn read_source(root: &Path, path: &Path) -> Result<Option<String>> {
     read().with_context(|| format!("read source {}", path.display()))
 }
 
-fn chunks(text: &str) -> Vec<(String, usize, usize)> {
-    let mut out = Vec::new();
-    let mut buffer = String::new();
-    let mut first = 1;
-    let mut last = 1;
-    let flush = |out: &mut Vec<_>, buf: &mut String, first, last| {
-        if buf.trim().is_empty() {
-            buf.clear();
-        } else {
-            out.push((std::mem::take(buf), first, last));
-        }
-    };
-    for (offset, line) in text.split_inclusive('\n').enumerate() {
-        let number = offset + 1;
-        let mut remaining = line;
-        while !remaining.is_empty() {
-            let mut take = remaining.len().min(CHUNK_BYTES);
-            while !remaining.is_char_boundary(take) {
-                take -= 1;
-            }
-            if buffer.len() + take > CHUNK_BYTES {
-                flush(&mut out, &mut buffer, first, last);
-            }
-            if buffer.is_empty() {
-                first = number;
-            }
-            buffer.push_str(&remaining[..take]);
-            last = number;
-            remaining = &remaining[take..];
-        }
-    }
-    flush(&mut out, &mut buffer, first, last);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,7 +353,7 @@ mod tests {
         fs::remove_file(dir.path().join("src/x.rs"))?;
         let second = Snapshot::read(&repo)?;
         assert_eq!(second.documents.len(), 1);
-        assert_eq!(second.documents[0].provenance.line_end, Some(1));
+        assert_eq!(second.documents[0].text, "changed\n");
         let original = first
             .documents
             .iter()
@@ -327,24 +364,5 @@ mod tests {
         assert!(repo.configure(&["docs/link".into()], true).is_err());
         assert!(repo.configure(&["../outside".into()], true).is_err());
         Ok(())
-    }
-
-    #[test]
-    fn long_unicode_lines_have_deterministic_provenance() {
-        let line = format!("x{}\r\n", "é".repeat(CHUNK_BYTES));
-        let parts = chunks(&format!("{line}done\n"));
-        assert!(parts.iter().all(|(text, _, _)| text.len() <= CHUNK_BYTES));
-        assert_eq!(
-            parts.first().map(|(_, start, end)| (*start, *end)),
-            Some((1, 1))
-        );
-        assert_eq!(parts.last().map(|(_, _, end)| *end), Some(2));
-        assert_eq!(
-            parts
-                .into_iter()
-                .map(|(text, _, _)| text)
-                .collect::<String>(),
-            format!("{line}done\n")
-        );
     }
 }

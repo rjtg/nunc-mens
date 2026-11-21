@@ -20,3 +20,5 @@
 /temp/
 *.log
 .DS_Store
+
+/.nunc/ledger.json

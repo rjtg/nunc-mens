@@ -1,16 +1,20 @@
-use crate::documents::{Document, Kind, Provenance, Snapshot};
+use crate::chunk::{self, Chunk, Strategy};
+use crate::documents::{Document, Kind, MatchedChunk, Provenance, Snapshot};
+use crate::entries::{Commit, EntryKind};
 use crate::fs::{effective_uid, lockfile, private_dir, sync_dir};
-use crate::repo::Repo;
+use crate::ledger::Guard;
+use crate::repo::{Repo, hash};
 use crate::vectors::{self, Embedder, Model};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, params};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const INDEX_NAME: &str = "index.sqlite3";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const BATCH: usize = 16;
 const SCHEMA: &str = "
     CREATE TABLE metadata (
@@ -19,22 +23,34 @@ const SCHEMA: &str = "
         model_id TEXT NOT NULL,
         model_revision TEXT NOT NULL,
         dimensions INTEGER NOT NULL CHECK (dimensions > 0),
-        digest TEXT NOT NULL
+        digest TEXT NOT NULL,
+        chunking TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE parents (
+        id TEXT PRIMARY KEY,
+        text TEXT NOT NULL,
+        revision TEXT NOT NULL,
+        layout_key TEXT NOT NULL,
+        layout TEXT NOT NULL,
+        origin TEXT NOT NULL
     ) STRICT;
     CREATE TABLE documents (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL CHECK (kind IN ('memory', 'source')),
         path TEXT NOT NULL,
         timestamp TEXT,
-        line_start INTEGER,
-        line_end INTEGER,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
         text TEXT NOT NULL,
         hash TEXT NOT NULL,
         vector BLOB NOT NULL,
-        CHECK ((kind = 'memory' AND timestamp IS NOT NULL AND line_start IS NULL AND line_end IS NULL)
-             OR (kind = 'source' AND timestamp IS NULL AND line_start IS NOT NULL
-                 AND line_end IS NOT NULL AND line_start >= 1 AND line_end >= line_start))
+        parent_id TEXT NOT NULL,
+        chunk TEXT NOT NULL,
+        section_start INTEGER NOT NULL,
+        section_end INTEGER NOT NULL
     ) STRICT;
+    CREATE INDEX chunk_hash ON documents(hash);
+    CREATE INDEX chunk_parent ON documents(parent_id);
 ";
 
 pub(crate) struct Index<'a> {
@@ -53,6 +69,7 @@ pub(crate) struct Reader {
     conn: Connection,
     _lock: File,
     pub digest: String,
+    pub strategy: Strategy,
     dimensions: usize,
 }
 
@@ -74,6 +91,8 @@ impl<'a> Index<'a> {
     }
 
     pub(crate) fn refresh(&self, embedder: &mut impl Embedder, full: bool) -> Result<Refresh> {
+        let guard = Guard::acquire(self.repo, true)?;
+        guard.cleanup_files()?;
         self.prepare()?;
         let lock = lockfile(&self.dir.join("index.lock"))?;
         lock.lock().context("lock index for refresh")?;
@@ -86,10 +105,20 @@ impl<'a> Index<'a> {
                 self.rebuild(&path, snapshot, embedder, existing)
             } else {
                 let mut connection = open(&path, false)?;
+                let version: u32 =
+                    connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+                if version == 1 {
+                    drop(connection);
+                    return self.rebuild(&path, snapshot, embedder, existing);
+                }
                 let digest = check(&connection, self.repo, model)?;
                 if digest == snapshot.digest {
                     return Ok(Refresh {
-                        documents: snapshot.documents.len(),
+                        documents: connection.query_row(
+                            "SELECT count(*) FROM documents",
+                            [],
+                            |row| row.get(0),
+                        )?,
                         ..Refresh::default()
                     });
                 }
@@ -141,6 +170,38 @@ impl<'a> Index<'a> {
         Ok(report)
     }
 
+    pub(crate) fn purge(&self, ids: impl Iterator<Item = uuid::Uuid>) -> Result<()> {
+        let path = self.path();
+        if !existing_private_file(&path)? {
+            return Ok(());
+        }
+        private_dir(&self.dir)?;
+        let lock = lockfile(&self.dir.join("index.lock"))?;
+        lock.lock()?;
+        let mut conn = open(&path, false)?;
+        let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        ensure!(
+            version == 1 || version == VERSION,
+            "incompatible index; run nunc reindex --full"
+        );
+        let tx = conn.transaction()?;
+        let mut erased = 0;
+        for id in ids {
+            let id = id.to_string();
+            if version == 1 {
+                erased += tx.execute("DELETE FROM documents WHERE id=?1", [&id])?;
+            } else {
+                erased += tx.execute("DELETE FROM documents WHERE parent_id=?1", [&id])?;
+                erased += tx.execute("DELETE FROM parents WHERE id=?1", [&id])?;
+            }
+        }
+        if erased != 0 {
+            tx.execute("UPDATE metadata SET digest=''", [])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn read(&self, model: Model) -> Result<Option<Reader>> {
         let path = self.path();
         if !existing_private_file(&path)? {
@@ -155,10 +216,14 @@ impl<'a> Index<'a> {
             }
             let conn = open(&path, true)?;
             let digest = check(&conn, self.repo, model)?;
+            let chunking: String =
+                conn.query_row("SELECT chunking FROM metadata", [], |row| row.get(0))?;
+            let strategy = serde_json::from_str(&chunking)?;
             Ok(Some(Reader {
                 conn,
                 _lock: lock,
                 digest,
+                strategy,
                 dimensions: model.dimensions,
             }))
         };
@@ -231,105 +296,182 @@ fn update_rows(
 ) -> Result<Refresh> {
     let model = embedder.model();
     let transaction = conn.transaction()?;
-    transaction.execute(
-        "CREATE TEMP TABLE seen (id TEXT PRIMARY KEY) WITHOUT ROWID",
-        [],
+    transaction.execute_batch(
+        "
+        CREATE TEMP TABLE seen (id TEXT PRIMARY KEY) WITHOUT ROWID;
+        CREATE TEMP TABLE seen_parents (id TEXT PRIMARY KEY) WITHOUT ROWID;
+    ",
     )?;
-    let mut report = Refresh {
-        documents: snapshot.documents.len(),
-        ..Refresh::default()
-    };
-    {
-        let mut seen = transaction.prepare("INSERT INTO seen(id) VALUES (?1)")?;
-        let mut known = transaction.prepare("SELECT hash FROM documents WHERE id = ?1")?;
+    let mut report = Refresh::default();
+    let layout_key = hash(&serde_json::to_vec(&snapshot.chunking)?);
+    for parent in &snapshot.documents {
+        let id = &parent.provenance.id;
+        transaction.execute("INSERT INTO seen_parents VALUES (?1)", [id])?;
+        let origin =
+            serde_json::to_string(&(&parent.provenance.entry_kind, &parent.provenance.git))?;
+        let known: Option<String> = transaction
+            .query_row(
+                "SELECT layout FROM parents WHERE id=?1 AND revision=?2 AND layout_key=?3",
+                params![id, parent.hash, layout_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let layout: Vec<Chunk> = match known {
+            Some(json) => {
+                transaction.execute(
+                    "UPDATE parents SET origin=?2 WHERE id=?1 AND origin!=?2",
+                    params![id, origin],
+                )?;
+                serde_json::from_str(&json)?
+            }
+            None => {
+                let layout =
+                    chunk::layout(&parent.text, parent.markdown, &snapshot.chunking, embedder)
+                        .with_context(|| format!("chunk {}", parent.provenance.path))?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO parents VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![
+                        id,
+                        parent.text,
+                        parent.hash,
+                        layout_key,
+                        serde_json::to_string(&layout)?,
+                        origin
+                    ],
+                )?;
+                layout
+            }
+        };
+        report.documents += layout.len();
+        let mut occurrences = HashMap::new();
         let mut changed = Vec::new();
-        for doc in &snapshot.documents {
-            let id = &doc.provenance.id;
-            seen.execute([id])?;
-            let hash: Option<String> = known.query_row([id], |row| row.get(0)).optional()?;
-            if hash.as_ref() == Some(&doc.hash) {
-                update_provenance(&transaction, doc)?;
+        for chunk in &layout {
+            let text = parent
+                .text
+                .get(chunk.span.clone())
+                .context("invalid cached chunk span")?;
+            let digest = hash(text.as_bytes());
+            let occurrence = occurrences.entry(digest.clone()).or_insert(0);
+            let id = format!(
+                "chunk:{}",
+                hash(format!("{id}\0{digest}\0{occurrence}").as_bytes())
+            );
+            *occurrence += 1;
+            transaction.execute("INSERT INTO seen VALUES (?1)", [&id])?;
+            let existing: Option<Vec<u8>> = transaction
+                .query_row(
+                    "SELECT vector FROM documents WHERE hash=?1 LIMIT 1",
+                    [&digest],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let data = ChunkData {
+                provenance: MatchedChunk::new(id, digest, parent, chunk),
+                text,
+                chunk,
+            };
+            if let Some(vector) = existing {
+                store(&transaction, parent, &data, &vector)?;
             } else {
-                changed.push(doc);
+                changed.push(data);
                 if changed.len() == BATCH {
-                    report.embedded += store_batch(&transaction, embedder, &changed)?;
+                    report.embedded += store_batch(&transaction, embedder, parent, &changed)?;
                     changed.clear();
                 }
             }
         }
-        report.embedded += store_batch(&transaction, embedder, &changed)?;
+        report.embedded += store_batch(&transaction, embedder, parent, &changed)?;
     }
     report.deleted = transaction.execute(
         "DELETE FROM documents WHERE id NOT IN (SELECT id FROM seen)",
         [],
     )?;
     transaction.execute(
-        "INSERT OR REPLACE INTO metadata VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        "DELETE FROM parents WHERE id NOT IN (SELECT id FROM seen_parents)",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO metadata VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             repo.id,
             model.id,
             model.revision,
             model.dimensions,
-            snapshot.digest
+            snapshot.digest,
+            serde_json::to_string(&snapshot.chunking.strategy)?
         ],
     )?;
     transaction.commit()?;
     Ok(report)
 }
 
-fn update_provenance(tx: &Transaction<'_>, doc: &Document) -> Result<()> {
-    let p = &doc.provenance;
+struct ChunkData<'a> {
+    provenance: MatchedChunk,
+    text: &'a str,
+    chunk: &'a Chunk,
+}
+
+fn store(
+    tx: &Transaction<'_>,
+    parent: &Document,
+    data: &ChunkData<'_>,
+    vector: &[u8],
+) -> Result<()> {
+    let p = &parent.provenance;
+    let c = &data.provenance;
     tx.prepare_cached(
-        "UPDATE documents SET path = ?2, timestamp = ?3, line_start = ?4, line_end = ?5
-         WHERE id = ?1 AND (path IS NOT ?2 OR timestamp IS NOT ?3 OR line_start IS NOT ?4 OR line_end IS NOT ?5)",
-    )?.execute(
-        params![p.id, p.path, p.timestamp, p.line_start, p.line_end],
-    )?;
+        "INSERT INTO documents VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+         ON CONFLICT(id) DO UPDATE SET timestamp=excluded.timestamp, line_start=excluded.line_start,
+         line_end=excluded.line_end, chunk=excluded.chunk, section_start=excluded.section_start, section_end=excluded.section_end
+         WHERE timestamp IS NOT excluded.timestamp OR chunk != excluded.chunk OR section_start != excluded.section_start OR section_end != excluded.section_end",
+    )?.execute(params![c.id, p.kind.as_str(), p.path, p.timestamp, c.line_start, c.line_end,
+        data.text, c.content_hash, vector, c.parent_id, serde_json::to_string(c)?, data.chunk.section.start, data.chunk.section.end])?;
     Ok(())
 }
 
 fn store_batch(
     tx: &Transaction<'_>,
     embedder: &mut impl Embedder,
-    docs: &[&Document],
+    parent: &Document,
+    chunks: &[ChunkData<'_>],
 ) -> Result<usize> {
-    if docs.is_empty() {
+    if chunks.is_empty() {
         return Ok(0);
     }
-    let passages: Vec<_> = docs.iter().map(|doc| doc.text.as_str()).collect();
+    let passages: Vec<_> = chunks.iter().map(|chunk| chunk.text).collect();
     let embeddings = embedder
         .passages(&passages)
-        .context("embed changed documents")?;
+        .context("embed changed chunks")?;
     ensure!(
-        embeddings.len() == docs.len(),
+        embeddings.len() == chunks.len(),
         "model returned the wrong number of embeddings"
     );
-    let mut stmt = tx.prepare_cached(
-        "INSERT OR REPLACE INTO documents
-         (id, kind, path, timestamp, line_start, line_end, text, hash, vector)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )?;
-    let dimensions = embedder.model().dimensions;
-    for (doc, vector) in docs.iter().zip(embeddings) {
-        let p = &doc.provenance;
-        let blob = vectors::encode(&vector, dimensions)
-            .with_context(|| format!("validate vector at {}", p.path))?;
-        stmt.execute(params![
-            p.id,
-            p.kind.as_str(),
-            p.path,
-            p.timestamp,
-            p.line_start,
-            p.line_end,
-            doc.text,
-            doc.hash,
-            blob
-        ])?;
+    for (chunk, vector) in chunks.iter().zip(embeddings) {
+        let blob = vectors::encode(&vector, embedder.model().dimensions)
+            .with_context(|| format!("validate vector at {}", parent.provenance.path))?;
+        store(tx, parent, chunk, &blob)?;
     }
-    Ok(docs.len())
+    Ok(chunks.len())
 }
 
 impl Reader {
+    pub(crate) fn origin(&self, id: &str) -> Result<(Option<EntryKind>, Option<Commit>)> {
+        let value: String =
+            self.conn
+                .query_row("SELECT origin FROM parents WHERE id=?1", [id], |row| {
+                    row.get(0)
+                })?;
+        Ok(serde_json::from_str(&value)?)
+    }
+
+    pub(crate) fn parent(&self, id: &str) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT text FROM parents WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?)
+    }
+
     pub(crate) fn scan(
         &self,
         kind: Option<Kind>,
@@ -337,7 +479,7 @@ impl Reader {
         mut visit: impl FnMut(IndexedRow<'_, '_>, &[f32]) -> Result<()>,
     ) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, path, timestamp, line_start, line_end, text, vector
+            "SELECT id, kind, path, timestamp, line_start, line_end, text, vector, parent_id, chunk, section_start, section_end
              FROM documents WHERE ?1 IS NULL OR kind = ?1",
         )?;
         let mut rows = stmt.query([kind.map(Kind::as_str)])?;
@@ -366,15 +508,40 @@ impl IndexedRow<'_, '_> {
         Ok(self.row.get_ref(0)?.as_str()?)
     }
 
+    pub(crate) fn parent_id(&self) -> Result<&str> {
+        Ok(self.row.get_ref(8)?.as_str()?)
+    }
+
+    pub(crate) fn timestamp(&self) -> Result<Option<&str>> {
+        Ok(self.row.get_ref(3)?.as_str_or_null()?)
+    }
+
+    pub(crate) fn section(&self) -> Result<std::ops::Range<usize>> {
+        Ok(self.row.get(10)?..self.row.get(11)?)
+    }
+
+    pub(crate) fn matched(&self) -> Result<Option<MatchedChunk>> {
+        Ok(Some(serde_json::from_str(self.row.get_ref(9)?.as_str()?)?))
+    }
+
     pub(crate) fn document(&self) -> Result<(Provenance, String)> {
         let row = self.row;
+        let kind = Kind::parse(row.get_ref(1)?.as_str()?)?;
         let source = Provenance {
-            id: row.get(0)?,
-            kind: Kind::parse(row.get_ref(1)?.as_str()?)?,
+            id: if kind == Kind::Memory {
+                row.get(8)?
+            } else {
+                row.get(0)?
+            },
+            kind,
             path: row.get(2)?,
             timestamp: row.get(3)?,
             line_start: row.get(4)?,
             line_end: row.get(5)?,
+            matched_chunk: self.matched()?,
+            entry_kind: None,
+            git: None,
+            visibility: None,
         };
         Ok((source, row.get(6)?))
     }
@@ -403,6 +570,13 @@ mod tests {
             MODEL
         }
 
+        fn token_offsets(&self, text: &str) -> Result<Vec<(usize, usize)>> {
+            Ok(text
+                .char_indices()
+                .map(|(i, c)| (i, i + c.len_utf8()))
+                .collect())
+        }
+
         fn passages(&mut self, passages: &[&str]) -> Result<Vec<Vec<f32>>> {
             self.calls += passages.len();
             if self.invalid {
@@ -410,6 +584,54 @@ mod tests {
             }
             Ok(passages.iter().map(|_| vec![1.0, -0.5]).collect())
         }
+    }
+
+    #[test]
+    fn unchanged_chunk_keeps_its_identity_and_embedding_after_line_shift() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir(&root)?;
+        let repo = Repo::new(&root)?;
+        let index = Index {
+            repo: &repo,
+            dir: temp.path().join("state"),
+        };
+        let path = root.join("design.md");
+        let original = "# Before\n\nA changing note.\n\n## Stable\n\nUnchanged writer policy.\n";
+        fs::write(&path, original)?;
+        repo.configure(&["design.md".into()], true)?;
+        let mut model = Mock::default();
+        assert_eq!(index.refresh(&mut model, false)?.embedded, 2);
+        let stable = || -> Result<(String, usize)> {
+            let reader = index.read(MODEL)?.context("missing index")?;
+            let mut found = None;
+            reader.scan(
+                None,
+                |_| true,
+                |row, _| {
+                    let chunk = row.matched()?.context("missing provenance")?;
+                    if chunk
+                        .heading_path
+                        .last()
+                        .is_some_and(|heading| heading == "Stable")
+                    {
+                        found = Some((chunk.id, chunk.line_start));
+                    }
+                    Ok(())
+                },
+            )?;
+            found.context("missing stable chunk")
+        };
+        let first = stable()?;
+        fs::write(
+            path,
+            original.replace("A changing note.", "A changing note.\nA second line."),
+        )?;
+        assert_eq!(index.refresh(&mut model, false)?.embedded, 1);
+        let second = stable()?;
+        assert_eq!(first.0, second.0);
+        assert_eq!(second.1, first.1 + 1);
+        Ok(())
     }
 
     #[test]
@@ -449,7 +671,7 @@ mod tests {
         assert_eq!(index.read(MODEL)?.context("no index")?.digest, original);
         model.invalid = false;
         let next = index.refresh(&mut model, false)?;
-        assert_eq!((next.documents, next.embedded, next.deleted), (1, 1, 1));
+        assert_eq!((next.documents, next.embedded, next.deleted), (1, 1, 2));
         let reader = index.read(MODEL)?.context("no index")?;
         reader.scan(
             None,

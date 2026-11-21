@@ -33,6 +33,20 @@ nunc doctor
 
 Markdown originals live at `.nunc/entries/<uuid>.md`. The index lives under XDG state and can be rebuilt with `nunc reindex --full`. Model files live under XDG cache. The model download prepares about 487 MB of data. Search inference runs locally with FastEmbed, SQLite stores the vectors, and Rust ranks them by cosine similarity. Keep private notes and indexed source text out of published artifacts. Local Git ignore rules exclude new memory files by default.
 
+## Work with project history
+
+The current source supports semantic retrieval of Markdown chunks with section and parent context, optional recency, and ranking explanations. It also supports duplicate discovery, Git import, and explicit memory lifecycle operations.
+
+```sh
+nunc search --context section --explain "Why did authentication fail?"
+nunc duplicates --json
+nunc git import --all --dry-run
+nunc git import --limit 100
+nunc consolidate candidates "deploy clock synchronization" --json
+```
+
+Use `consolidate apply` to save a summary you provide and archive its originals. Use `search --raw` to inspect archived history. `forget --dry-run` shows dependencies before an explicit deletion. To back up these relationships, retain both your Markdown entries and `.nunc/ledger.json`. [CLI reference](docs/CLI.md)
+
 ## Build and test
 
 Use Rust 1.89 or newer, Git, a C/C++ toolchain, and the system TLS development libraries (OpenSSL on Linux). The default ONNX Runtime build targets are glibc Linux on x86-64 or AArch64 and macOS on Apple Silicon. The first build may retrieve the CPU ONNX Runtime distribution. Runtime model downloads are initiated separately by `nunc models download`.

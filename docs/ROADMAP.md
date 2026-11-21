@@ -11,4 +11,15 @@ The MVP implementation follows [the implementation plan](IMPLEMENTATION_PLAN.md)
 | H | Automatic polling refresh, index diagnostics, CLI documentation and CI |
 | I | Real executable verification with a development conversation journal and source changes |
 
-Possible later work includes an event-driven watcher for larger repositories, context-aware splitting for long memories, packaged binaries and measured search/indexing scale limits. Alternative retrieval modes and additional adapters are outside this MVP.
+Subsequent milestones are tracked in [the M5–M9 plan](M5_M9_PLAN.md).
+
+| Issue | Deliverable |
+| --- | --- |
+| [#2](https://github.com/rjtg/nunc-mens/issues/2) | Structural and optional semantic chunks with section and parent context |
+| [#3](https://github.com/rjtg/nunc-mens/issues/3) | Recency ranking and explanations |
+| [#4](https://github.com/rjtg/nunc-mens/issues/4) | Exact and semantic duplicate discovery |
+| [#5](https://github.com/rjtg/nunc-mens/issues/5) | Shared Git commit ingestion, history import and an optional hook |
+| [#6](https://github.com/rjtg/nunc-mens/issues/6) | Recoverable consolidation, archived search and undo |
+| [#7](https://github.com/rjtg/nunc-mens/issues/7) | Explicit forget with dependency warnings and tombstones |
+
+Possible later work includes an event-driven watcher for larger repositories, packaged binaries and larger-corpus performance measurements.

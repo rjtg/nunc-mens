@@ -37,7 +37,7 @@ fn watch(repo: &Repo, stop: Receiver<()>) {
             }) => {
                 if embedded + deleted > 0 || last_error.is_some() {
                     eprintln!(
-                        "Indexed {documents} documents ({embedded} embedded, {deleted} deleted)"
+                        "Indexed {documents} chunks ({embedded} embedded, {deleted} deleted)"
                     );
                 }
                 last_error = None;

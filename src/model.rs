@@ -59,7 +59,7 @@ const TOK_CONFIG: Artifact = Artifact {
 };
 const ARTIFACTS: &[Artifact] = &[WEIGHTS, TOKENIZER, CONFIG, SPECIAL, TOK_CONFIG];
 
-pub(crate) struct LocalModel(TextEmbedding);
+pub(crate) struct LocalModel(TextEmbedding, tokenizers::Tokenizer);
 
 impl LocalModel {
     pub(crate) fn load(repo: &Repo) -> Result<Self> {
@@ -82,7 +82,12 @@ impl LocalModel {
             .with_intra_threads(4);
         let embedding = TextEmbedding::try_new_from_user_defined(model, options)
             .with_context(|| format!("load FastEmbed/ONNX model from {}", dir.display()))?;
-        Ok(Self(embedding))
+        let mut tokenizer = embedding.tokenizer.clone();
+        tokenizer
+            .with_truncation(None)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        tokenizer.with_padding(None);
+        Ok(Self(embedding, tokenizer))
     }
 
     pub(crate) fn query(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -103,6 +108,14 @@ impl LocalModel {
 impl Embedder for LocalModel {
     fn model(&self) -> Model {
         MODEL
+    }
+
+    fn token_offsets(&self, text: &str) -> Result<Vec<(usize, usize)>> {
+        let encoded = self
+            .1
+            .encode(text, false)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(encoded.get_offsets().to_vec())
     }
 
     fn passages(&mut self, passages: &[&str]) -> Result<Vec<Vec<f32>>> {

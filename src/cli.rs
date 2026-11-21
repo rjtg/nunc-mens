@@ -1,15 +1,20 @@
 use crate::documents::{Kind, Snapshot};
+use crate::duplicates::{self, DEFAULT_THRESHOLD};
 use crate::entries::{self, ContextFields, MAX_BODY};
 use crate::fifo::{self, Delivery};
+use crate::git;
 use crate::index::Index;
+use crate::ledger::{self, Guard, Ledger};
 use crate::model::{self, LocalModel, MODEL};
 use crate::repo::Repo;
-use crate::search;
+use crate::search::{self, ContextMode, Sort};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(name = "nunc", version, about, arg_required_else_help = true)]
@@ -42,7 +47,26 @@ enum Action {
         source: Vec<PathBuf>,
     },
     /// Capture through the FIFO when available, or save directly.
-    Write(Capture),
+    Write {
+        #[command(flatten)]
+        input: Capture,
+        #[arg(long)]
+        check_duplicates: bool,
+        #[arg(long, requires = "check_duplicates")]
+        threshold: Option<f64>,
+    },
+    /// Compare normalized content and semantic embeddings without changing entries.
+    Duplicates {
+        id: Option<String>,
+        #[arg(long, default_value_t = DEFAULT_THRESHOLD)]
+        threshold: f64,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
+        #[arg(long)]
+        exact: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Refresh the semantic index from Markdown and registered sources.
     Reindex {
         /// Build a fresh database and publish it after successful inference.
@@ -63,6 +87,37 @@ enum Action {
         kind: Option<Kind>,
         #[arg(long)]
         source: Vec<PathBuf>,
+        #[arg(long, value_enum, default_value = "chunk")]
+        context: ContextMode,
+        #[arg(long, value_enum, default_value = "semantic")]
+        sort: Sort,
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "0.05")]
+        recency_boost: Option<f64>,
+        #[arg(long)]
+        explain: bool,
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Import Git commits and manage the optional local post-commit hook.
+    Git {
+        #[command(subcommand)]
+        command: GitAction,
+    },
+    /// Find candidates, apply an external summary, or undo an archive operation.
+    Consolidate {
+        #[command(subcommand)]
+        command: Consolidation,
+    },
+    /// Permanently remove only the explicitly named memory entries.
+    Forget {
+        #[arg(required = true)]
+        entries: Vec<Uuid>,
+        #[arg(long, conflicts_with = "yes")]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Manage the local embedding model.
     Models {
@@ -73,6 +128,69 @@ enum Action {
     Status,
     /// Check local configuration and prerequisites.
     Doctor,
+}
+
+#[derive(Subcommand)]
+enum GitAction {
+    Ingest {
+        revision: String,
+    },
+    Import {
+        #[arg(long, conflicts_with = "range")]
+        all: bool,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: Option<u32>,
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        since: Option<chrono::NaiveDate>,
+        #[arg(long, value_name = "REV..REV")]
+        range: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Sync,
+    Hook {
+        #[command(subcommand)]
+        command: HookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookAction {
+    Install,
+    Status,
+    Uninstall,
+}
+
+#[derive(Subcommand)]
+enum Consolidation {
+    Candidates {
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(group(clap::ArgGroup::new("summary_input").required(true).args(["summary", "summary_from_file", "summary_stdin"])))]
+    Apply {
+        #[arg(long, required = true, value_delimiter = ',')]
+        entries: Vec<Uuid>,
+        #[arg(long, value_name = "ID=HASH")]
+        revision: Vec<String>,
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long)]
+        summary_from_file: Option<PathBuf>,
+        #[arg(long)]
+        summary_stdin: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Undo {
+        id: Uuid,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -94,17 +212,21 @@ impl Capture {
         if !self.stdin {
             return Ok(self.text.join(" "));
         }
-        let stdin = io::stdin();
-        ensure!(!stdin.is_terminal(), "pipe text into --stdin");
-        let mut bytes = Vec::new();
-        stdin
-            .lock()
-            .take(MAX_BODY as u64 + 1)
-            .read_to_end(&mut bytes)
-            .context("read entry from stdin")?;
-        ensure!(bytes.len() <= MAX_BODY, "entry exceeds {MAX_BODY} bytes");
-        String::from_utf8(bytes).context("entry must be UTF-8")
+        input_stdin()
     }
+}
+
+fn input_stdin() -> Result<String> {
+    let stdin = io::stdin();
+    ensure!(!stdin.is_terminal(), "pipe text into stdin");
+    let mut bytes = Vec::new();
+    stdin
+        .lock()
+        .take(MAX_BODY as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("read text from stdin")?;
+    ensure!(bytes.len() <= MAX_BODY, "input exceeds {MAX_BODY} bytes");
+    String::from_utf8(bytes).context("input must be UTF-8")
 }
 
 pub fn run() -> ExitCode {
@@ -148,16 +270,50 @@ fn execute(action: Action) -> Result<()> {
             )?);
         }
         Action::Serve { boundary, source } => fifo::serve(&repo, boundary, &source)?,
-        Action::Write(input) => match fifo::write(&repo, &input.body()?)? {
-            Delivery::Queued => println!("Queued for FIFO delivery"),
-            Delivery::Saved(receipt) => print_receipt(receipt),
-        },
+        Action::Write {
+            input,
+            check_duplicates,
+            threshold,
+        } => {
+            let body = input.body()?;
+            if check_duplicates {
+                let threshold = threshold.unwrap_or(DEFAULT_THRESHOLD);
+                ensure!(
+                    (0.0..=1.0).contains(&threshold),
+                    "duplicate threshold must be between 0 and 1"
+                );
+                match duplicates::check_write(&repo, &body, threshold) {
+                    Ok(report) => print_duplicates(report, &mut io::stderr().lock())?,
+                    Err(error) => eprintln!("nunc: duplicate check unavailable: {error:#}"),
+                }
+            }
+            match fifo::write(&repo, &body)? {
+                Delivery::Queued => println!("Queued for FIFO delivery"),
+                Delivery::Saved(receipt) => print_receipt(receipt),
+            }
+        }
+        Action::Duplicates {
+            id,
+            threshold,
+            limit,
+            exact,
+            json,
+        } => {
+            let report = duplicates::find(&repo, id.as_deref(), threshold, limit as usize, exact)?;
+            let mut out = io::stdout().lock();
+            if json {
+                serde_json::to_writer(&mut out, &report)?;
+                writeln!(out)?;
+            } else {
+                print_duplicates(report, &mut out)?;
+            }
+        }
         Action::Reindex { full, source } => {
             repo.configure(&source, false)?;
             let mut model = LocalModel::load(&repo)?;
             let report = Index::for_repo(&repo)?.refresh(&mut model, full)?;
             println!(
-                "Indexed {} documents ({} embedded, {} deleted)",
+                "Indexed {} chunks ({} embedded, {} deleted)",
                 report.documents, report.embedded, report.deleted
             );
         }
@@ -167,8 +323,27 @@ fn execute(action: Action) -> Result<()> {
             json,
             kind,
             source,
+            context,
+            sort,
+            recency_boost,
+            explain,
+            raw,
         } => {
-            let found = search::search(&repo, &query.join(" "), limit as usize, kind, &source)?;
+            let found = search::search(
+                &repo,
+                &query.join(" "),
+                search::Options {
+                    limit: limit as usize,
+                    kind,
+                    sources: &source,
+                    context,
+                    sort,
+                    recency_boost,
+                    explain,
+                    raw,
+                    one_per_parent: false,
+                },
+            )?;
             let mut out = io::stdout().lock();
             if json {
                 serde_json::to_writer(&mut out, &found)?;
@@ -193,13 +368,58 @@ fn execute(action: Action) -> Result<()> {
                     if let (Some(first), Some(last)) = (p.line_start, p.line_end) {
                         write!(out, ":{first}-{last}")?;
                     }
+                    if let Some(visibility) = p.visibility {
+                        write!(out, " {}", visibility.status)?;
+                        if let Some(id) = visibility.archived_into {
+                            write!(out, " → {id}")?;
+                        }
+                        if explain && !visibility.sources.is_empty() {
+                            write!(out, " from {}", serde_json::to_string(&visibility.sources)?)?;
+                        }
+                    }
                     if let Some(timestamp) = p.timestamp {
                         write!(out, " {timestamp}")?;
                     }
+                    if let Some(commit) = p.git {
+                        write!(out, " commit {}", commit.sha)?;
+                    }
                     writeln!(out, " [{}]\n{}\n", p.id, hit.text)?;
+                    if let Some(explanation) = hit.explanation {
+                        writeln!(
+                            out,
+                            "   cosine {:.4} + recency {:.4} = {:.4}; model {} @ {}; {:?} chunks, {:?} order, {:?} context",
+                            explanation.similarity,
+                            explanation.recency_contribution,
+                            explanation.final_score,
+                            explanation.model.id,
+                            explanation.model.revision,
+                            explanation.chunking,
+                            explanation.sort,
+                            explanation.context
+                        )?;
+                        if let Some(chunk) = p.matched_chunk {
+                            writeln!(
+                                out,
+                                "   matched {} in {} at lines {}–{} {}",
+                                chunk.id,
+                                chunk.parent_id,
+                                chunk.line_start,
+                                chunk.line_end,
+                                chunk.heading_path.join(" / ")
+                            )?;
+                        }
+                    }
                 }
             }
         }
+        Action::Git { command } => git_action(&repo, command)?,
+        Action::Consolidate { command } => consolidate(&repo, command)?,
+        Action::Forget {
+            entries,
+            dry_run,
+            yes,
+            json,
+        } => forget(&repo, &entries, dry_run, yes, json)?,
         Action::Models {
             command: ModelAction::Download,
         } => {
@@ -251,6 +471,255 @@ fn status(repo: &Repo, detail: bool) -> Result<()> {
         }
         Some(_) => println!("Index state: present"),
         None => println!("Index state: missing (run nunc reindex after model setup)"),
+    }
+    Ok(())
+}
+
+fn print_duplicates(report: duplicates::Report, out: &mut impl Write) -> Result<()> {
+    for warning in report.warnings {
+        writeln!(out, "nunc: {warning}")?;
+    }
+    for pair in report.matches {
+        writeln!(
+            out,
+            "{} {} {:.4}",
+            pair.detection, pair.scope, pair.similarity
+        )?;
+        for item in [pair.left, pair.right] {
+            writeln!(out, "  {} {} {}", item.id, item.path, item.excerpt)?;
+        }
+    }
+    Ok(())
+}
+
+fn consolidate(repo: &Repo, command: Consolidation) -> Result<()> {
+    match command {
+        Consolidation::Candidates { query, limit, json } => {
+            let found = search::search(
+                repo,
+                &query.join(" "),
+                search::Options {
+                    limit: limit as usize,
+                    kind: Some(Kind::Memory),
+                    sources: &[],
+                    context: ContextMode::Parent,
+                    sort: Sort::Semantic,
+                    recency_boost: Some(0.0),
+                    explain: false,
+                    raw: false,
+                    one_per_parent: true,
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&found)?);
+            } else {
+                for warning in found.warnings {
+                    eprintln!("nunc: {warning}");
+                }
+                for hit in found.results {
+                    let chunk = hit
+                        .source
+                        .matched_chunk
+                        .context("missing candidate revision")?;
+                    println!(
+                        "{} {:.4} {} {}\n{}\n",
+                        hit.source.id, hit.score, hit.source.path, chunk.parent_hash, hit.text
+                    );
+                }
+            }
+        }
+        Consolidation::Apply {
+            entries,
+            revision,
+            summary,
+            summary_from_file,
+            summary_stdin,
+            json,
+        } => {
+            let body = if let Some(body) = summary {
+                body
+            } else if let Some(path) = summary_from_file {
+                String::from_utf8(crate::fs::read_regular(&path, MAX_BODY)?)?
+            } else {
+                ensure!(summary_stdin, "select a summary input");
+                input_stdin()?
+            };
+            let mut expected = BTreeMap::new();
+            for item in revision {
+                let (id, hash) = item
+                    .split_once('=')
+                    .context("revision must have form ID=HASH")?;
+                ensure!(
+                    expected.insert(id.parse()?, hash.to_owned()).is_none(),
+                    "duplicate revision precondition"
+                );
+            }
+            let receipt = Guard::acquire(repo, true)?.apply(&entries, &expected, &body)?;
+            refresh_pending(repo);
+            print_apply(&receipt, json)?;
+        }
+        Consolidation::Undo { id, json } => {
+            let receipt = Guard::acquire(repo, true)?.undo(id)?;
+            refresh_pending(repo);
+            print_apply(&receipt, json)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_apply(receipt: &ledger::Applied, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(receipt)?);
+    } else {
+        println!("{} {}", receipt.status, receipt.summary_id);
+        for id in &receipt.archived_entries {
+            println!("  {id}");
+        }
+    }
+    Ok(())
+}
+
+fn refresh_pending(repo: &Repo) {
+    if let Err(error) = LocalModel::load(repo)
+        .and_then(|mut model| Index::for_repo(repo)?.refresh(&mut model, false))
+    {
+        eprintln!("nunc: durable change saved; indexing pending: {error:#}");
+    }
+}
+
+const INLINE_GIT_REFRESH_LIMIT: usize = 256;
+
+const FORGET_WARNING: &str = "Surviving summaries, Git history, backups, and storage remnants may still contain this information.";
+
+fn forget(repo: &Repo, ids: &[Uuid], dry_run: bool, yes: bool, json: bool) -> Result<()> {
+    if dry_run {
+        return print_forget(
+            &Ledger::read(repo)?.forget_plan(repo, ids)?,
+            "dry-run",
+            json,
+        );
+    }
+    let mut guard = Guard::acquire(repo, true)?;
+    let plan = guard.ledger.forget_plan(repo, ids)?;
+    let interactive = !yes && !plan.targets.is_empty();
+    if interactive {
+        ensure!(
+            io::stdin().is_terminal(),
+            "forget requires an interactive confirmation or --yes"
+        );
+        eprint!("{}", format_forget(&plan, "confirmation required"));
+        eprint!("Type yes to forget these entries: ");
+        io::stderr().flush()?;
+        let mut response = String::new();
+        io::stdin().read_line(&mut response)?;
+        ensure!(
+            response.trim().eq_ignore_ascii_case("yes"),
+            "forget cancelled"
+        );
+    }
+    if !interactive {
+        if json && !plan.targets.is_empty() {
+            eprint!("{}", format_forget(&plan, "forget"));
+        } else if !json {
+            print!("{}", format_forget(&plan, "forget"));
+        }
+    }
+    guard.forget(&plan)?;
+    Index::for_repo(repo)?
+        .purge(guard.forgotten_ids())
+        .context("forget committed; retry forget or run nunc reindex --full to clean the index")?;
+    if json {
+        print_forget(&plan, "forgotten", true)?;
+    } else {
+        println!("Forgot {} entries", plan.targets.len());
+    }
+    Ok(())
+}
+
+fn print_forget(plan: &ledger::ForgetPlan, status: &str, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"status": status, "targets": plan.targets,
+            "already_forgotten": plan.already_forgotten, "dependencies": plan.dependencies,
+            "warnings": [FORGET_WARNING]})
+        );
+    } else {
+        print!("{}", format_forget(plan, status));
+    }
+    Ok(())
+}
+
+fn format_forget(plan: &ledger::ForgetPlan, status: &str) -> String {
+    let mut out = format!("Forget {status}\n");
+    for id in &plan.targets {
+        out.push_str(&format!("  {id}\n"));
+    }
+    for id in &plan.already_forgotten {
+        out.push_str(&format!("  {id} already forgotten\n"));
+    }
+    for dep in &plan.dependencies {
+        let kind = if dep.direct { "direct" } else { "transitive" };
+        out.push_str(&format!(
+            "  affected summary {} ({kind} dependency)\n",
+            dep.summary_id
+        ));
+    }
+    out.push_str(FORGET_WARNING);
+    out.push('\n');
+    out
+}
+
+fn git_action(repo: &Repo, command: GitAction) -> Result<()> {
+    let (counts, dry_run) = match command {
+        GitAction::Ingest { revision } => (git::ingest(repo, &revision)?, false),
+        GitAction::Sync => (git::import(repo, git::Selection::default())?, false),
+        GitAction::Import {
+            all,
+            limit,
+            since,
+            range,
+            dry_run,
+        } => (
+            git::import(
+                repo,
+                git::Selection {
+                    all,
+                    limit,
+                    since,
+                    range,
+                    dry_run,
+                },
+            )?,
+            dry_run,
+        ),
+        GitAction::Hook { command } => {
+            let path = match command {
+                HookAction::Install => git::change_hook(repo, true)?,
+                HookAction::Uninstall => git::change_hook(repo, false)?,
+                HookAction::Status => git::hook_path(repo)?,
+            };
+            println!(
+                "Post-commit hook {} at {}",
+                git::hook_status(repo, &path)?.name(),
+                path.display()
+            );
+            return Ok(());
+        }
+    };
+    let verb = if dry_run { "would import" } else { "saved" };
+    println!(
+        "{} selected, {} {verb}, {} existing, {} forgotten",
+        counts.selected, counts.saved, counts.existing, counts.forgotten
+    );
+    if !dry_run && counts.selected != 0 {
+        if counts.selected <= INLINE_GIT_REFRESH_LIMIT {
+            refresh_pending(repo);
+        } else {
+            eprintln!(
+                "nunc: history saved; run nunc reindex or let nunc serve index the bulk import"
+            );
+        }
     }
     Ok(())
 }

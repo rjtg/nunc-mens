@@ -1,6 +1,7 @@
 use anyhow::{Result, ensure};
+use serde::Serialize;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
 pub(crate) struct Model {
     pub id: &'static str,
     pub revision: &'static str,
@@ -10,6 +11,7 @@ pub(crate) struct Model {
 pub(crate) trait Embedder {
     fn model(&self) -> Model;
     fn passages(&mut self, passages: &[&str]) -> Result<Vec<Vec<f32>>>;
+    fn token_offsets(&self, text: &str) -> Result<Vec<(usize, usize)>>;
 }
 
 pub(crate) fn norm(vector: &[f32], dimensions: usize) -> Result<f64> {
@@ -46,6 +48,16 @@ pub(crate) fn decode(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>> {
         .copied()
         .map(f32::from_le_bytes)
         .collect())
+}
+
+pub(crate) fn cosine(query: &[f32], query_norm: f64, candidate: &[f32]) -> Result<f64> {
+    let candidate_norm = norm(candidate, query.len())?;
+    let dot: f64 = query
+        .iter()
+        .zip(candidate)
+        .map(|(&q, &v)| f64::from(q) * f64::from(v))
+        .sum();
+    Ok((dot / (query_norm * candidate_norm)).clamp(-1.0, 1.0))
 }
 
 #[cfg(test)]

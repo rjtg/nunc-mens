@@ -10,6 +10,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+const OLD_IGNORE: &[u8] = b"/entries/\n/input.fifo\n/session.json\n/*.lock\n/.tmp*\n";
+const LOCAL_IGNORE: &[u8] =
+    b"/entries/\n/ledger.json\n/input.fifo\n/session.json\n/*.lock\n/.tmp*\n";
+
 #[derive(Debug, Clone)]
 pub struct Repo {
     pub root: PathBuf,
@@ -21,6 +25,9 @@ pub struct Repo {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub sources: Vec<PathBuf>,
+    pub(crate) chunking: crate::chunk::Settings,
+    pub(crate) search: crate::search::Settings,
+    pub(crate) git: crate::git::Settings,
 }
 
 impl Repo {
@@ -94,14 +101,14 @@ impl Repo {
         private_dir(&self.local())?;
         let local = self.local();
         let ignore = local.join(".gitignore");
-        if !ignore.try_exists()? {
+        let old_default =
+            || read_regular(&ignore, 4096).is_ok_and(|contents| contents == OLD_IGNORE);
+        if !ignore.try_exists()? || old_default() {
             let _lock = self.config_lock()?;
             if !ignore.try_exists()? {
-                atomic_write(
-                    &ignore,
-                    b"/entries/\n/input.fifo\n/session.json\n/*.lock\n/.tmp*\n",
-                    false,
-                )?;
+                atomic_write(&ignore, LOCAL_IGNORE, false)?;
+            } else if old_default() {
+                atomic_write(&ignore, LOCAL_IGNORE, true)?;
             }
         }
         private_dir(&self.entries())?;
@@ -123,8 +130,14 @@ impl Repo {
         };
         let config: Config = toml::from_str(std::str::from_utf8(&bytes)?)
             .with_context(|| format!("parse {}", path.display()))?;
+        config.chunking.validate()?;
+        config.search.validate()?;
+        config.git.validate()?;
         Ok(Config {
             sources: normalize_sources(&config.sources)?,
+            chunking: config.chunking,
+            search: config.search,
+            git: config.git,
         })
     }
 
@@ -143,7 +156,10 @@ impl Repo {
         for source in &sources {
             self.validate_source(source, false)?;
         }
-        let config = Config { sources };
+        let config = Config {
+            sources,
+            ..self.config()?
+        };
         atomic_write(&path, toml::to_string_pretty(&config)?.as_bytes(), true)
     }
 

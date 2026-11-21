@@ -24,19 +24,19 @@ The CLI examples describe the **target interface**, not currently working comman
 ## Design principles
 
 - **Write-first, offline-capable:** `nunc log` writes directly to Markdown without any model or network request.
-- **Plain text is canonical:** daily journal files are the source of truth; the search database is disposable and reconstructible.
-- **Small and understandable:** one Rust binary, small dependencies, no daemon or MCP requirement.
+- **Plain text is canonical:** individual Markdown entry files are the source of truth; the search database is disposable and reconstructible.
+- **Small and understandable:** one Rust binary, small dependencies, no mandatory daemon or MCP requirement.
 - **Search that works for agents:** machine-readable JSON, stable entry identifiers, timestamps, provenance and useful exit codes.
 - **Hybrid retrieval:** SQLite FTS5 keyword search plus cosine similarity of locally generated embeddings; exact identifiers should not disappear in semantic scores.
 - **In-process embeddings:** use the Rust `fastembed` crate to run a small Hugging Face-hosted ONNX embedding model locally, without Ollama or any HTTP inference service. Explicit `nunc models download` prepares the local cache; indexing/search never downloads models implicitly.
-- **Safe and private:** don't log secrets; enforce local-only defaults; never commit journals, index files, or credentials.
+- **Safe and private:** don't log secrets; enforce local-only defaults; never commit private notes, index files, runtime artifacts, or credentials.
 - **Dogfood the CLI:** contributors and coding agents must use `nunc` to capture work notes and retrieve prior decisions once commands are implemented, and verify actual output rather than pretending tests succeeded.
 
 ## Proposed architecture
 
 ```text
 nunc log / nunc "..."
-    -> $NUNC_JOURNAL_DIR/YYYY-MM-DD.md  (append-only Markdown; source of truth)
+    -> .nunc/entries/<id>.md  (one file per entry; source of truth)
 
 nunc reindex
     -> parse Markdown entries -> stable IDs -> fastembed embeddings -> SQLite index
@@ -46,7 +46,7 @@ nunc search
     -> readable text or --json (CLI and shell-capable agents)
 ```
 
-Recommended defaults: journal in `$HOME/.local/share/nunc-mens/journal`, index in `$HOME/.local/state/nunc-mens/index.sqlite3`, optionally use XDG environment variables. All paths configurable via env/flags. The app must never assume it owns arbitrary user Markdown files.
+Recommended defaults: repository-local `.nunc/entries/`, with repository-scoped index in the XDG state directory and models in the XDG cache directory. All paths configurable via env/flags. The app must never assume it owns arbitrary user Markdown files.
 
 ## Development
 
@@ -64,7 +64,7 @@ cargo run -- --help
 
 ## Agent onboarding
 
-If you are a coding agent, **read `AGENTS.md` first**. Implement the milestones in `docs/ROADMAP.md` in order; create real runnable code and tests, document deviations, and use the resulting tool as part of your own workflow. Do not replace the requested small CLI with QMD, a persistent server, or a hosted memory SaaS.
+If you are a coding agent, **read `AGENTS.md` first**. Implement the milestones in `docs/ROADMAP.md` in order; create real runnable code and tests, document deviations, and use the resulting tool as part of your own workflow. Do not replace the requested small CLI with QMD, a mandatory system-wide server, or a hosted memory SaaS.
 
 ## License
 

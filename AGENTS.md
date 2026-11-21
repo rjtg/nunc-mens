@@ -51,3 +51,14 @@ Read in order: README.md, docs/CLI.md, docs/ARCHITECTURE.md, docs/ROADMAP.md. Tr
 ## Definition of done (MVP)
 
 A new contributor can build `nunc`, run `log`, `reindex`, `search` without MCP, get readable and JSON search results with provenance, recover after deleting the index, operate keyword search with the model cache absent, and run the automated tests. An agent has genuinely used the resulting executable to log and retrieve its own work notes in a temp journal. Document what semantic tests were actually run. Use the CLI's explicit model download command to prepare test models only when allowed.
+
+## Superseding repo-first requirements
+
+**Read [docs/REPO_FIFO.md](docs/REPO_FIFO.md) before implementing. Its repo-local layout and protocol override earlier daily-journal and no-server wording in this document.**
+
+- Discover Git root from nested working directories. Use one `.nunc/entries/<id>.md` file per complete record, not a daily append-only file. Support standalone mode explicitly.
+- Implement optional foreground `nunc serve`: create `.nunc/input.fifo`, publish `.nunc/session.json`, print a cryptographically random boundary or accept validated `--boundary`. Recognize only complete `--<boundary>` delimiter lines. Preserve Markdown blank lines and code fences.
+- Implement `nunc write` and `nunc write --stdin` with safe framing and concurrency handling; `nunc log` remains convenient. If no server is running, write the entry file directly without indefinite blocking. Do not claim FIFO writes are durable acknowledgements.
+- Support repeatable `--source` flags for read-only files/directories, initial indexing, watching, deletion reconciliation, and chunk-level source provenance. No unconfigured directory crawling.
+- Index database is repo-scoped outside Git; runtime FIFO/session artifacts are ignored. Memory files may be deliberately Git-tracked after privacy review, never committed automatically.
+- Dogfood in an isolated temporary Git repo by starting `nunc serve`, writing an actual decision through the FIFO/client, verifying the file, and retrieving it via `nunc search`. Test split delimiters, simultaneous writers, restarts, missing readers, and source updates.

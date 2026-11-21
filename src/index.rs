@@ -467,6 +467,16 @@ fn store_batch(
 }
 
 impl Reader {
+    pub(crate) fn has_source_path(&self, path: &Path, recursive: bool) -> Result<bool> {
+        let path = path.to_str().context("source path is not UTF-8")?;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM documents WHERE kind = 'source'
+              AND (path = ?1 OR (?2 AND substr(path, 1, length(?1) + 1) = ?1 || '/')))",
+            params![path, recursive],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn origin(&self, id: &str) -> Result<(Option<EntryKind>, Option<Commit>)> {
         let value: String =
             self.conn

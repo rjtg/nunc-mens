@@ -170,35 +170,57 @@ impl Repo {
     }
 
     pub(crate) fn validate_source(&self, relative: &Path, allow_missing: bool) -> Result<bool> {
+        match self.source_location(relative)? {
+            SourceLocation::File | SourceLocation::Directory => Ok(true),
+            SourceLocation::Missing if allow_missing => Ok(false),
+            SourceLocation::Unsupported if allow_missing => Ok(false),
+            SourceLocation::Missing => {
+                anyhow::bail!("source path does not exist: {}", relative.display())
+            }
+            SourceLocation::Unsupported => anyhow::bail!(
+                "source is a symlink or special file: {}",
+                relative.display()
+            ),
+        }
+    }
+
+    pub(crate) fn source_location(&self, relative: &Path) -> Result<SourceLocation> {
         let mut path = self.root.clone();
+        let mut location = SourceLocation::Directory;
         for part in relative.components() {
             path.push(part);
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(err)
-                    if allow_missing
-                        && matches!(
-                            err.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                        ) =>
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
                 {
-                    return Ok(false);
+                    return Ok(SourceLocation::Missing);
                 }
                 Err(err) => {
                     return Err(err).with_context(|| format!("inspect source {}", path.display()));
                 }
             };
-            if !metadata.is_dir() && !metadata.is_file() {
-                ensure!(
-                    allow_missing,
-                    "source is a symlink or special file: {}",
-                    path.display()
-                );
-                return Ok(false);
-            }
+            location = if metadata.is_dir() {
+                SourceLocation::Directory
+            } else if metadata.is_file() {
+                SourceLocation::File
+            } else {
+                return Ok(SourceLocation::Unsupported);
+            };
         }
-        Ok(true)
+        Ok(location)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceLocation {
+    File,
+    Directory,
+    Missing,
+    Unsupported,
 }
 
 pub fn source_path(path: &Path) -> Result<PathBuf> {

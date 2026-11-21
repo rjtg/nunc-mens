@@ -1,16 +1,16 @@
 use crate::chunk::Strategy;
 use crate::documents::{Kind, Provenance, Snapshot};
-use crate::index::Index;
+use crate::index::{Index, Reader};
 use crate::ledger::Guard;
 use crate::model::{LocalModel, MODEL};
-use crate::repo::{Repo, source_path};
+use crate::repo::{Repo, SourceLocation, source_path};
 use crate::vectors::{self, cosine};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Serialize)]
 pub(crate) struct Results {
@@ -71,6 +71,7 @@ pub(crate) struct Options<'a> {
     pub limit: usize,
     pub kind: Option<Kind>,
     pub sources: &'a [PathBuf],
+    pub source_files: &'a [PathBuf],
     pub context: ContextMode,
     pub sort: Sort,
     pub recency_boost: Option<f64>,
@@ -109,44 +110,110 @@ struct Ranked {
     timestamp: Option<DateTime<Utc>>,
 }
 
+const MEMORY_PATH: &str = ".nunc/entries";
+
+struct SourceFilter {
+    path: PathBuf,
+    recursive: bool,
+    missing: bool,
+}
+
 struct Filter {
     kind: Option<Kind>,
-    sources: Vec<PathBuf>,
+    memory: bool,
+    sources: Vec<SourceFilter>,
 }
 
 impl Filter {
-    fn new(kind: Option<Kind>, sources: &[PathBuf]) -> Result<Self> {
-        let sources = sources
+    fn new(repo: &Repo, roots: &[PathBuf], options: &Options<'_>) -> Result<Self> {
+        let mut memory = false;
+        let mut sources = Vec::new();
+        for (path, exact) in options
+            .sources
             .iter()
-            .map(|path| source_path(path))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|p| (p, false))
+            .chain(options.source_files.iter().map(|p| (p, true)))
+        {
+            if !exact
+                && path
+                    .components()
+                    .filter(|part| *part != Component::CurDir)
+                    .eq(Path::new(MEMORY_PATH).components())
+            {
+                memory = true;
+                continue;
+            }
+            let path = source_path(path)?;
+            ensure!(
+                roots.iter().any(|root| path.starts_with(root)),
+                "source filter {} is outside the registered sources; register it with nunc init --source or nunc reindex --source",
+                path.display()
+            );
+            let location = repo.source_location(&path)?;
+            ensure!(
+                location != SourceLocation::Unsupported,
+                "source filter is a symlink or special file: {}",
+                path.display()
+            );
+            ensure!(
+                !exact || location != SourceLocation::Directory,
+                "--source-file requires a file: {}",
+                path.display()
+            );
+            sources.push(SourceFilter {
+                path,
+                recursive: !exact && location != SourceLocation::File,
+                missing: location == SourceLocation::Missing,
+            });
+        }
         ensure!(
-            sources.is_empty() || kind != Some(Kind::Memory),
-            "--source requires source results"
+            sources.is_empty() || options.kind != Some(Kind::Memory),
+            "project source filters require source results"
         );
+        ensure!(
+            !memory || options.kind != Some(Kind::Source),
+            "--source .nunc/entries requires memory results"
+        );
+        let kind = if sources.is_empty() && memory {
+            Some(Kind::Memory)
+        } else if !sources.is_empty() && !memory {
+            Some(Kind::Source)
+        } else {
+            options.kind
+        };
         Ok(Self {
-            kind: if sources.is_empty() {
-                kind
-            } else {
-                Some(Kind::Source)
-            },
+            kind,
+            memory,
             sources,
         })
     }
 
+    fn validate_missing(&self, reader: &Reader) -> Result<()> {
+        for source in self.sources.iter().filter(|source| source.missing) {
+            ensure!(
+                reader.has_source_path(&source.path, source.recursive)?,
+                "source filter {} does not exist and has no indexed matches; check the repository-relative path",
+                source.path.display()
+            );
+        }
+        Ok(())
+    }
+
     fn includes(&self, path: &str) -> bool {
-        self.sources.is_empty()
-            || self
-                .sources
-                .iter()
-                .any(|prefix| Path::new(path).starts_with(prefix))
+        let path = Path::new(path);
+        (!self.memory && self.sources.is_empty())
+            || (self.memory && path.starts_with(MEMORY_PATH))
+            || self.sources.iter().any(|filter| {
+                path == filter.path || (filter.recursive && path.starts_with(&filter.path))
+            })
     }
 }
 
 pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<Results> {
     ensure!(!query.trim().is_empty(), "search query must be nonblank");
-    let filter = Filter::new(options.kind, options.sources)?;
-    let mut settings = repo.config()?.search;
+    let config = repo.config()?;
+    let filter = Filter::new(repo, &config.sources, &options)?;
+    let mut settings = config.search;
     if let Some(boost) = options.recency_boost {
         settings.recency_boost = boost;
     }
@@ -161,6 +228,7 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
     let reader = Index::for_repo(repo)?
         .read(MODEL)?
         .context("index is absent; run nunc reindex")?;
+    filter.validate_missing(&reader)?;
     let mut best: Vec<Ranked> = Vec::with_capacity(options.limit);
     reader.scan(
         filter.kind,
@@ -338,13 +406,75 @@ mod tests {
 
     #[test]
     fn filters_are_component_aware_and_repeatable() -> Result<()> {
-        let filter = Filter::new(None, &["./docs".into(), "other/file".into()])?;
-        assert_eq!(filter.kind, Some(Kind::Source));
-        assert!(filter.includes("docs/sub/architecture.md"));
+        let dir = tempfile::tempdir()?;
+        let repo = Repo::new(dir.path())?;
+        std::fs::create_dir_all(dir.path().join("docs/design"))?;
+        std::fs::create_dir(dir.path().join("other"))?;
+        std::fs::write(dir.path().join("other/file"), "decision")?;
+        let roots = ["docs".into(), "other/file".into()];
+        let options = Options {
+            limit: 1,
+            kind: None,
+            sources: &["./docs/design/".into(), "./.nunc/entries/".into()],
+            source_files: &["other/file".into()],
+            context: ContextMode::Chunk,
+            sort: Sort::Semantic,
+            recency_boost: None,
+            explain: false,
+            raw: false,
+            one_per_parent: false,
+        };
+        let filter = Filter::new(&repo, &roots, &options)?;
+        assert_eq!(filter.kind, None);
+        assert!(filter.includes("docs/design/sub/architecture.md"));
         assert!(filter.includes("other/file"));
-        assert!(!filter.includes("docs-old/doc.md"));
+        assert!(filter.includes(".nunc/entries/example.md"));
+        assert!(!filter.includes("docs/design-old/doc.md"));
         assert!(!filter.includes("other/file.txt"));
-        assert!(Filter::new(Some(Kind::Memory), &["docs".into()]).is_err());
+        assert!(
+            Filter::new(
+                &repo,
+                &roots,
+                &Options {
+                    kind: Some(Kind::Memory),
+                    ..options
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            Filter::new(
+                &repo,
+                &roots,
+                &Options {
+                    sources: &["./docs/../secret".into()],
+                    ..options
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            Filter::new(
+                &repo,
+                &roots,
+                &Options {
+                    source_files: &["docs/design".into()],
+                    ..options
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            Filter::new(
+                &repo,
+                &roots,
+                &Options {
+                    sources: &["elsewhere".into()],
+                    ..options
+                }
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

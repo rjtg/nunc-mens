@@ -318,8 +318,6 @@ fn real_fastembed_semantic_search_and_json_provenance() -> Result<()> {
             "search",
             "--json",
             "--source",
-            "unselected",
-            "--source",
             "docs",
             "time synchronization",
         ])?
@@ -1532,5 +1530,161 @@ fn standalone_read_after_write_and_concurrent_visibility_follow_the_contract() -
     assert!(contains(&raw, &archived));
     assert!(!contains(&raw, &forgotten));
     assert!(fixture.entry_bytes(&forgotten).is_err());
+    Ok(())
+}
+
+#[test]
+fn invalid_source_filters_fail_before_model_initialization() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fs::create_dir(fixture.repo.join("design"))?;
+    fs::create_dir(fixture.repo.join("design-old"))?;
+    std::os::unix::fs::symlink("../design-old", fixture.repo.join("design/link"))?;
+    fixture.run(&["init", "--source", "design"])?;
+    for (flag, path, expected) in [
+        ("--source", "design-old", "outside the registered sources"),
+        ("--source", "../outside", "repository-relative"),
+        ("--source", "design/link", "symlink or special file"),
+        ("--source-file", "design", "requires a file"),
+    ] {
+        let failure = fixture.nunc(&["search", "decision", flag, path]).output()?;
+        assert!(!failure.status.success());
+        assert!(failure.stdout.is_empty());
+        assert!(String::from_utf8(failure.stderr)?.contains(expected));
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn exact_source_filters_union_and_apply_before_ranking() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    for (name, body) in [
+        (
+            "docs/decisions/db.md",
+            "# SQLite\n\nKeep the ledger outside the vector index.",
+        ),
+        (
+            "docs/decisions/sub/storage.md",
+            "# Storage\n\nThe SQLite index is disposable.\n\n## Rebuild\n\nRebuild from Markdown when needed.",
+        ),
+        (
+            "docs/design-old/README.md",
+            "# Design\n\nSQLite concurrency SQLite concurrency.",
+        ),
+        (
+            "docs/design/proposal.md",
+            "# Design\n\nRender initialization output in the CLI.",
+        ),
+        (
+            "docs/rfcs/sqlite.md",
+            "# Draft SQLite RFC\n\nLock readers before replacing the database.",
+        ),
+        (
+            "docs/plans/delivery.md",
+            "# Plans\n\nDeliver the worktree repair command.",
+        ),
+        (
+            "docs/incidents/failure.md",
+            "# Incident\n\nA damaged SQLite database can be rebuilt.",
+        ),
+        (
+            "docs/research/notes.md",
+            "# Research\n\nAn evaluation of SQLite locking.",
+        ),
+    ] {
+        let path = fixture.repo.join(name);
+        fs::create_dir_all(path.parent().context("source parent")?)?;
+        fs::write(path, body)?;
+    }
+    fs::create_dir(fixture.repo.join("docs/empty"))?;
+    let memory = fixture.log_id("A memory about SQLite concurrency")?;
+    fixture.run(&["reindex", "--source", "docs"])?;
+    let query = |flags: &[&str]| -> Result<Value> {
+        let mut args = vec!["search", "--json", "SQLite concurrency"];
+        args.extend_from_slice(flags);
+        fixture.json(&args)
+    };
+    let solo = query(&["--source-file", "./docs/design/proposal.md", "--limit", "1"])?;
+    assert_eq!(solo["results"][0]["path"], "docs/design/proposal.md");
+    assert_eq!(solo["results"][0]["matched_chunk"]["line_start"], 1);
+
+    let union = query(&[
+        "--source",
+        "./docs/decisions/",
+        "--source-file",
+        "docs/rfcs/sqlite.md",
+        "--source-file",
+        "docs/incidents/failure.md",
+        "--limit",
+        "20",
+    ])?;
+    let paths: std::collections::BTreeSet<_> = union["results"]
+        .as_array()
+        .context("results")?
+        .iter()
+        .filter_map(|hit| hit["path"].as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "docs/decisions/db.md",
+            "docs/decisions/sub/storage.md",
+            "docs/incidents/failure.md",
+            "docs/rfcs/sqlite.md"
+        ]
+        .into()
+    );
+    assert!(
+        union["results"]
+            .as_array()
+            .context("results")?
+            .iter()
+            .filter(|hit| hit["path"] == "docs/decisions/sub/storage.md")
+            .count()
+            > 1
+    );
+    assert_eq!(
+        query(&["--source", "docs/empty"])?["results"],
+        serde_json::json!([])
+    );
+    let mixed = query(&[
+        "--source",
+        ".nunc/entries/",
+        "--source-file",
+        "docs/plans/delivery.md",
+    ])?;
+    let hits = mixed["results"].as_array().context("mixed results")?;
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().any(|hit| hit["id"] == memory));
+
+    fs::remove_file(fixture.repo.join("docs/research/notes.md"))?;
+    let obsolete = query(&["--source-file", "docs/research/notes.md"])?;
+    assert!(
+        !obsolete["warnings"]
+            .as_array()
+            .context("freshness warning")?
+            .is_empty()
+    );
+    assert_eq!(obsolete["results"][0]["path"], "docs/research/notes.md");
+    fixture.run(&["reindex"])?;
+    let failure = fixture
+        .nunc(&[
+            "search",
+            "decision",
+            "--json",
+            "--source-file",
+            "docs/research/notes.md",
+        ])
+        .output()?;
+    assert!(failure.stdout.is_empty());
+    assert!(!failure.status.success());
+    assert!(
+        String::from_utf8(failure.stderr)?.contains("does not exist and has no indexed matches")
+    );
+
+    fixture.run(&["reindex", "--source", "docs/rfcs/sqlite.md"])?;
+    let direct = query(&["--source-file", "docs/rfcs/sqlite.md"])?;
+    assert_eq!(direct["results"][0]["path"], "docs/rfcs/sqlite.md");
     Ok(())
 }

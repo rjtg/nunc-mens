@@ -89,6 +89,9 @@ enum Action {
         kind: Option<Kind>,
         #[arg(long)]
         source: Vec<PathBuf>,
+        /// Restrict results to this exact registered source file. Repeat to add files.
+        #[arg(long)]
+        source_file: Vec<PathBuf>,
         #[arg(long, value_enum, default_value = "chunk")]
         context: ContextMode,
         #[arg(long, value_enum, default_value = "semantic")]
@@ -353,6 +356,7 @@ fn execute(action: Action) -> Result<()> {
             json,
             kind,
             source,
+            source_file,
             context,
             sort,
             recency_boost,
@@ -366,6 +370,7 @@ fn execute(action: Action) -> Result<()> {
                     limit: limit as usize,
                     kind,
                     sources: &source,
+                    source_files: &source_file,
                     context,
                     sort,
                     recency_boost,
@@ -543,6 +548,7 @@ fn consolidate(repo: &Repo, command: Consolidation) -> Result<()> {
                     limit: limit as usize,
                     kind: Some(Kind::Memory),
                     sources: &[],
+                    source_files: &[],
                     context: ContextMode::Parent,
                     sort: Sort::Semantic,
                     recency_boost: Some(0.0),

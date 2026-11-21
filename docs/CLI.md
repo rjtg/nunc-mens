@@ -15,7 +15,7 @@
 | `nunc unarchive ID... [--dry-run] [--json]` | Restores manually archived memories. |
 | `nunc forget ID... [--dry-run\|--yes] [--json]` | Deletes only the specified entries after warning about dependencies. |
 | `nunc reindex [--full] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
-| `nunc search QUERY... [--limit N] [--json] [--type memory\|source] [--source PATH]...` | Ranks compatible indexed vectors by cosine similarity. |
+| `nunc search QUERY... [--limit N] [--json] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Ranks compatible indexed vectors by cosine similarity. |
 | `nunc models download` | Explicitly downloads and validates the pinned model and tokenizer. |
 | `nunc status` | Shows repository, server, sources, cache, and index paths. |
 | `nunc doctor` | Also compares index freshness against the current repository snapshot. |
@@ -41,7 +41,21 @@ Use absolute overrides outside the worktree. The index is `<state>/<repo-id>/ind
 
 ## Search output
 
-Default limit is 5, with a range of 1–1000. `--type` selects memories or sources. Repeatable `--source` filters by exact repository-relative paths or directory prefixes and selects source results. Deleted paths remain usable as filters while the existing index is stale. An empty result set is successful.
+Default limit is 5, with a range of 1–1000. `--type` selects memories or sources. An empty result set is successful.
+
+### Search selected project documents
+
+Register a documentation folder with `nunc init --source docs` or `nunc reindex --source docs`. Organize architecture decisions, specifications, RFCs, plans, incidents and research as ordinary files under that folder.
+
+```sh
+nunc search "SQLite concurrency" --source docs/decisions/ --source docs/design/
+nunc search "SQLite concurrency" --source docs/incidents/ --source-file docs/rfcs/sqlite.md
+nunc search "SQLite concurrency" --source .nunc/entries/
+```
+
+Paths are relative to the worktree root, even from a subdirectory. A directory passed to `--source` matches recursively by path components. An existing file passed to `--source` or `--source-file` matches exactly. Repeated directory and file filters form a union applied before ranking and limiting. Use `--source .nunc/entries/` to include memories alongside selected project documents. `--type memory` still works on its own.
+
+Choose paths inside a registered source. Absolute paths, parent traversal, symlinks, special files and directories passed to `--source-file` are rejected. An existing empty directory yields no results. A deleted path remains usable while matching rows exist in the stale index, with a freshness warning. Once reindex removes those rows, that missing path produces an error.
 
 - `--context chunk` returns the matched slice and is the default. `section` returns its enclosing Markdown section up to the next heading. `parent` returns the original full note body or source file. For plain text, section context is the full file. These options change the returned text while ranking the same chunks.
 - `--sort semantic` orders by the final similarity score. `--sort recent` uses the original timestamp first, then score, with undated sources last. Exact ties use the stable chunk ID.

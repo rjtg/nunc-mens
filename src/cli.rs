@@ -69,6 +69,8 @@ enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Compare two Markdown memories. Exit 1 if they differ.
+    Diff { old: Uuid, new: Uuid },
     /// Refresh the semantic index from Markdown and registered sources.
     Reindex {
         /// Build a fresh database and publish it after successful inference.
@@ -273,16 +275,21 @@ pub fn run() -> ExitCode {
         args.insert(1, "log".into());
     }
     let cli = Cli::parse_from(args);
+    let error_status = if matches!(cli.command, Action::Diff { .. }) {
+        ExitCode::from(2)
+    } else {
+        ExitCode::FAILURE
+    };
     match execute(cli.command) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(status) => status,
         Err(error) => {
             eprintln!("nunc: {error:#}");
-            ExitCode::FAILURE
+            error_status
         }
     }
 }
 
-fn execute(action: Action) -> Result<()> {
+fn execute(action: Action) -> Result<ExitCode> {
     let repo = Repo::discover()?;
     match action {
         Action::Init { source } => {
@@ -353,6 +360,10 @@ fn execute(action: Action) -> Result<()> {
                 report.documents, report.embedded, report.deleted
             );
         }
+        Action::Diff { old, new } => {
+            let different = crate::diff::compare(&repo, old, new, &mut io::stdout().lock())?;
+            return Ok(ExitCode::from(u8::from(different)));
+        }
         Action::Search {
             query,
             limit,
@@ -400,7 +411,7 @@ fn execute(action: Action) -> Result<()> {
                             .map_or(hit.source.id.as_str(), |chunk| chunk.parent_id.as_str());
                         writeln!(out, "{id}")?;
                     }
-                    return Ok(());
+                    return Ok(ExitCode::SUCCESS);
                 }
                 if found.results.is_empty() {
                     writeln!(out, "No results")?;
@@ -488,7 +499,7 @@ fn execute(action: Action) -> Result<()> {
                 .print(&mut io::stdout().lock(), json)?;
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_receipt(receipt: entries::Receipt) {

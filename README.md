@@ -40,6 +40,7 @@ Version 0.2.0 adds semantic retrieval of Markdown chunks with section and parent
 ```sh
 nunc search --context section --explain "Why did authentication fail?"
 nunc duplicates --json
+nunc diff "$old_id" "$new_id"
 nunc git import --all --dry-run
 nunc git import --limit 100
 nunc consolidate candidates "deploy clock synchronization" --json

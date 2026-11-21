@@ -1708,6 +1708,69 @@ fn search_ids_rejects_incompatible_output_and_keeps_errors_off_stdout() -> Resul
 }
 
 #[test]
+fn diff_compares_verbatim_markdown_without_model_or_index() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let old_body = "# Café\r\n\n```rust\nlet limit = 5;\n```\ntrailing CR\r";
+    let long_line = "界".repeat(30_000);
+    let new_body = format!("# Café\r\n\n```rust\nlet limit = 7;\n```\n{long_line}\n");
+    let old = fixture.log_id(old_body)?;
+    let same = fixture.log_id(old_body)?;
+    let new = fixture.log_id(&new_body)?;
+    for id in [&old, &same] {
+        let equal = fixture.run(&["diff", &old, id])?;
+        assert!(equal.stdout.is_empty());
+        assert!(equal.stderr.is_empty());
+    }
+
+    let path = fixture.local().join("entries").join(format!("{old}.md"));
+    let original = fs::read(&path)?;
+    fixture.run(&["archive", &old])?;
+    let diff = fixture.nunc(&["diff", &old, &new]).output()?;
+    assert_eq!(diff.status.code(), Some(1));
+    assert!(diff.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(diff.stdout)?,
+        format!(
+            "--- a/{old}.md\n+++ b/{new}.md\n@@ -1,6 +1,6 @@\n # Café\r\n \n ```rust\n-let limit = 5;\n+let limit = 7;\n ```\n-trailing CR\r\n\\ No newline at end of file\n+{long_line}\n"
+        )
+    );
+    assert_eq!(fs::read(&path)?, original);
+    assert!(!fixture.state.exists());
+    assert!(!fixture.cache.exists());
+    Ok(())
+}
+
+#[test]
+fn diff_reports_invalid_missing_empty_and_forgotten_entries_without_output() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let valid = fixture.log_id("A readable note")?;
+    let forgotten = fixture.log_id("Forgotten body must stay hidden")?;
+    let dir = fixture.local().join("entries");
+    let path = dir.join(format!("{forgotten}.md"));
+    let original = fs::read(&path)?;
+    fixture.run(&["forget", &forgotten, "--yes"])?;
+    // An interrupted cleanup or a restored file cannot defeat the tombstone.
+    fs::write(&path, original)?;
+    let empty = uuid::Uuid::new_v4().to_string();
+    fs::write(dir.join(format!("{empty}.md")), "")?;
+    let missing = uuid::Uuid::new_v4().to_string();
+    for (id, message) in [
+        ("invalid", "invalid value"),
+        (&missing, "cannot inspect memory"),
+        (&empty, "missing front matter"),
+        (&forgotten, "was forgotten"),
+    ] {
+        let output = fixture.nunc(&["diff", &valid, id]).output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr)?;
+        assert!(error.contains(message), "{error}");
+        assert!(!error.contains("Forgotten body"));
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires the explicitly prepared ONNX model cache"]
 fn search_ids_orders_unique_parent_ids_and_preserves_visibility() -> Result<()> {
     let mut fixture = Fixture::new()?;

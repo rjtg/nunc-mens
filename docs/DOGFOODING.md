@@ -119,3 +119,9 @@ Formatting, Clippy, and 35 default tests passed. The opt-in `exact_source_filter
 The compiled CLI recorded and indexed a two-chunk development note about ranking parents for shell selection. `nunc search --type memory --ids --limit 1 "How can I send a unique memory selection into another command?" | xargs -r nunc archive --dry-run --json` passed exactly the UUID from the capture receipt to the archive preview. The first run placed the index inside Git and failed with the expected path error. Moving the index to a sibling directory fixed the fixture.
 
 Formatting, Clippy, and 36 default tests passed. The opt-in `search_ids_orders_unique_parent_ids_and_preserves_visibility` test passed with the cached ONNX model in 34.91 s. It covered ranked IDs, chunk deduplication, Git entries, path filtering, empty output, archive visibility and forgotten entries. The LSP timed out on the edited files, so Cargo supplied verification.
+
+## Model-free memory diff
+
+In a temporary Git repository, the compiled CLI logged two revisions of a real duplicate-review decision. `nunc diff "$old_id" "$new_id" > review.patch` exited 1 with two UUID headers and the expected changed line. GNU `patch` applied the output to the first body, and `cmp` confirmed byte-for-byte agreement with the second body. The fixture never created an index or model cache.
+
+Formatting, Clippy, and 39 default tests passed. Diff coverage includes identical entries, archived entries, empty and missing files, restored files with forgotten tombstones, Unicode, long lines, fenced code, CRLF, missing final LF, and large changed regions. Some Rust LSP responses were stale or timed out, so Cargo verified the final sources.

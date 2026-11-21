@@ -9,6 +9,7 @@
 | `nunc write TEXT...` or `nunc write --stdin` | Queues capture via a live FIFO or saves directly when the server is unavailable. |
 | `nunc serve [--boundary TOKEN] [--source PATH]...` | Runs the foreground FIFO and refreshes the index from local files. |
 | `nunc duplicates [ID] [--threshold N] [--limit N] [--exact] [--raw] [--json]` | Finds candidate exact or semantic duplicates. |
+| `nunc diff OLD NEW` | Compares the original Markdown bodies of two selected memories. |
 | `nunc git ingest\|import\|sync\|hook` | Captures selected commit history or manages the post-commit hook. |
 | `nunc consolidate candidates\|apply\|undo` | Retrieves full candidate entries, commits an external summary, or undoes an archive. |
 | `nunc archive ID... [--dry-run] [--json]` | Hides selected memories and keeps their Markdown. |
@@ -132,6 +133,14 @@ Archive and unarchive validate all specified IDs before publishing one atomic le
 
 An entry hidden by consolidation remains owned by that operation. Use `nunc consolidate undo` to restore its originals. A manual archive of an active summary hides the summary while preserving its existing sources and associations. Undo leaves the summary raw-only with status `undone`.
 
+## Compare memories
+
+```sh
+nunc diff "$old_id" "$new_id"
+```
+
+Pass two journal UUIDs. The command reads the original Markdown bodies, including archived memories, and omits generated metadata. A change prints a unified diff with stable UUID headers, three lines of context, and plain text suitable for a pipe or patch file. Extremely large changed regions may be represented as a single replacement hunk. Identical bodies produce empty stdout and exit 0. Differences exit 1. Invalid, missing, forgotten, corrupt or empty entry files and operational failures exit 2 with diagnostics on stderr. The operation leaves the entries, ledger and index unchanged and works without a model.
+
 ## Consolidation and forget
 
 ```sh
@@ -152,7 +161,7 @@ Forget validates every target, warns about direct and transitive dependent summa
 
 `Saved <id> <path>` means the Markdown file was durably published. `Queued for FIFO delivery` confirms the client wrote its frame to the FIFO. Use `log` when the caller requires a durable receipt.
 
-Exit status is 0 on success, 2 for CLI syntax or argument parsing errors, and 1 for invalid input detected after parsing or operational failures. Model, database, and filesystem errors go to stderr.
+Exit status is 0 on success, 2 for CLI syntax or argument parsing errors, and 1 for invalid input detected after parsing or operational failures. `diff` uses its own comparison exit statuses described above. Model, database, and filesystem errors go to stderr.
 
 ## Diagnose and repair the search index
 

@@ -3,6 +3,7 @@ compile_error!("nunc requires a Unix filesystem and POSIX FIFOs");
 
 mod chunk;
 pub mod cli;
+mod diff;
 mod documents;
 mod duplicates;
 pub mod entries;

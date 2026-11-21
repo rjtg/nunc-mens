@@ -191,6 +191,17 @@ impl Ledger {
             && !self.summaries.contains_key(&entry.metadata.id)
     }
 
+    pub fn read_entry(&self, repo: &Repo, id: Uuid) -> Result<Entry> {
+        ensure!(!self.forgotten(id), "entry {id} was forgotten");
+        let entry = entries::read(&entries::path(repo, id))
+            .with_context(|| format!("cannot inspect memory {id}"))?;
+        ensure!(
+            !self.pending_summary(&entry),
+            "entry {id} is an uncommitted summary"
+        );
+        Ok(entry)
+    }
+
     pub fn manual_archives(&self) -> impl Iterator<Item = Uuid> + '_ {
         self.manual_archived.iter().copied()
     }
@@ -252,13 +263,7 @@ impl Ledger {
         let mut changed = Vec::new();
         let mut unchanged = Vec::new();
         for &id in ids {
-            ensure!(!self.forgotten(id), "entry {id} was forgotten");
-            let entry = entries::read(&entries::path(repo, id))
-                .with_context(|| format!("cannot inspect memory {id}"))?;
-            ensure!(
-                !self.pending_summary(&entry),
-                "entry {id} is an uncommitted summary"
-            );
+            self.read_entry(repo, id)?;
             ensure!(
                 !self
                     .summaries
@@ -294,12 +299,8 @@ impl Ledger {
             if self.forgotten(id) {
                 already_forgotten.push(id);
             } else {
-                let entry = entries::read(&entries::path(repo, id))
+                self.read_entry(repo, id)
                     .with_context(|| format!("cannot forget entry {id}"))?;
-                ensure!(
-                    !self.pending_summary(&entry),
-                    "entry {id} is an uncommitted summary"
-                );
                 targets.push(id);
             }
         }
@@ -411,12 +412,7 @@ impl<'a> Guard<'a> {
         let mut inputs = ids.to_vec();
         inputs.sort_unstable();
         for id in &inputs {
-            ensure!(!self.ledger.forgotten(*id), "entry {id} was forgotten");
-            let entry = entries::read(&entries::path(self.repo, *id))?;
-            ensure!(
-                !self.ledger.pending_summary(&entry),
-                "entry {id} is an uncommitted summary"
-            );
+            let entry = self.ledger.read_entry(self.repo, *id)?;
             let fingerprint = hash(entry.body.as_bytes());
             ensure!(
                 revisions

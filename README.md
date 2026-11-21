@@ -12,7 +12,7 @@
 nunc log "Fixed staging deploy: token refresh failed because of clock skew"
 nunc "Remember to investigate the intermittent CI timeout" # shorthand for log
 nunc search "What caused the staging authentication failure?"
-nunc search --mode keyword "clock skew"
+nunc search "clock skew"
 nunc search --json --limit 5 "auth deploy"
 nunc reindex
 nunc reindex --full
@@ -27,7 +27,7 @@ The CLI examples describe the **target interface**, not currently working comman
 - **Plain text is canonical:** individual Markdown entry files are the source of truth; the search database is disposable and reconstructible.
 - **Small and understandable:** one Rust binary, small dependencies, no mandatory daemon or MCP requirement.
 - **Search that works for agents:** machine-readable JSON, stable entry identifiers, timestamps, provenance and useful exit codes.
-- **Hybrid retrieval:** SQLite FTS5 keyword search plus cosine similarity of locally generated embeddings; exact identifiers should not disappear in semantic scores.
+- **Semantic retrieval:** SQLite cosine similarity over locally generated fastembed vectors; no stored vectors, BM25, or hybrid ranking in MVP.
 - **In-process embeddings:** use the Rust `fastembed` crate to run a small Hugging Face-hosted ONNX embedding model locally, without Ollama or any HTTP inference service. Explicit `nunc models download` prepares the local cache; indexing/search never downloads models implicitly.
 - **Safe and private:** don't log secrets; enforce local-only defaults; never commit private notes, index files, runtime artifacts, or credentials.
 - **Dogfood the CLI:** contributors and coding agents must use `nunc` to capture work notes and retrieve prior decisions once commands are implemented, and verify actual output rather than pretending tests succeeded.
@@ -39,10 +39,10 @@ nunc log / nunc "..."
     -> .nunc/entries/<id>.md  (one file per entry; source of truth)
 
 nunc reindex
-    -> parse Markdown entries -> stable IDs -> fastembed embeddings -> SQLite index
+    -> parse Markdown entries -> stable IDs -> fastembed embeddings -> repo-scoped SQLite vector store
 
 nunc search
-    -> FTS5 keyword retrieval + cosine vector retrieval -> merged ranked results
+    -> query embedding + cosine similarity over stored vectors -> top-k results
     -> readable text or --json (CLI and shell-capable agents)
 ```
 
@@ -52,7 +52,7 @@ Recommended defaults: repository-local `.nunc/entries/`, with repository-scoped 
 
 The first deliverable is a working, tested MVP, not an MCP integration or a sophisticated reranker. Follow [AGENTS.md](AGENTS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/ROADMAP.md](docs/ROADMAP.md).
 
-Planned Rust stack: `clap`, `serde`, `serde_json`, `rusqlite` (bundled SQLite with FTS5), `fastembed` (in-process ONNX embeddings), `sha2`, and standard-library file operations. Add dependencies only when justified. Initialize the crate and its `Cargo.lock` during the MVP implementation.
+Planned Rust stack: `clap`, `serde`, `serde_json`, `rusqlite` (bundled SQLite with stored vectors), `fastembed` (in-process ONNX embeddings), `sha2`, and standard-library file operations. Add dependencies only when justified. Initialize the crate and its `Cargo.lock` during the MVP implementation.
 
 ```sh
 # Once the CLI has been implemented:
@@ -84,4 +84,8 @@ nunc search --type source --source ./docs "cache"
 nunc reindex
 ```
 
-The foreground `serve` process accepts boundary-framed messages through a repo-local FIFO. Each complete message becomes one `.nunc/entries/<id>.md` file with metadata and is indexed immediately. Repeatable `--source` flags register read-only files/directories for initial indexing and watching. `nunc log`/`nunc write` must also work without a running server, persisting entries directly for later indexing. The SQLite index is repo-scoped in XDG state; the model cache is outside Git. Project entry files may be intentionally Git-tracked; FIFO, session files, indexes and secrets must not be committed. No Ollama or mandatory daemon. See [docs/REPO_FIFO.md](docs/REPO_FIFO.md) for framing, concurrency and security guarantees.
+The foreground `serve` process accepts boundary-framed messages through a repo-local FIFO. Each complete message becomes one `.nunc/entries/<id>.md` file with metadata and is indexed immediately. Repeatable `--source` flags register read-only files/directories for initial indexing and watching. `nunc log`/`nunc write` must also work without a running server, persisting entries directly for later indexing. The SQLite vector store is repo-scoped in XDG state; the model cache is outside Git. Project entry files may be intentionally Git-tracked; FIFO, session files, indexes and secrets must not be committed. No Ollama or mandatory daemon. See [docs/REPO_FIFO.md](docs/REPO_FIFO.md) for framing, concurrency and security guarantees.
+
+### MVP search decision
+
+**Only semantic search:** `fastembed` generates document and query embeddings; SQLite stores vectors and provenance; Rust computes cosine similarity and returns top-k matches. No FTS5, BM25, keyword fallback, hybrid ranking, vector database or ANN extension in MVP. The index lives outside Git at `$XDG_STATE_HOME/nunc-mens/<repo-id>/index.sqlite3` (default `~/.local/state/nunc-mens/<repo-id>/index.sqlite3`); model artifacts live under the XDG cache directory. Without a downloaded model, entry capture still works but indexing/search cannot run; pending entries can be indexed later with `nunc reindex`.

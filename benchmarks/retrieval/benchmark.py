@@ -26,6 +26,11 @@ NUNC_CASES = {
     "nunc-semantic-chunks": [],
     "nunc-small-chunks": [],
 }
+BUDGET_CASES = {
+    "nunc-parent-800": ["--context", "parent", "--max-tokens", "800"],
+    "nunc-parent-2000": ["--context", "parent", "--max-tokens", "2000"],
+}
+NUNC_OPTIONS = {**NUNC_CASES, **BUDGET_CASES}
 QMD_CASES = (
     "qmd-lexical", "qmd-vector", "qmd-hybrid", "qmd-hybrid-reranked", "qmd-default",
 )
@@ -229,7 +234,7 @@ def query_results(output, mode, reverse, root, evidence):
 
 
 def evaluate(case, args, fixture, run_env, queries, mapping, emit):
-    nunc = case in NUNC_CASES
+    nunc = case in NUNC_OPTIONS
     mode = "nunc" if nunc else "qmd"
     reverse = {paths[mode]: doc for doc, paths in mapping["paths"].items()}
     for round_index in range(args.rounds):
@@ -239,7 +244,7 @@ def evaluate(case, args, fixture, run_env, queries, mapping, emit):
             root = fixture / ("repo" if nunc else f"qmd-{scope}")
             if nunc:
                 env = run_env
-                command = [args.nunc, "search", "--json", "--limit", "10", *NUNC_CASES[case]]
+                command = [args.nunc, "search", "--json", "--limit", "10", *NUNC_OPTIONS[case]]
                 if scope == "raw":
                     command.append("--raw")
                 command.extend(["--", prompt])
@@ -256,6 +261,7 @@ def evaluate(case, args, fixture, run_env, queries, mapping, emit):
                 "command": command, "hits": hits, "response_bytes": len(output), **timing,
                 "metrics": duplicate_safe_metrics(hits, query["grades"]),
                 "has_evidence_judgment": bool(query.get("evidence")),
+                **({"budget": json.loads(output)["budget"]} if case in BUDGET_CASES else {}),
             })
 
 
@@ -278,7 +284,7 @@ def main():
     parser.add_argument("--qmd-rerank-model", type=Path)
     parser.add_argument("--qmd-generate-model", type=Path)
     parser.add_argument("--rounds", type=int, default=2)
-    parser.add_argument("--case", action="append", choices=(*NUNC_CASES, *QMD_CASES))
+    parser.add_argument("--case", action="append", choices=(*NUNC_OPTIONS, *QMD_CASES))
     parser.add_argument("--query", action="append", help="optional judged query ID")
     parser.add_argument("--query-file", type=Path, default=HERE / "queries.json")
     args = parser.parse_args()
@@ -346,15 +352,15 @@ def main():
         qmd_ready = False
         for case in cases:
             print(f"Running {case}", flush=True)
-            if case in NUNC_CASES:
+            if case in NUNC_OPTIONS:
                 env = nunc_index(case, args, args.root, emit)
             elif not qmd_ready:
                 qmd_indexes(args, args.root, emit)
                 qmd_ready = True
-            if case not in NUNC_CASES:
+            if case not in NUNC_OPTIONS:
                 for scope in ("active", "raw"):
                     shutil.copytree(args.root / f"state-qmd-{scope}", args.root / f"state-{case}-{scope}")
-            evaluate(case, args, args.root, env if case in NUNC_CASES else None, queries, mapping, emit)
+            evaluate(case, args, args.root, env if case in NUNC_OPTIONS else None, queries, mapping, emit)
 
 
 def substitute(argument, substitutions):

@@ -39,6 +39,18 @@ impl Kind {
             _ => bail!("unknown indexed document kind"),
         }
     }
+
+    pub(crate) fn is_markdown(self, path: &Path) -> bool {
+        self == Self::Memory
+            || path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    ["md", "markdown", "mdown"]
+                        .iter()
+                        .any(|name| ext.eq_ignore_ascii_case(name))
+                })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -123,14 +135,7 @@ impl Snapshot {
         for path in source_files(repo, &config.sources)? {
             if let Some(text) = read_source(&repo.root, &path)? {
                 let name = path.to_str().context("source path must be UTF-8")?;
-                let markdown = path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| {
-                        ["md", "markdown", "mdown"]
-                            .iter()
-                            .any(|name| ext.eq_ignore_ascii_case(name))
-                    });
+                let markdown = Kind::Source.is_markdown(&path);
                 if !text.trim().is_empty() {
                     documents.push(Document::new(
                         Provenance {

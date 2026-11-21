@@ -10,7 +10,10 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
+
+mod budget;
 
 #[derive(Serialize)]
 pub(crate) struct Results {
@@ -18,6 +21,8 @@ pub(crate) struct Results {
     pub repo_id: String,
     pub warnings: Vec<String>,
     pub results: Vec<Match>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<budget::Usage>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
@@ -78,6 +83,7 @@ pub(crate) struct Options<'a> {
     pub explain: bool,
     pub raw: bool,
     pub one_per_parent: bool,
+    pub max_tokens: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -101,6 +107,8 @@ pub(crate) struct Match {
     pub rank: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explanation: Option<Explanation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<budget::ContextWindow>,
 }
 
 struct Ranked {
@@ -108,6 +116,7 @@ struct Ranked {
     parent: String,
     chunk: String,
     timestamp: Option<DateTime<Utc>>,
+    section: Option<Range<usize>>,
 }
 
 const MEMORY_PATH: &str = ".nunc/entries";
@@ -256,7 +265,7 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
                 recent_order(options.sort, item.timestamp, timestamp)
                     .then_with(|| compare(item.hit.score, &item.chunk, score, id))
             };
-            if options.one_per_parent
+            if (options.one_per_parent || options.max_tokens.is_some())
                 && let Some(existing) = best.iter().position(|hit| hit.parent == parent)
             {
                 if order(&best[existing]).is_le() {
@@ -271,12 +280,18 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
                     (source.entry_kind, source.git) = reader.origin(parent)?;
                 }
                 source.visibility = visibility;
-                let matched_text = if options.explain {
+                let matched_text = if options.explain && options.max_tokens.is_none() {
                     text.clone()
                 } else {
                     String::new()
                 };
-                if !matches!(options.context, ContextMode::Chunk) {
+                let section = if options.max_tokens.is_some() {
+                    text.clear();
+                    Some(row.section()?)
+                } else {
+                    None
+                };
+                if options.max_tokens.is_none() && !matches!(options.context, ContextMode::Chunk) {
                     let original = reader.parent(parent)?;
                     text = match options.context {
                         ContextMode::Section => original
@@ -292,11 +307,13 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
                         parent: parent.to_owned(),
                         chunk: id.to_owned(),
                         timestamp,
+                        section,
                         hit: Match {
                             source,
                             text,
                             score,
                             rank: 0,
+                            context_window: None,
                             explanation: options.explain.then_some(Explanation {
                                 similarity,
                                 recency_contribution: boost,
@@ -317,14 +334,17 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
             Ok(())
         },
     )?;
-    let results = best
-        .into_iter()
-        .enumerate()
-        .map(|(offset, mut item)| {
-            item.hit.rank = offset + 1;
-            item.hit
-        })
-        .collect();
+    for (offset, item) in best.iter_mut().enumerate() {
+        item.hit.rank = offset + 1;
+    }
+    let (results, budget) = match options.max_tokens {
+        Some(limit) => {
+            let (results, usage) =
+                budget::pack(best, limit, options.context, |parent| reader.parent(parent))?;
+            (results, Some(usage))
+        }
+        None => (best.into_iter().map(|item| item.hit).collect(), None),
+    };
     let digest = reader.digest.clone();
     drop(reader);
     let warning = match Snapshot::read(repo) {
@@ -337,6 +357,7 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
         repo_id: repo.id.clone(),
         warnings: warning.into_iter().collect(),
         results,
+        budget,
     })
 }
 
@@ -423,6 +444,7 @@ mod tests {
             explain: false,
             raw: false,
             one_per_parent: false,
+            max_tokens: None,
         };
         let filter = Filter::new(&repo, &roots, &options)?;
         assert_eq!(filter.kind, None);

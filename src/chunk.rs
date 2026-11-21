@@ -181,6 +181,19 @@ fn structure(text: &str, blocks: &mut Vec<usize>) -> Vec<Section> {
     sections
 }
 
+pub(crate) fn context_boundaries(text: &str, markdown: bool) -> Vec<usize> {
+    let mut blocks = vec![0];
+    if markdown {
+        structure(text, &mut blocks);
+    } else {
+        blocks.extend(text.match_indices('\n').map(|(offset, _)| offset + 1));
+    }
+    blocks.push(text.len());
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks
+}
+
 fn split_unit(
     text: &str,
     mut span: Range<usize>,

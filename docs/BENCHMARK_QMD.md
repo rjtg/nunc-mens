@@ -90,3 +90,15 @@ One-document update appends the same sentence in both tools. QMD measurements se
 Keep semantic search and structural chunks as nunc defaults. For this repository-sized fixture, default nunc found every judged document within five slots and returned evidence for every evidence-judged query. Exact rank-one misses and the large latency gap between lexical and inference modes justify prototyping optional keyword and literal metadata retrieval in [#9](https://github.com/rjtg/nunc-mens/issues/9). Prioritize path, SHA, and punctuation-heavy terms. QMD vector and controlled hybrid tied across every measured quality metric, so the study does not justify a hybrid default or a reranker.
 
 Measure attribution-aware context budgets next in [#11](https://github.com/rjtg/nunc-mens/issues/11). Retrieved text size can grow more than fourfold with parent expansion even when evidence coverage is unchanged. Use [#29](https://github.com/rjtg/nunc-mens/issues/29) to determine which startup, snapshot, and retrieval costs dominate at scale before adding optimizations. The corpus is small, fictional, and English. Quantization, model, snippet defaults, and index implementations differ. Further multilingual or large-corpus evaluation is needed before making broader quality or performance claims.
+
+## Follow-up on context budgets
+
+For [#11](https://github.com/rjtg/nunc-mens/issues/11), the release CLI ran the three long-context queries twice on the same host and fixture, using the same index for each mode. All searches requested parent context and ten result slots. The budgeted runs returned at most one window per parent.
+
+| Mode | Median JSON bytes | Recall@5 | Judged evidence in top 5 | First p50 | Repeat p50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Unbudgeted | 51,716 | 1.000 | 3 of 3 | 2.075 s | 2.070 s |
+| 800 estimated tokens | 3,383 | 0.833 | 2 of 3 | 3.024 s | 2.292 s |
+| 2,000 estimated tokens | 8,221 | 1.000 | 3 of 3 | 2.186 s | 2.167 s |
+
+The 2,000-token run kept all judged evidence and reduced median JSON bytes by 84%. It returned five distinct parents for each query. The 800-token run missed the backlog threshold. Its response used more bytes than four times the estimated budget because the policy excludes the JSON response envelope. All budgeted results stayed within their charged estimate. The 2,000-token sample took about 0.1 s longer at the median. There were only three timings per pass, and startup dominated, so the sample is too small to isolate the allocator's latency. [Raw budget runs](../benchmarks/retrieval/results/sparrow-context-budget.jsonl.gz)

@@ -93,6 +93,9 @@ enum Action {
         /// Print ranked parent IDs, one per line.
         #[arg(long, conflicts_with_all = ["json", "explain"])]
         ids: bool,
+        /// Cap estimated context tokens, including per-result provenance.
+        #[arg(long, conflicts_with = "ids", value_parser = clap::value_parser!(u32).range(1..))]
+        max_tokens: Option<u32>,
         #[arg(long = "type")]
         kind: Option<Kind>,
         #[arg(long)]
@@ -380,6 +383,7 @@ fn execute(action: Action) -> Result<ExitCode> {
             limit,
             json,
             ids,
+            max_tokens,
             kind,
             source,
             source_file,
@@ -403,6 +407,7 @@ fn execute(action: Action) -> Result<ExitCode> {
                     explain,
                     raw,
                     one_per_parent: ids,
+                    max_tokens: max_tokens.map(|value| value as usize),
                 },
             )?;
             let mut out = io::stdout().lock();
@@ -437,7 +442,13 @@ fn execute(action: Action) -> Result<ExitCode> {
                         p.kind.as_str(),
                         p.path
                     )?;
-                    if let (Some(first), Some(last)) = (p.line_start, p.line_end) {
+                    let (first, last) = hit
+                        .context_window
+                        .as_ref()
+                        .map_or((p.line_start, p.line_end), |window| {
+                            (Some(window.line_start), Some(window.line_end))
+                        });
+                    if let (Some(first), Some(last)) = (first, last) {
                         write!(out, ":{first}-{last}")?;
                     }
                     if let Some(visibility) = p.visibility {
@@ -456,6 +467,9 @@ fn execute(action: Action) -> Result<ExitCode> {
                         write!(out, " commit {}", commit.sha)?;
                     }
                     writeln!(out, " [{}]\n{}\n", p.id, hit.text)?;
+                    if hit.context_window.is_some_and(|window| window.truncated) {
+                        writeln!(out, "   Context shortened to fit the budget.")?;
+                    }
                     if let Some(explanation) = hit.explanation {
                         writeln!(
                             out,
@@ -481,6 +495,15 @@ fn execute(action: Action) -> Result<ExitCode> {
                             )?;
                         }
                     }
+                }
+                if let Some(budget) = found.budget {
+                    eprintln!(
+                        "nunc: context budget used {}/{} estimated tokens ({} shortened, {} omitted)",
+                        budget.estimated_tokens,
+                        budget.max_tokens,
+                        budget.truncated_results,
+                        budget.omitted_candidates,
+                    );
                 }
             }
         }
@@ -654,6 +677,7 @@ fn consolidate(repo: &Repo, command: Consolidation) -> Result<()> {
                     explain: false,
                     raw: false,
                     one_per_parent: true,
+                    max_tokens: None,
                 },
             )?;
             if json {

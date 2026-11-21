@@ -18,6 +18,7 @@ nunc log "Deploy tokens expired because the staging host's clock drifted."
 nunc models download
 nunc reindex
 nunc search "Why did authentication fail in staging?"
+nunc search "authentication" --context parent --max-tokens 2000 --json
 nunc search --json --type source --source docs "time synchronization"
 ```
 

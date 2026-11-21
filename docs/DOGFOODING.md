@@ -135,3 +135,9 @@ Formatting, Clippy, and 41 default tests passed. Tests exercised timestamp order
 ## QMD comparison
 
 The release binary logged the decision to compare byte-identical bodies and measure both finding a source and returning its evidence. The benchmark used isolated journal and QMD indexes and real ONNX and GGUF models. The first harness run exposed a QMD path-normalization bug when it emitted a relative Markdown path. Regression tests cover relative paths, absolute paths, and empty responses. The corrected matrix finished 306 query invocations. A separate run exercised the literal flag `--from-checkpoint` in four modes. Python LSP diagnostics were unavailable because pyright was missing. Four focused Python tests, Rust formatting, Clippy, and 41 default Rust tests passed. [Full methodology, results, and raw records](BENCHMARK_QMD.md)
+
+## Budgeted attributed search
+
+In the first measured run, admitting more parents at 2,000 estimated tokens crowded out some text from the top matches. Keeping the complete matched chunk where it fits and reserving space for local expansion restored all three benchmark evidence passages at 2,000 tokens. The 800-token trial still lost the backlog threshold, which a lower budget could reasonably omit. [Budget benchmark](BENCHMARK_QMD.md#follow-up-on-context-budgets)
+
+In a separate Git fixture, the real executable logged the decisions about ranked allocation and returned offsets, then indexed both entries. The paraphrase “How do we stop a large result from crowding out other documents?” retrieved the allocation decision at rank 1 and the attribution decision at rank 2, using 460 of 1,000 estimated tokens. Formatting, Clippy, 46 default Rust tests, four benchmark tests, and the targeted ONNX integration test passed. Rust LSP diagnostics timed out on several edited files, and Cargo verified those sources.

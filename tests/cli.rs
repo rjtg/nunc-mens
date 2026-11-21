@@ -961,6 +961,139 @@ fn git_merge_reports_changes_relative_to_first_parent() -> Result<()> {
 }
 
 #[test]
+fn context_budget_rejects_zero_and_ids_mode_before_loading_the_model() -> Result<()> {
+    let fixture = Fixture::new()?;
+    for args in [
+        &["search", "writer", "--max-tokens", "0"][..],
+        &["search", "writer", "--max-tokens", "100", "--ids"][..],
+    ] {
+        let output = fixture.nunc(args).output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn real_search_budget_keeps_distinct_attributed_context() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let docs = fixture.repo.join("docs");
+    fs::create_dir(&docs)?;
+    let long = format!(
+        "# Runtime decisions\n\n## Café locking\n\nThe SQLite writer mutex guards durable publication ⛄.\n\n{}",
+        "A separate lead tells the reader to review older operational notes.\n\n".repeat(100)
+    );
+    let brief = "# Transactions\n\nThe SQLite writer mutex coordinates process access.";
+    fs::write(docs.join("long.md"), &long)?;
+    fs::write(docs.join("brief.md"), brief)?;
+    let hidden = fixture.log_id("Archived SQLite mutex publication note.")?;
+    fixture.run(&["archive", &hidden])?;
+    fixture.run(&["reindex", "--source", "docs"])?;
+    let args = [
+        "search",
+        "SQLite writer mutex guards publication",
+        "--source",
+        "docs",
+        "--context",
+        "parent",
+        "--max-tokens",
+        "900",
+        "--explain",
+        "--limit",
+        "2",
+        "--json",
+    ];
+    let report = fixture.json(&args)?;
+    assert_eq!(report, fixture.json(&args)?);
+    let hits = report["results"]
+        .as_array()
+        .context("missing budgeted hits")?;
+    assert_eq!(hits.len(), 2);
+    let mut found_long = false;
+    for hit in hits {
+        let is_long = hit["path"] == "docs/long.md";
+        let parent = if is_long { &long } else { brief };
+        let window = &hit["context_window"];
+        let number = |key: &str| -> Result<usize> {
+            Ok(window[key]
+                .as_u64()
+                .with_context(|| format!("missing {key}"))?
+                .try_into()?)
+        };
+        let start = number("byte_start")?;
+        let end = number("byte_end")?;
+        assert_eq!(hit["text"], &parent[start..end]);
+        assert_eq!(
+            number("line_start")?,
+            parent[..start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1
+        );
+        assert!(hit["matched_chunk"]["id"].is_string());
+        assert!(hit["explanation"]["similarity"].is_number());
+        if is_long {
+            found_long = true;
+            assert_eq!(window["truncated"], true);
+            assert_eq!(
+                hit["matched_chunk"]["heading_path"],
+                serde_json::json!(["Runtime decisions", "Café locking"])
+            );
+            assert!(
+                hit["text"]
+                    .as_str()
+                    .context("missing context")?
+                    .contains("durable publication ⛄")
+            );
+        }
+    }
+    assert!(found_long);
+    assert_eq!(report["budget"]["max_tokens"], 900);
+    assert_eq!(report["budget"]["omitted_candidates"], 0);
+    assert!(
+        report["budget"]["estimated_tokens"]
+            .as_u64()
+            .is_some_and(|used| used <= 900)
+    );
+    let tiny = fixture.json(&[
+        "search",
+        "SQLite writer",
+        "--source",
+        "docs",
+        "--max-tokens",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(tiny["results"], serde_json::json!([]));
+    assert_eq!(tiny["budget"]["omitted_candidates"], 2);
+    let raw = fixture.json(&[
+        "search",
+        "SQLite mutex",
+        "--type",
+        "memory",
+        "--raw",
+        "--max-tokens",
+        "1000",
+        "--json",
+    ])?;
+    assert_eq!(raw["results"][0]["id"], hidden);
+    let ordinary = fixture.json(&[
+        "search",
+        "SQLite mutex",
+        "--type",
+        "memory",
+        "--max-tokens",
+        "1000",
+        "--json",
+    ])?;
+    assert_eq!(ordinary["results"], serde_json::json!([]));
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires the explicitly prepared ONNX model cache"]
 fn real_context_explanations_duplicates_and_lifecycle() -> Result<()> {
     let mut fixture = Fixture::new()?;

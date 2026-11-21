@@ -6,15 +6,15 @@ A minimal shell-accessible memory tool, built in Rust, for a human and coding ag
 
 ## Data flow
 
-1. Capture with `nunc log` (or shorthand) -> append to local daily Markdown journal.
-2. Parse Markdown entries -> normalize metadata, keep verbatim body -> update SQLite.
+1. Discover Git root; capture with `nunc serve` FIFO or `nunc log`/`nunc write` -> atomically create one `.nunc/entries/<id>.md` file.
+2. Parse entry files and explicitly registered read-only `--source` paths -> update repo-scoped SQLite.
 3. Query FTS5 and optional cosine similarity -> fuse rankings -> print plaintext or JSON.
 
 ## Format
 
 Proposed entry boundary: a dedicated heading or marker with stable generated ID and metadata, followed by verbatim Markdown body until the next recognized entry marker. The implementer must choose a format where arbitrary user text (including headings, code fences and marker-like strings) cannot accidentally split entries. Prefer explicit length-delimited or escaped boundaries and add roundtrip tests. Journal is readable without the app. Do not use the entry text itself as identity, since identical thoughts may be logged twice.
 
-Daily files: `YYYY-MM-DD.md`, sorted by timestamp and insertion order; no automatic editing of old entries. Preserve the original body. Provenance uses relative path + stable entry ID.
+Individual files: `.nunc/entries/<id>.md`, with stable IDs and timestamps; no automatic editing of old entries. Preserve the original body. Provenance uses relative path + stable entry ID.
 
 ## Persistence
 
@@ -35,7 +35,7 @@ Keyword = SQLite FTS5 BM25. Semantic = query embedding + cosine similarity over 
 
 ## Explicit non-goals for MVP
 
-- MCP server or background process
+- MCP server or mandatory global background daemon (optional repo-local foreground `serve` is supported)
 - Hosted/vector SaaS, remote telemetry, Ollama and auto-sync
 - QMD dependency or heavy local reranking LLM
 - Distributed multiuser journal, cloud backup, automatic AI summarization

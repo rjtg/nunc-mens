@@ -8,7 +8,7 @@ A minimal shell-accessible memory tool, built in Rust, for a human and coding ag
 
 1. Discover Git root; capture with `nunc serve` FIFO or `nunc log`/`nunc write` -> atomically create one `.nunc/entries/<id>.md` file.
 2. Parse entry files and explicitly registered read-only `--source` paths -> update repo-scoped SQLite.
-3. Query FTS5 and optional cosine similarity -> fuse rankings -> print plaintext or JSON.
+3. Query vector storage and optional cosine similarity -> fuse rankings -> print plaintext or JSON.
 
 ## Format
 
@@ -18,8 +18,8 @@ Individual files: `.nunc/entries/<id>.md`, with stable IDs and timestamps; no au
 
 ## Persistence
 
-- `rusqlite` with bundled SQLite (FTS5) for entry text and metadata.
-- FTS5 table for keyword retrieval. A standard SQLite table storing encoded `f32` embeddings is sufficient for the MVP (linear scan + cosine in Rust, bounded query volume). Do not add an ANN database initially.
+- `rusqlite` with bundled SQLite (vector storage) for entry text and metadata.
+
 - Index schema version, model identifier and vector dimensions; reject mismatches.
 - Index is cache, not user data: support rebuild from Markdown and removal/reconciliation of deleted entries.
 - Use transactions for incremental writes. Full rebuild to a temporary DB and atomic rename on the same filesystem where feasible; preserve the previous valid index on failure.
@@ -31,7 +31,7 @@ Use the **Rust `fastembed` crate** to load a small multilingual Hugging Face ONN
 
 ## Ranking
 
-Keyword = SQLite FTS5 BM25. Semantic = query embedding + cosine similarity over compatible indexed vectors. Hybrid = fuse ranked candidate lists with deterministic reciprocal rank fusion (RRF) or equivalent; prefer exact identifiers and don't overengineer. Each result includes mode, rank/score, stable ID, timestamp and source path.
+Semantic retrieval only: cached fastembed query vector + cosine similarity against compatible vectors loaded from SQLite, linear scan in Rust.
 
 ## Explicit non-goals for MVP
 
@@ -55,3 +55,7 @@ Keep dependency and binary footprint modest; check ONNX Runtime distribution, mo
 - `nunc write`/`nunc log` fall back to direct file persistence when the server is absent. Indexing errors never discard saved Markdown; `reindex` recovers.
 - Repeatable `--source` flags index explicitly selected **read-only** source files/directories with deterministic chunks and file/line provenance. Watch changes, reconcile deletions, deduplicate overlaps, respect ignore rules and avoid symlink escapes.
 - SQLite is a disposable **repo-scoped** index outside Git; `fastembed` uses locally cached ONNX models. Runtime FIFO/session files and indexes must never be committed. Memory entries may be Git-tracked intentionally after privacy review.
+
+## Binding MVP indexing decision
+
+`fastembed` is an embedding generator, **not** a search index. Use a repo-scoped SQLite file at `$XDG_STATE_HOME/nunc-mens/<repo-id>/index.sqlite3` (default `~/.local/state/nunc-mens/<repo-id>/index.sqlite3`), outside Git. Persist IDs, source paths, kind, content, content hashes, model identifier/revision/dimensions and embeddings as `f32` BLOBs. For queries, generate one vector with the cached model, read compatible vectors and compute cosine similarity in Rust, sorting top-k results. Start with linear scan; no SQLite vector extension or separate vector DB. **No FTS5, BM25, keyword or hybrid search in MVP.** If model unavailable, writes persist but indexing remains pending and search errors clearly. Reindex is reproducible from Markdown and registered sources, and must never implicitly download a model.

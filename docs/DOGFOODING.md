@@ -95,3 +95,9 @@ After an incremental refresh of the conversation fixture, `nunc duplicates --thr
 In an isolated Git worktree, the built binary logged a real implementation decision about reusing chunk identity and staged SQLite publication. After indexing with the cached model, a fixture removed one chunk row directly from SQLite. `nunc repair --dry-run --json` reported exactly one `MISSING_CHUNK` finding and left the index bytes unchanged. `nunc repair --json` rebuilt the index, and a repeat reported no work. A paraphrased search found the original parent ID with byte-identical Markdown.
 
 Formatting, Clippy, and 30 default tests passed. The opt-in `audit_and_repair_disposable_index_while_preserving_durable_visibility` test passed with the cached ONNX model. It exercised missing and stale chunks, invalid vectors, deleted sources, stale forgotten rows, offline pruning, concurrent durable logging, archive and raw visibility, and a corrupt SQLite file. The Rust LSP returned clean results for some files and stale or timed-out responses for others. Cargo supplied the final verification.
+
+## Reversible archive
+
+The built binary logged a real implementation decision about reversible archive in an isolated Git worktree. After archiving one of two intentionally matching notes, ordinary `duplicates --exact --json` returned no pairs and `duplicates --exact --raw --json` returned one. Unarchive restored the ordinary pair. The original entry bytes matched throughout.
+
+Formatting, Clippy, and 32 default tests passed. The opt-in `manual_archive_changes_search_visibility_without_reembedding` test passed with real ONNX inference. It confirmed immediate default and raw visibility changes, full rebuild persistence, unarchive, and no raw leakage after explicit forget. Additional tests verified multi-entry changes, dry-run, idempotency, nested consolidation and an interrupted ledger publication. Some LSP calls timed out, so Cargo supplied final verification.

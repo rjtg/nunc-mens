@@ -172,11 +172,10 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
                 if guard.ledger.forgotten(id) {
                     return Ok(());
                 }
-                let visibility = guard.ledger.visibility(&archives, id);
-                if !options.raw && matches!(visibility.status, "archived" | "undone") {
+                if !options.raw && guard.ledger.hidden(&archives, id) {
                     return Ok(());
                 }
-                Some(visibility)
+                Some(guard.ledger.visibility(&archives, id))
             } else {
                 None
             };

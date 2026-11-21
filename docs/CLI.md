@@ -8,9 +8,11 @@
 | `nunc TEXT...` | Shorthand for `log` when the first argument is ordinary text and does not name a command. |
 | `nunc write TEXT...` or `nunc write --stdin` | Queues capture via a live FIFO or saves directly when the server is unavailable. |
 | `nunc serve [--boundary TOKEN] [--source PATH]...` | Runs the foreground FIFO and refreshes the index from local files. |
-| `nunc duplicates [ID] [--threshold N] [--limit N] [--exact] [--json]` | Finds candidate exact or semantic duplicates. |
+| `nunc duplicates [ID] [--threshold N] [--limit N] [--exact] [--raw] [--json]` | Finds candidate exact or semantic duplicates. |
 | `nunc git ingest\|import\|sync\|hook` | Captures selected commit history or manages the post-commit hook. |
 | `nunc consolidate candidates\|apply\|undo` | Retrieves full candidate entries, commits an external summary, or undoes an archive. |
+| `nunc archive ID... [--dry-run] [--json]` | Hides selected memories and keeps their Markdown. |
+| `nunc unarchive ID... [--dry-run] [--json]` | Restores manually archived memories. |
 | `nunc forget ID... [--dry-run\|--yes] [--json]` | Deletes only the specified entries after warning about dependencies. |
 | `nunc reindex [--full] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
 | `nunc search QUERY... [--limit N] [--json] [--type memory\|source] [--source PATH]...` | Ranks compatible indexed vectors by cosine similarity. |
@@ -73,7 +75,7 @@ Both strategies preserve CommonMark heading paths and group blocks within a sect
 
 ### Duplicate discovery
 
-`nunc duplicates [ID] --json` compares current parent content using a whitespace-normalized, case-sensitive SHA-256. Without an ID it inspects all eligible entries and configured source files. With an ID it limits results to pairs involving that parent. `--exact` skips the index and model. With the default 0.90 threshold, indexed passage comparisons can find paraphrases and similar passages. A `chunk` match establishes similarity between two fragments. High similarity can also flag conflicting revisions. Every match includes excerpts, IDs, paths, timestamps and chunk provenance when applicable.
+`nunc duplicates [ID] --json` compares current parent content using a whitespace-normalized, case-sensitive SHA-256. Without an ID it inspects all eligible entries and configured source files. With an ID it limits results to pairs involving that parent. `--exact` skips the index and model. By default, duplicate discovery and write-time checks exclude archived and undone entries. Use `duplicates --raw` to inspect them. Forgotten entries remain excluded. With the default 0.90 threshold, indexed passage comparisons can find paraphrases and similar passages. A `chunk` match establishes similarity between two fragments. High similarity can also flag conflicting revisions. Every match includes excerpts, IDs, paths, timestamps and chunk provenance when applicable.
 
 `nunc write --check-duplicates [--threshold N]` reports candidates on stderr before normal capture. Capture continues if the model or index is unavailable. Neither duplicate command suppresses entries. Semantic all-pairs comparisons scale quadratically with indexed chunks.
 
@@ -93,6 +95,19 @@ nunc git hook uninstall
 Default import and sync walk current HEAD ancestry in Git's descendants-first topological order. `--all` considers commits reachable from all refs. `--range A..B` takes commits reachable from B and excludes those reachable from A. Range and all are mutually exclusive. Date (UTC midnight, Git committer date) and positive limit can narrow any scope. Merges produce their own memory and use first-parent changes. Sync walks HEAD but opens commit details only for unseen IDs. Rewritten commits with new hashes are new memories. Existing Markdown from earlier commits remains available. Interrupted imports can be rerun and dry runs create no durable files.
 
 The optional managed post-commit hook invokes the installed CLI path and leaves Git commit success independent of ingestion. An existing or shared hook is preserved, with instructions to chain `nunc git ingest HEAD` explicitly. The command honors worktree-local `core.hooksPath`. Entries include full SHA, author, both dates, bounded messages and filtered changed paths/statistics. Binary bodies and patch hunks are omitted by default. Enabling `git.diff_context_bytes` adds bounded, heuristically redacted text for included paths. Inspect imported content before sharing it. Capture works without a model or server. Cached inference reconciles after runs selecting up to 256 commits. For larger runs, use the watcher or run `nunc reindex` after capture.
+
+## Reversible archive
+
+```sh
+nunc archive "$first" "$second" --dry-run --json
+nunc archive "$first" "$second"
+nunc search --raw "FIFO concurrency"
+nunc unarchive "$first"
+```
+
+Archive and unarchive validate all specified IDs before publishing one atomic ledger update. Repeating an operation reports unchanged IDs. Dry runs leave Markdown, the ledger, and SQLite unchanged. Changes take effect for subsequent retrieval without inference or reindex. Raw search labels manually archived memories with `archive_reason: "manual"`. A forgotten memory cannot be restored.
+
+An entry hidden by consolidation remains owned by that operation. Use `nunc consolidate undo` to restore its originals. A manual archive of an active summary hides the summary while preserving its existing sources and associations. Undo leaves the summary raw-only with status `undone`.
 
 ## Consolidation and forget
 

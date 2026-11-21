@@ -236,6 +236,9 @@ fn inspect(
     }
     if report.findings.contains_key("LINEAGE_TARGET_MISSING")
         || report.findings.contains_key("LINEAGE_TARGET_KIND")
+        || report
+            .findings
+            .contains_key("MANUAL_ARCHIVE_TARGET_MISSING")
     {
         report.action = "inspect_durable_inputs";
     }
@@ -266,6 +269,11 @@ fn check_lineage(
             if !ledger.forgotten(*source) && !parents.contains_key(source.to_string().as_str()) {
                 report.issue("LINEAGE_SOURCE_MISSING", "warning", source.to_string());
             }
+        }
+    }
+    for id in ledger.manual_archives() {
+        if !parents.contains_key(id.to_string().as_str()) {
+            report.issue("MANUAL_ARCHIVE_TARGET_MISSING", "error", id.to_string());
         }
     }
     for id in ledger.tombstones() {

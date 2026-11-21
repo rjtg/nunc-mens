@@ -65,6 +65,8 @@ enum Action {
         #[arg(long)]
         exact: bool,
         #[arg(long)]
+        raw: bool,
+        #[arg(long)]
         json: bool,
     },
     /// Refresh the semantic index from Markdown and registered sources.
@@ -108,6 +110,10 @@ enum Action {
         #[command(subcommand)]
         command: Consolidation,
     },
+    /// Hide selected memories while keeping their original Markdown.
+    Archive(ArchiveArgs),
+    /// Restore manually archived memories to ordinary retrieval.
+    Unarchive(ArchiveArgs),
     /// Permanently remove only the explicitly named memory entries.
     Forget {
         #[arg(required = true)]
@@ -140,6 +146,16 @@ enum Action {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Args)]
+struct ArchiveArgs {
+    #[arg(required = true)]
+    entries: Vec<Uuid>,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -309,9 +325,11 @@ fn execute(action: Action) -> Result<()> {
             threshold,
             limit,
             exact,
+            raw,
             json,
         } => {
-            let report = duplicates::find(&repo, id.as_deref(), threshold, limit as usize, exact)?;
+            let report =
+                duplicates::find(&repo, id.as_deref(), threshold, limit as usize, exact, raw)?;
             let mut out = io::stdout().lock();
             if json {
                 serde_json::to_writer(&mut out, &report)?;
@@ -426,6 +444,8 @@ fn execute(action: Action) -> Result<()> {
         }
         Action::Git { command } => git_action(&repo, command)?,
         Action::Consolidate { command } => consolidate(&repo, command)?,
+        Action::Archive(args) => archive(&repo, args, true)?,
+        Action::Unarchive(args) => archive(&repo, args, false)?,
         Action::Forget {
             entries,
             dry_run,
@@ -740,6 +760,37 @@ fn git_action(repo: &Repo, command: GitAction) -> Result<()> {
             eprintln!(
                 "nunc: history saved; run nunc reindex or let nunc serve index the bulk import"
             );
+        }
+    }
+    Ok(())
+}
+
+fn archive(repo: &Repo, args: ArchiveArgs, hide: bool) -> Result<()> {
+    let report = if args.dry_run {
+        let ledger = Ledger::read(repo)?;
+        ledger.archive_plan(repo, &args.entries, hide, true)?
+    } else {
+        Guard::acquire(repo, true)?.archive(&args.entries, hide)?
+    };
+    let mut output = io::stdout().lock();
+    if args.json {
+        serde_json::to_writer(&mut output, &report)?;
+        writeln!(output)?;
+    } else {
+        let qualifier = if report.dry_run { " (dry run)" } else { "" };
+        writeln!(
+            output,
+            "{}{}: {} changed, {} unchanged",
+            report.operation,
+            qualifier,
+            report.changed.len(),
+            report.unchanged.len()
+        )?;
+        for id in &report.changed {
+            writeln!(output, "  {id}")?;
+        }
+        for id in &report.unchanged {
+            writeln!(output, "  {id} unchanged")?;
         }
     }
     Ok(())

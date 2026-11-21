@@ -34,9 +34,10 @@ Freshness checks and polling reread eligible files. Search scans selected vector
 
 `git` shares parsing and entry publication between ingest, import, sync and the optional hook. Commit memories use a deterministic UUID derived from the worktree identity and full Git commit hash. Git traversal streams one hash at a time, and bounded process readers limit individual metadata and diffs.
 
-`ledger` owns archive associations, undo state and content-free tombstones in `.nunc/ledger.json`. Worktree mutations take the memory lock before acquiring the SQLite lock. Searches consult the ledger under a shared memory lock before returning indexed data. The disposable index never decides visibility.
+`ledger` owns manual and consolidation archive associations, undo state and content-free tombstones in `.nunc/ledger.json`. Worktree mutations take the memory lock before acquiring the SQLite lock. Searches consult the ledger under a shared memory lock before returning indexed data. The disposable index never decides visibility.
 
 - Apply publishes the new Markdown summary first, with a summary kind that stays invisible until a single atomic ledger replacement commits its associations. If publication is interrupted, originals stay searchable. The same body and source revisions derive the same operation ID, so a retry can reuse a staged summary. Competing applications serialize and can neither claim an already archived source nor form a cycle.
+- Manual archive publishes one ledger update for all selected IDs. Search and duplicate discovery share ledger visibility, and the rebuildable index retains archived rows for raw retrieval.
 - Undo toggles the durable association and leaves the summary raw-only. Nested associations retain history. A forgotten source remains an ID marker with no retained body.
 - Forget commits all tombstones together before removing any files or index rows. If interrupted, search and import consult the tombstone immediately. Retry forget or run reindex to remove pending files and rows. Physical erasure and copies outside the selected entries are outside this guarantee.
 - Reindex refreshes SQLite from surviving Markdown and configured sources. Archive status comes from the ledger in both normal and raw search. Back up the ledger with entry Markdown to preserve state.

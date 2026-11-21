@@ -108,24 +108,39 @@ impl Top {
     }
 }
 
+fn eligible_parents<'a>(
+    guard: &Guard<'_>,
+    snapshot: &'a Snapshot,
+    raw: bool,
+) -> Result<BTreeMap<&'a str, &'a Document>> {
+    let archives = guard.ledger.archives()?;
+    Ok(snapshot
+        .documents
+        .iter()
+        .filter_map(|doc| {
+            let id = doc.provenance.id.as_str();
+            let hidden =
+                uuid::Uuid::parse_str(id).is_ok_and(|id| guard.ledger.hidden(&archives, id));
+            (raw || !hidden).then_some((id, doc))
+        })
+        .collect())
+}
+
 pub(crate) fn find(
     repo: &Repo,
     id: Option<&str>,
     threshold: f64,
     limit: usize,
     exact: bool,
+    raw: bool,
 ) -> Result<Report> {
     valid_threshold(threshold)?;
-    let _guard = Guard::acquire(repo, false)?;
+    let guard = Guard::acquire(repo, false)?;
     let snapshot = Snapshot::read(repo)?;
-    let parents: BTreeMap<_, _> = snapshot
-        .documents
-        .iter()
-        .map(|doc| (doc.provenance.id.as_str(), doc))
-        .collect();
+    let parents = eligible_parents(&guard, &snapshot, raw)?;
     ensure!(
         id.is_none_or(|id| parents.contains_key(id)),
-        "unknown entry or source ID"
+        "entry or source is unavailable; use --raw to include archived entries"
     );
     let hashes: HashMap<_, _> = parents
         .iter()
@@ -235,7 +250,7 @@ fn exact_pair(left: &Document, right: &Document) -> Pair {
 
 pub(crate) fn check_write(repo: &Repo, text: &str, threshold: f64) -> Result<Report> {
     valid_threshold(threshold)?;
-    let _guard = Guard::acquire(repo, false)?;
+    let guard = Guard::acquire(repo, false)?;
     let snapshot = Snapshot::read(repo)?;
     let digest = normalized(text);
     let incoming = || Item {
@@ -249,12 +264,8 @@ pub(crate) fn check_write(repo: &Repo, text: &str, threshold: f64) -> Result<Rep
         limit: 5,
         pairs: Vec::new(),
     };
-    let parents: HashMap<_, _> = snapshot
-        .documents
-        .iter()
-        .map(|doc| (doc.provenance.id.as_str(), doc))
-        .collect();
-    for parent in &snapshot.documents {
+    let parents = eligible_parents(&guard, &snapshot, false)?;
+    for parent in parents.values() {
         if normalized(&parent.text) == digest {
             top.offer(Pair {
                 detection: "exact",

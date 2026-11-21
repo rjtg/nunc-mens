@@ -15,6 +15,8 @@ const MAX_LEDGER: usize = 128 * 1024 * 1024;
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Ledger {
     summaries: BTreeMap<Uuid, Summary>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    manual_archived: BTreeSet<Uuid>,
     forgotten: BTreeMap<Uuid, Tombstone>,
 }
 
@@ -48,6 +50,8 @@ pub(crate) struct Visibility {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived_into: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    archive_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     archived_into_forgotten: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<Reference>,
@@ -73,6 +77,14 @@ pub(crate) struct ForgetPlan {
     pub dependencies: Vec<Dependency>,
 }
 
+#[derive(Serialize)]
+pub(crate) struct ArchiveReport {
+    pub operation: &'static str,
+    pub dry_run: bool,
+    pub changed: Vec<Uuid>,
+    pub unchanged: Vec<Uuid>,
+}
+
 impl Ledger {
     pub fn read(repo: &Repo) -> Result<Self> {
         match fs::symlink_metadata(repo.local()) {
@@ -92,7 +104,13 @@ impl Ledger {
     }
 
     fn validate(&self) -> Result<()> {
-        self.archives()?;
+        let archives = self.archives()?;
+        for id in &self.manual_archived {
+            ensure!(
+                !archives.contains_key(id) && !self.forgotten(*id),
+                "conflicting manual archive for {id}"
+            );
+        }
         // Topological traversal over every historical edge, including undo and tombstones.
         let mut degrees = BTreeMap::new();
         let mut reverse = BTreeMap::<_, Vec<_>>::new();
@@ -173,10 +191,13 @@ impl Ledger {
             && !self.summaries.contains_key(&entry.metadata.id)
     }
 
-    pub fn visibility(&self, archives: &BTreeMap<Uuid, Uuid>, id: Uuid) -> Visibility {
-        let archived_into = archives.get(&id).copied();
+    pub fn manual_archives(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.manual_archived.iter().copied()
+    }
+
+    fn status(&self, archives: &BTreeMap<Uuid, Uuid>, id: Uuid) -> &'static str {
         let summary = self.summaries.get(&id);
-        let status = if archived_into.is_some() {
+        if archives.contains_key(&id) || self.manual_archived.contains(&id) {
             "archived"
         } else if summary.is_some_and(|summary| summary.undone) {
             "undone"
@@ -184,6 +205,23 @@ impl Ledger {
             "consolidated"
         } else {
             "active"
+        }
+    }
+
+    pub fn hidden(&self, archives: &BTreeMap<Uuid, Uuid>, id: Uuid) -> bool {
+        matches!(self.status(archives, id), "archived" | "undone")
+    }
+
+    pub fn visibility(&self, archives: &BTreeMap<Uuid, Uuid>, id: Uuid) -> Visibility {
+        let archived_into = archives.get(&id).copied();
+        let summary = self.summaries.get(&id);
+        let status = self.status(archives, id);
+        let archive_reason = if archived_into.is_some() {
+            Some("consolidation")
+        } else if self.manual_archived.contains(&id) {
+            Some("manual")
+        } else {
+            None
         };
         let sources = summary
             .into_iter()
@@ -196,9 +234,56 @@ impl Ledger {
         Visibility {
             status,
             archived_into,
+            archive_reason,
             archived_into_forgotten: archived_into.map(|target| self.forgotten(target)),
             sources,
         }
+    }
+
+    pub fn archive_plan(
+        &self,
+        repo: &Repo,
+        ids: &[Uuid],
+        archive: bool,
+        dry_run: bool,
+    ) -> Result<ArchiveReport> {
+        unique(ids)?;
+        let archives = self.archives()?;
+        let mut changed = Vec::new();
+        let mut unchanged = Vec::new();
+        for &id in ids {
+            ensure!(!self.forgotten(id), "entry {id} was forgotten");
+            let entry = entries::read(&entries::path(repo, id))
+                .with_context(|| format!("cannot inspect memory {id}"))?;
+            ensure!(
+                !self.pending_summary(&entry),
+                "entry {id} is an uncommitted summary"
+            );
+            ensure!(
+                !self
+                    .summaries
+                    .get(&id)
+                    .is_some_and(|summary| summary.undone),
+                "summary {id} was undone and remains available through raw retrieval"
+            );
+            if let Some(summary) = archives.get(&id) {
+                ensure!(
+                    archive,
+                    "entry {id} was archived by consolidation {summary}; use nunc consolidate undo"
+                );
+                unchanged.push(id);
+            } else if self.manual_archived.contains(&id) == archive {
+                unchanged.push(id);
+            } else {
+                changed.push(id);
+            }
+        }
+        Ok(ArchiveReport {
+            operation: if archive { "archive" } else { "unarchive" },
+            dry_run,
+            changed,
+            unchanged,
+        })
     }
 
     pub fn forget_plan(&self, repo: &Repo, ids: &[Uuid]) -> Result<ForgetPlan> {
@@ -295,6 +380,21 @@ impl<'a> Guard<'a> {
         atomic_write(&self.repo.local().join(NAME), &bytes, true)
     }
 
+    pub fn archive(&mut self, ids: &[Uuid], archive: bool) -> Result<ArchiveReport> {
+        let report = self.ledger.archive_plan(self.repo, ids, archive, false)?;
+        for id in &report.changed {
+            if archive {
+                self.ledger.manual_archived.insert(*id);
+            } else {
+                self.ledger.manual_archived.remove(id);
+            }
+        }
+        if !report.changed.is_empty() {
+            self.save()?;
+        }
+        Ok(report)
+    }
+
     pub fn apply(
         &mut self,
         ids: &[Uuid],
@@ -359,13 +459,9 @@ impl<'a> Guard<'a> {
         }
         let archives = self.ledger.archives()?;
         for id in &inputs {
-            ensure!(!archives.contains_key(id), "entry {id} is already archived");
             ensure!(
-                self.ledger
-                    .summaries
-                    .get(id)
-                    .is_none_or(|summary| !summary.undone),
-                "entry {id} is an undone summary"
+                !self.ledger.hidden(&archives, *id),
+                "entry {id} is already archived or undone"
             );
         }
         let path = entries::path(self.repo, summary_id);
@@ -426,6 +522,7 @@ impl<'a> Guard<'a> {
             });
         }
         summary.undone = true;
+        self.ledger.manual_archived.remove(&id);
         self.save()?;
         Ok(Applied {
             summary_id: id,
@@ -437,6 +534,7 @@ impl<'a> Guard<'a> {
     pub fn forget(&mut self, plan: &ForgetPlan) -> Result<()> {
         for &id in &plan.targets {
             let entry = entries::read(&entries::path(self.repo, id))?;
+            self.ledger.manual_archived.remove(&id);
             self.ledger.forgotten.insert(
                 id,
                 Tombstone {
@@ -477,6 +575,27 @@ impl<'a> Guard<'a> {
 mod tests {
     use super::*;
     use crate::documents::Snapshot;
+
+    #[test]
+    fn interrupted_manual_archive_preserves_the_previous_ledger() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = Repo::new(temp.path())?;
+        let note = entries::persist(&repo, "Original archive input", ContextFields::default())?;
+        let mut guard = Guard::acquire(&repo, true)?;
+        let ledger_path = repo.local().join(NAME);
+        fs::create_dir(&ledger_path)?;
+        assert!(guard.archive(&[note.id], true).is_err());
+        fs::remove_dir(&ledger_path)?;
+        drop(guard);
+        let mut guard = Guard::acquire(&repo, true)?;
+        assert!(!guard.ledger.hidden(&guard.ledger.archives()?, note.id));
+        assert_eq!(guard.archive(&[note.id], true)?.changed, [note.id]);
+        drop(guard);
+        let ledger = Ledger::read(&repo)?;
+        assert!(ledger.hidden(&ledger.archives()?, note.id));
+        assert_eq!(entries::read(&note.path)?.body, "Original archive input");
+        Ok(())
+    }
 
     #[test]
     fn interrupted_summary_and_forget_recover_from_durable_intent() -> Result<()> {

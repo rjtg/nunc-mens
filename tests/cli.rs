@@ -1280,3 +1280,101 @@ fn audit_and_repair_disposable_index_while_preserving_durable_visibility() -> Re
     );
     Ok(())
 }
+
+#[test]
+fn manual_archive_is_atomic_idempotent_and_preserves_consolidation_lineage() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let first = fixture.log_id("An original comparable decision")?;
+    let second = fixture.log_id("An original comparable decision")?;
+    let bytes = fixture.entry_bytes(&first)?;
+    let ledger = fixture.local().join("ledger.json");
+    let preview = fixture.json(&["archive", &first, &second, "--dry-run", "--json"])?;
+    assert_eq!(preview["changed"], serde_json::json!([first, second]));
+    assert!(!ledger.exists());
+    let report = fixture.json(&["archive", &first, &second, "--json"])?;
+    assert_eq!(report["changed"], preview["changed"]);
+    assert_eq!(fixture.entry_bytes(&first)?, bytes);
+    let durable = fs::read(&ledger)?;
+    let retry = fixture.json(&["archive", &first, "--json"])?;
+    assert_eq!(retry["unchanged"], serde_json::json!([first]));
+    assert_eq!(fs::read(&ledger)?, durable);
+    assert_eq!(
+        fixture.json(&["duplicates", "--exact", "--json"])?["matches"],
+        serde_json::json!([])
+    );
+    let raw = fixture.json(&["duplicates", "--exact", "--raw", "--json"])?;
+    assert_eq!(raw["matches"].as_array().map(Vec::len), Some(1));
+    assert!(
+        !fixture
+            .nunc(&["archive", &first, "00000000-0000-0000-0000-000000000001"])
+            .output()?
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(&ledger)?, durable);
+
+    fixture.run(&["unarchive", &first])?;
+    let joined = fixture.summary(&first, "First consolidated layer")?;
+    let outer = fixture.summary(&joined, "Second consolidated layer")?;
+    let conflict = fixture.nunc(&["unarchive", &second, &first]).output()?;
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8(conflict.stderr)?.contains("consolidate undo"));
+    assert_eq!(
+        fixture.json(&["archive", &second, "--json"])?["unchanged"],
+        serde_json::json!([second])
+    );
+    fixture.run(&["consolidate", "undo", &outer])?;
+    fixture.run(&["archive", &joined])?;
+    fixture.run(&["consolidate", "undo", &joined])?;
+    assert!(
+        !fixture
+            .nunc(&["unarchive", &joined])
+            .output()?
+            .status
+            .success()
+    );
+
+    fixture.run(&["forget", &second, "--yes"])?;
+    assert!(
+        !fixture
+            .nunc(&["unarchive", &second])
+            .output()?
+            .status
+            .success()
+    );
+    assert_eq!(fixture.entry_bytes(&first)?, bytes);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn manual_archive_changes_search_visibility_without_reembedding() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let id = fixture.log_id("An archived decision about exclusive memory locks.")?;
+    fixture.run(&["reindex"])?;
+    fixture.run(&["archive", &id])?;
+    let text = "memory locks";
+    let normal = fixture.json(&["search", "--json", text])?;
+    assert_eq!(normal["results"], serde_json::json!([]));
+    let raw = fixture.json(&["search", "--raw", "--json", text])?;
+    assert_eq!(raw["results"][0]["id"], id);
+    assert_eq!(raw["results"][0]["archive_reason"], "manual");
+    fixture.run(&["reindex", "--full"])?;
+    assert_eq!(
+        fixture.json(&["search", "--json", text])?["results"],
+        serde_json::json!([])
+    );
+    fixture.run(&["unarchive", &id])?;
+    assert_eq!(
+        fixture.json(&["search", "--json", text])?["results"][0]["id"],
+        id
+    );
+    fixture.run(&["archive", &id])?;
+    fixture.run(&["forget", &id, "--yes"])?;
+    assert_eq!(
+        fixture.json(&["search", "--raw", "--json", text])?["results"],
+        serde_json::json!([])
+    );
+    Ok(())
+}

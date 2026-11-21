@@ -45,7 +45,7 @@ nunc git import --limit 100
 nunc consolidate candidates "deploy clock synchronization" --json
 ```
 
-Use `consolidate apply` to save a summary you provide and archive its originals. Use `search --raw` to inspect archived history. `forget --dry-run` shows dependencies before an explicit deletion. To back up these relationships, retain both your Markdown entries and `.nunc/ledger.json`. [CLI reference](docs/CLI.md)
+Use `consolidate apply` to save a summary you provide and archive its originals. Use `archive` and `unarchive` to change retrieval visibility while preserving original Markdown. Use `search --raw` to inspect archived history. `forget --dry-run` shows dependencies before an explicit deletion. To back up these relationships, retain both your Markdown entries and `.nunc/ledger.json`. [CLI reference](docs/CLI.md)
 
 If the disposable index is out of sync, run `nunc doctor --deep` or preview repair with `nunc repair --dry-run`.
 

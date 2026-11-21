@@ -9,7 +9,12 @@
 *.db-*
 /journal/
 /journals/
-/.nunc/
+/.nunc/input.fifo
+/.nunc/session.json
+/.nunc/*.sock
+/.nunc/*.lock
+/.nunc/*.pid
+/.nunc/index*
 /.nunc-mens/
 /tmp/
 /temp/

@@ -25,13 +25,14 @@ nunc log --tag auth --tag staging --repo myservice "Fixed deploy failure"
 nunc reindex
 nunc reindex --full
 nunc doctor
+nunc models download
 ```
 
 - Index all supported entries in the configured journal directory, and **only** there. `reindex` incrementally refreshes changed and removed entries when possible; `--full` recreates the SQLite search index from source and discards stale data.
-- FTS5 is always available for indexed entries. Attempt embeddings only when a compatible configured backend is reachable. If embeddings are unavailable, still build the keyword index and report counts and the reason.
+- FTS5 is always available for indexed entries. Generate embeddings in-process with `fastembed` only when the configured model is already cached. If it is missing or cannot load, still build the keyword index and report counts and the reason. Never download during indexing.
 - Persist embedding provider/model/dimensions/version. When those change, invalidate/rebuild affected embeddings; never compare vectors with incompatible dimensions.
 - No silent stale results: writes either trigger freshness validation on search or show a clear 'index needs refresh' warning. For MVP, explicit reindex with clear stale warning is acceptable.
-- `doctor` reports effective paths, index state, backend connectivity, configured embedding model and missing prerequisites **without displaying journal text**.
+- `doctor` reports effective paths, index state, cached model availability, configured embedding model and missing prerequisites **without displaying journal text**.
 
 ## Retrieval
 
@@ -43,7 +44,7 @@ nunc search --mode hybrid --json "CI failures"
 ```
 
 - Keyword: SQLite FTS5/BM25; match exact tokens and identifiers as reliably as possible (define tokenizer behavior/tests).
-- Semantic: embed query using the same provider/model as indexed entries, then cosine similarity over stored `f32` vectors. Fail clearly if backend/index is unavailable; do not mislabel keyword-only hits as semantic.
+- Semantic: embed query using the same provider/model as indexed entries, then cosine similarity over stored `f32` vectors. Fail clearly if the cached model/index is unavailable; do not mislabel keyword-only hits as semantic.
 - Hybrid: merge FTS5 and vector candidates deterministically (e.g., reciprocal rank fusion) with exact-match protection. Default to hybrid if available; otherwise transparently fall back to keyword with a warning to stderr.
 - Return `--limit` best-ranked results (default 5), each with ID, timestamp, file path and verbatim text. Provide an explicit score/rank and search mode in JSON. Avoid returning arbitrary file contents.
 - `--json` returns a single valid JSON object, including results, `mode_requested`, `mode_used`, and warnings; don't emit diagnostic lines on stdout. Human formatting may be more compact.
@@ -54,8 +55,8 @@ nunc search --mode hybrid --json "CI failures"
 ```sh
 export NUNC_JOURNAL_DIR="$HOME/.local/share/nunc-mens/journal"
 export NUNC_INDEX_PATH="$HOME/.local/state/nunc-mens/index.sqlite3"
-export NUNC_OLLAMA_URL="http://127.0.0.1:11434"
-export NUNC_EMBED_MODEL="nomic-embed-text"
+export NUNC_EMBED_MODEL="<supported-multilingual-fastembed-model-id>"
+export NUNC_MODEL_CACHE_DIR="$HOME/.cache/nunc-mens/models"
 ```
 
-Defaults are proposals; implement OS/XDG-aware path handling with tests. Embeddings use Ollama's supported `/api/embed` endpoint and parse its documented response; centralize API-version compatibility if necessary. Never require Ollama to log or keyword-search. No automatic remote endpoint fallback.
+Defaults are proposals; implement OS/XDG-aware path handling with tests. Embeddings run in-process using the Rust `fastembed` crate and a supported multilingual Hugging Face ONNX model. Choose and document an actual model ID supported by the pinned crate version during implementation; do not treat the placeholder above as a real model ID. `nunc models download` is the only command allowed to fetch model files; all other commands must be offline and must use the cache. `log` and keyword search must work without model files. No Ollama or HTTP inference service.

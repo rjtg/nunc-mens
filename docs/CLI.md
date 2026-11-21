@@ -60,3 +60,22 @@ export NUNC_MODEL_CACHE_DIR="$HOME/.cache/nunc-mens/models"
 ```
 
 Defaults are proposals; implement OS/XDG-aware path handling with tests. Embeddings run in-process using the Rust `fastembed` crate and a supported multilingual Hugging Face ONNX model. Choose and document an actual model ID supported by the pinned crate version during implementation; do not treat the placeholder above as a real model ID. `nunc models download` is the only command allowed to fetch model files; all other commands must be offline and must use the cache. `log` and keyword search must work without model files. No Ollama or HTTP inference service.
+
+## Repo-local server, FIFO and sources (supersedes legacy journal paths above)
+
+See [REPO_FIFO.md](REPO_FIFO.md) for the normative specification. The default scope is the Git repository root, discovered from nested directories; entries live as separate files in `.nunc/entries/<id>.md`, not `YYYY-MM-DD.md`. `nunc init` optionally creates `.nunc/config.toml`.
+
+```sh
+nunc init
+nunc serve --source ./src --source ./docs --source ./AGENTS.md
+nunc serve --boundary 'my-session-token' --source ./docs
+nunc status
+nunc write "Cache strategy updated"
+printf 'A multi-line note\n' | nunc write --stdin
+nunc search --type memory "cache decision"
+nunc search --type source --source ./docs "cache API"
+```
+
+`serve` creates `.nunc/input.fifo`, prints the FIFO and generated or explicit session boundary, and publishes permission-restricted `.nunc/session.json`. A complete line `--<boundary>` ends one message; the server atomically persists one Markdown file and immediately indexes it. Multiple messages and multiline Markdown are supported. `--source` is repeatable for read-only source files/directories; scan initially, watch for changes and reconcile deletions. Search results expose `kind=memory|source`, path and source chunk line ranges; `--type` and `--source` filter results.
+
+`nunc write` safely frames input using the current session; when no server is available it writes an entry directly, never hanging indefinitely. FIFO writes alone do not acknowledge persistence/indexing. `nunc reindex` reconciles memory files and configured sources. Repo-scoped SQLite indexes live in XDG state; the `fastembed` model cache lives in XDG cache. The legacy `NUNC_JOURNAL_DIR` and daily-file proposals above are replaced by this design.

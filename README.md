@@ -2,8 +2,17 @@
 
 `nunc` captures project notes as local Markdown and retrieves notes and explicitly selected files through semantic search. Run it from any directory in your Git worktree.
 
+Install a published release from crates.io, or build the current version from GitHub.
+
 ```sh
-cargo install --path . --locked
+cargo install nunc-mens --locked
+# Install directly from GitHub:
+cargo install --git https://github.com/rjtg/nunc-mens --locked
+```
+
+Both commands install the `nunc` executable. From a local checkout, use `cargo install --path . --locked`.
+
+```sh
 nunc init --source docs --source src
 nunc log "Deploy tokens expired because the staging host's clock drifted."
 nunc models download
@@ -38,4 +47,4 @@ The default test suite runs without a downloaded embedding model. See [CLI refer
 
 ## License
 
-The project has yet to select a license. The pinned E5 model is MIT-licensed. [Model card](https://huggingface.co/intfloat/multilingual-e5-small)
+This project is available under the [MIT License](LICENSE). The pinned E5 model is also MIT-licensed. [Model card](https://huggingface.co/intfloat/multilingual-e5-small)

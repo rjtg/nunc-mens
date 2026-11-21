@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Repository-local semantic memory"
+license = "MIT"
 repository = "https://github.com/rjtg/nunc-mens"
+readme = "README.md"
+include = ["/Cargo.lock", "/LICENSE", "/README.md", "/docs/**", "/src/**", "/tests/**"]
 
 [[bin]]
 name = "nunc"

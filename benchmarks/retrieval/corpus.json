@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "project": "Sparrow, a fictional queue and deployment service",
+  "documents": [
+    {
+      "id": "lease-adr",
+      "path": "decisions/004-writer-lease.md",
+      "kind": "source",
+      "text": "# ADR 004 — Serialize durable writes\n\n## Decision\n\nThe process holding the repository writer lease may replace the durable manifest. Readers share a generation until the writer publishes the next one. Serialize writers before touching SQLite so a concurrent rebuild cannot expose a partial generation.\n\n## Alternatives\n\nA process-local mutex cannot coordinate two terminal sessions. An external consensus system is unnecessary for a single filesystem.\n"
+    },
+    {
+      "id": "lease-api",
+      "path": "reference/lease-api.md",
+      "kind": "source",
+      "text": "# Writer lease API\n\n## Recovery\n\nCall `reopenLease()` after a child aborts. Pass the durable generation returned by `readLeaseHeader()`. The function raises `SPW_E_LEASE_GEN_MISMATCH` to prevent reclaiming a lease from a newer worker.\n\n```rust\nlet generation = readLeaseHeader(root)?;\nlet lease = reopenLease(root, generation)?;\n```\n"
+    },
+    {
+      "id": "reader-api",
+      "path": "reference/read-api.md",
+      "kind": "source",
+      "text": "# Reader lease API\n\nA reopened reader checks `SPW_E_SNAPSHOT_STALE` and retries on the latest committed generation. `readSnapshot()` never takes the writer lease for immutable data. A stale snapshot may still be used by the process that opened it until the read finishes.\n"
+    },
+    {
+      "id": "clock-incident",
+      "path": "incidents/2025-02-staging-clock.md",
+      "kind": "source",
+      "text": "# Staging rejected valid deploy tokens\n\n## Root cause\n\nThe staging host's clock ran seven minutes ahead of the signing host. Authentication treated newly minted tokens as expired. The mitigation restored synchronization and recreated tokens after correcting the offset. No production signing key changed.\n"
+    },
+    {
+      "id": "clock-remedy",
+      "path": "runbooks/clock-health.md",
+      "kind": "source",
+      "text": "# Verify clock synchronization\n\nRun `chronyc tracking` and inspect the last offset. The rollout is blocked when the absolute skew exceeds two seconds. The health check only detects skew and cannot rotate credentials.\n"
+    },
+    {
+      "id": "tls-reference",
+      "path": "reference/tls-rollover.md",
+      "kind": "source",
+      "text": "# TLS issuer transition\n\nDuring certificate migration keep both CA roots in the trust bundle. `trust.transition_grace_days` controls how long installed clients keep the previous public issuer. The default is seven days. This is separate from the API token signing grace window.\n"
+    },
+    {
+      "id": "lease-diff-design",
+      "path": "design/patch-review.md",
+      "kind": "source",
+      "text": "# Review exact Markdown changes\n\nCompare saved UTF-8 bodies line by line. Preserve blank lines, CRLF, and missing final line feeds. The commands use standard unified patch headers. Captured timestamps remain outside the content comparison.\n"
+    },
+    {
+      "id": "budget-design",
+      "path": "design/agent-context.md",
+      "kind": "source",
+      "text": "# Context for coding agents\n\nKeep the span that actually matched first. Expand toward surrounding lines only after other relevant documents have room. A command returns both a matched span and a parent ID for follow-up. This prevents a giant troubleshooting guide from crowding out a short decision.\n"
+    },
+    {
+      "id": "upgrade-runbook",
+      "path": "runbooks/upgrade-recovery.md",
+      "kind": "source",
+      "file": "fixtures/upgrade-recovery.md"
+    },
+    {
+      "id": "old-token-policy",
+      "kind": "memory",
+      "timestamp": "2024-06-12T12:00:00Z",
+      "text": "# Original token-drain policy\n\nWe allowed a thirty-second overlap of old and new API signing keys. At launch no in-flight request was expected to last longer. This was the first policy during the trial rollout.\n"
+    },
+    {
+      "id": "new-token-policy",
+      "kind": "memory",
+      "timestamp": "2026-10-18T12:00:00Z",
+      "text": "# Revised token-drain policy\n\nAfter observing slow uploads, allow both API signing keys for ninety seconds. This replaced the thirty-second trial window. After ninety seconds the prior API signing key can be retired.\n"
+    },
+    {
+      "id": "refresh-lease-memory",
+      "kind": "memory",
+      "timestamp": "2025-09-09T12:00:00Z",
+      "text": "# Temporary leases on model files\n\nLock the embedding cache while downloading model artifacts. Validate hashes in a staging directory and rename the directory only after verification. A model cache lock never covers the application writer lease or the journal.\n"
+    },
+    {
+      "id": "retired-fifo",
+      "kind": "memory",
+      "timestamp": "2025-01-09T12:00:00Z",
+      "archived": true,
+      "text": "# Abandoned FIFO acknowledgement prototype\n\nThe prototype called a successful write a durable acknowledgement and tracked it with `spw_fifo_ack_v0`. The prototype was retired because accepting bytes cannot establish that the disk publication completed.\n"
+    },
+    {
+      "id": "modern-fifo",
+      "kind": "memory",
+      "timestamp": "2025-02-02T12:00:00Z",
+      "text": "# FIFO capture receipts\n\nA successful pipe write confirms only that the frame was queued. When a caller requires proof of durable capture, use synchronous direct logging and wait for the Markdown file receipt.\n"
+    },
+    {
+      "id": "modern-fifo-copy",
+      "kind": "memory",
+      "timestamp": "2025-02-03T12:00:00Z",
+      "text": "# FIFO capture receipts\n\nA successful pipe write confirms only that the frame was queued. When a caller requires proof of durable capture, use synchronous direct logging and wait for the Markdown file receipt.\n"
+    },
+    {
+      "id": "imported-commit",
+      "kind": "git",
+      "timestamp": "2025-03-07T12:00:00Z",
+      "path": "worker/drain.rs",
+      "text": "Drain the active delivery before recycling the worker\n\nA SIGTERM marks the worker unavailable, then waits for delivery_finalized before terminating the subprocess. This avoids a second worker taking the unfinished task.\n",
+      "file_text": "// Fixture for deterministic Git-history import.\nfn drain(worker: &mut Worker) { worker.stop_accepting(); worker.await_completion(); }\n"
+    }
+  ]
+}

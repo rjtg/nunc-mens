@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "queries": [
+    {"id": "paraphrase-writer", "category": "semantic", "query": "Why prevent parallel processes from publishing a half-written storage generation?", "grades": {"lease-adr": 3, "lease-api": 1}, "evidence": {"lease-adr": "Serialize writers before touching SQLite"}},
+    {"id": "paraphrase-auth", "category": "semantic", "query": "What environmental problem made correctly signed credentials fail in the test deployment?", "grades": {"clock-incident": 3, "clock-remedy": 1}, "evidence": {"clock-incident": "seven minutes ahead"}},
+    {"id": "paraphrase-budget", "category": "semantic", "query": "How should a retrieval tool share scarce space around relevant snippets across several files?", "grades": {"budget-design": 3}, "evidence": {"budget-design": "other relevant documents have room"}},
+    {"id": "exact-symbol", "category": "exact", "query": "reopenLease()", "grades": {"lease-api": 3}, "evidence": {"lease-api": "Call `reopenLease()`"}},
+    {"id": "exact-error", "category": "exact", "query": "SPW_E_SNAPSHOT_STALE", "grades": {"reader-api": 3}, "evidence": {"reader-api": "SPW_E_SNAPSHOT_STALE"}},
+    {"id": "exact-path", "category": "exact", "query": "design/patch-review.md", "grades": {"lease-diff-design": 3}, "evidence": {"lease-diff-design": "standard unified patch headers"}},
+    {"id": "exact-config", "category": "exact", "query": "trust.transition_grace_days", "grades": {"tls-reference": 3}, "evidence": {"tls-reference": "trust.transition_grace_days"}},
+    {"id": "exact-sha", "category": "exact", "query": "${commit_sha}", "grades": {"imported-commit": 3}},
+    {"id": "history-old", "category": "history", "query": "What grace period was approved during the trial rollout before slow transfers were observed?", "grades": {"old-token-policy": 3, "new-token-policy": 1}, "evidence": {"old-token-policy": "thirty-second overlap"}},
+    {"id": "history-new", "category": "history", "query": "When can we now withdraw the old API signer after reports of slow uploads?", "grades": {"new-token-policy": 3, "old-token-policy": 1}, "evidence": {"new-token-policy": "ninety seconds"}},
+    {"id": "commit-paraphrase", "category": "history", "query": "Which commit ensured a replacement worker could not take an unfinished job when another received a shutdown signal?", "grades": {"imported-commit": 3}, "evidence": {"imported-commit": "delivery_finalized"}},
+    {"id": "long-cursor", "category": "long-context", "query": "How can I repair a replay cursor that points after the last durable record?", "grades": {"upgrade-runbook": 3}, "evidence": {"upgrade-runbook": "replay-cursor reset --from-checkpoint"}},
+    {"id": "long-broken-manifest", "category": "long-context", "query": "Which file should be restored if the journal generation pointer is unreadable after the upgrade?", "grades": {"upgrade-runbook": 3, "lease-adr": 1}, "evidence": {"upgrade-runbook": "manifest.last-good.json"}},
+    {"id": "long-metrics", "category": "long-context", "query": "How should an operator judge whether the backlog is temporary after adding consumers?", "grades": {"upgrade-runbook": 3}, "evidence": {"upgrade-runbook": "three consecutive five-minute intervals"}},
+    {"id": "distinct-lease", "category": "lifecycle", "query": "How do competing model downloads avoid publishing unchecked weights?", "grades": {"refresh-lease-memory": 3}, "evidence": {"refresh-lease-memory": "Validate hashes in a staging directory"}},
+    {"id": "duplicate-fifo", "category": "lifecycle", "query": "How can a sender prove a queued note made it to storage?", "grades": {"modern-fifo": 3, "modern-fifo-copy": 3}, "evidence": {"modern-fifo": "synchronous direct logging", "modern-fifo-copy": "synchronous direct logging"}},
+    {"id": "archived-prototype", "category": "lifecycle", "query": "spw_fifo_ack_v0", "scope": "raw", "grades": {"retired-fifo": 3}, "evidence": {"retired-fifo": "spw_fifo_ack_v0"}}
+  ]
+}

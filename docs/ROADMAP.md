@@ -16,6 +16,8 @@ The 0.2.0 release provides worktree-local Markdown capture, FIFO writing with an
 | Optional external synthesis | #18 defines stdout-only synthesis over explicit entry IDs. #19 and #20 extend model discovery and user-level configuration only as needed for the selected backend. The current external-summary workflow remains available. | Optional. Resolve backend availability, portability and configuration boundaries before adding native inference dependencies. |
 | Measured optimizations | #32 and #33 follow #25 and #29. #31 follows #30 plus measured repeat-query benefit and tested invalidation from #37. #27 requires a quality gain on #8. #34 requires evidence that exact scanning remains a bottleneck after simpler changes. | Skip optimizations without a measurable benefit. |
 
+The [#8 benchmark fixture](../benchmarks/retrieval/README.md) is ready. Both CLIs can use the same 16 document bodies and 17 labeled queries. The experimental runner, latency and resource measurements, ablations, and report remain open.
+
 ## Audit notes and risks
 
 - #25 now supports component-safe folder unions, exact files, and diagnostics for invalid source paths. Future retrieval modes should apply the same candidate filter. #28 already has per-hit scores and model provenance from #3. Pipeline counts and skipped-stage reasons remain.

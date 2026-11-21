@@ -45,3 +45,13 @@ Keyword = SQLite FTS5 BM25. Semantic = query embedding + cosine similarity over 
 ## Implementation guidance
 
 Keep dependency and binary footprint modest; check ONNX Runtime distribution, model licensing and cross-platform build support. Ensure no network/model dependency for fast capture, good error messages, and fully isolated unit/integration tests. Document actual latency and footprint only after measuring, not as promises.
+
+## Superseding architecture decision: Git-repository-first FIFO ingestion
+
+**[REPO_FIFO.md](REPO_FIFO.md) is normative and replaces the daily append-only journal and 'no background process' assumptions above.** The server is an **optional foreground, repository-local process**, not a mandatory global daemon.
+
+- Discover Git root from nested paths; `.nunc/entries/<id>.md` stores one memory per completed FIFO frame, with stable ID, timestamp, metadata and original Markdown body. Persist atomically before indexing.
+- `nunc serve` creates a named pipe and session metadata with a generated or explicit multipart-style boundary. Only complete delimiter lines terminate messages. FIFO is not durable, and concurrent writers need serialization or socket-based coordination; no implicit persistence acknowledgement.
+- `nunc write`/`nunc log` fall back to direct file persistence when the server is absent. Indexing errors never discard saved Markdown; `reindex` recovers.
+- Repeatable `--source` flags index explicitly selected **read-only** source files/directories with deterministic chunks and file/line provenance. Watch changes, reconcile deletions, deduplicate overlaps, respect ignore rules and avoid symlink escapes.
+- SQLite is a disposable **repo-scoped** index outside Git; `fastembed` uses locally cached ONNX models. Runtime FIFO/session files and indexes must never be committed. Memory entries may be Git-tracked intentionally after privacy review.

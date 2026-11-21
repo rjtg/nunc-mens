@@ -101,3 +101,9 @@ Formatting, Clippy, and 30 default tests passed. The opt-in `audit_and_repair_di
 The built binary logged a real implementation decision about reversible archive in an isolated Git worktree. After archiving one of two intentionally matching notes, ordinary `duplicates --exact --json` returned no pairs and `duplicates --exact --raw --json` returned one. Unarchive restored the ordinary pair. The original entry bytes matched throughout.
 
 Formatting, Clippy, and 32 default tests passed. The opt-in `manual_archive_changes_search_visibility_without_reembedding` test passed with real ONNX inference. It confirmed immediate default and raw visibility changes, full rebuild persistence, unarchive, and no raw leakage after explicit forget. Additional tests verified multi-entry changes, dry-run, idempotency, nested consolidation and an interrupted ledger publication. Some LSP calls timed out, so Cargo supplied final verification.
+
+## Standalone multi-process consistency
+
+Formatting, Clippy, and 34 default tests passed. Twelve independent `nunc write` processes received unique durable receipts and saved all original bodies. A linked Git worktree had its own journal and distinct disposable index path.
+
+The opt-in `standalone_read_after_write_and_concurrent_visibility_follow_the_contract` test passed with real ONNX inference in 26.98 s. It observed a stale result immediately after durable capture, then held the actual index lock until a search process was confirmed to hold a shared memory lock. It launched competing reindex, archive and forget processes before releasing the reader. That in-flight search returned the original snapshot. A successful reindex then made the new entry searchable, ordinary search excluded archived content, and raw search retained only the archived content among the two hidden IDs. Persistent-transport and cache coverage remain open in #37. The LSP timed out on the test file, so Cargo verified it.

@@ -1378,3 +1378,159 @@ fn manual_archive_changes_search_visibility_without_reembedding() -> Result<()> 
     );
     Ok(())
 }
+
+#[test]
+fn concurrent_standalone_clients_return_unique_durable_receipts() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let children = (0..12)
+        .map(|ordinal| {
+            let note = format!("independent writer {ordinal}\n\nbody without a final newline");
+            let child = fixture
+                .nunc(&["write", &note])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            Ok((note, child))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut ids = std::collections::BTreeSet::new();
+    for (note, child) in children {
+        let receipt = String::from_utf8(checked(child.wait_with_output()?)?.stdout)?;
+        ensure!(receipt.starts_with("Saved "), "expected durable receipt");
+        let id = receipt
+            .split_whitespace()
+            .nth(1)
+            .context("missing receipt ID")?;
+        assert!(ids.insert(id.to_owned()));
+        let saved = String::from_utf8(fixture.entry_bytes(id)?)?;
+        assert_eq!(body(&saved)?, note);
+    }
+    assert_eq!(ids.len(), 12);
+    assert_eq!(fixture.entries()?.len(), 12);
+    Ok(())
+}
+
+#[test]
+fn linked_worktrees_have_distinct_memory_and_index_paths() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.commit("tracked source", "Create worktree fixture")?;
+    let other = fixture._dir.path().join("linked");
+    fixture.git(&[
+        "worktree",
+        "add",
+        "--detach",
+        other.to_str().context("worktree path")?,
+    ])?;
+    fixture.log_id("Memory private to the original worktree")?;
+    assert!(!other.join(".nunc").exists());
+    let original = String::from_utf8(fixture.run(&["status"])?.stdout)?;
+    let linked = String::from_utf8(
+        checked(fixture.nunc(&["status"]).current_dir(&other).output()?)?.stdout,
+    )?;
+    let index = |text: &str| {
+        text.lines()
+            .find(|line| line.starts_with("Index "))
+            .map(str::to_owned)
+    };
+    assert!(index(&original).is_some());
+    assert!(index(&linked).is_some());
+    assert_ne!(index(&original), index(&linked));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn standalone_read_after_write_and_concurrent_visibility_follow_the_contract() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let archived = fixture.log_id("A timing decision to archive")?;
+    let forgotten = fixture.log_id("A timing decision to forget")?;
+    fixture.run(&["reindex"])?;
+    let new = fixture.log_id("A new acknowledged timing decision")?;
+    let search = |raw: bool| {
+        let mut args = vec!["search", "--json", "--limit", "50"];
+        if raw {
+            args.push("--raw");
+        }
+        args.push("timing decision");
+        fixture.json(&args)
+    };
+    let contains = |result: &Value, id: &str| -> bool {
+        result["results"]
+            .as_array()
+            .is_some_and(|hits| hits.iter().any(|hit| hit["id"] == id))
+    };
+    let stale = search(false)?;
+    assert!(!contains(&stale, &new));
+    assert!(
+        !stale["warnings"]
+            .as_array()
+            .context("missing warnings")?
+            .is_empty()
+    );
+
+    // Block the reader at the index lock, then observe that it holds the
+    // shared memory lock before starting the competing writers.
+    let state = fs::read_dir(&fixture.state)?
+        .next()
+        .context("missing index state")??
+        .path();
+    let index_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.join("index.lock"))?;
+    index_lock.lock()?;
+    let reader = fixture
+        .nunc(&["search", "--json", "--limit", "50", "timing decision"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let memory_probe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.local().join("memory.lock"))?;
+    eventually(|| match memory_probe.try_lock() {
+        Ok(()) => {
+            memory_probe.unlock()?;
+            Ok(false)
+        }
+        Err(fs::TryLockError::WouldBlock) => Ok(true),
+        Err(fs::TryLockError::Error(error)) => Err(error.into()),
+    })?;
+    let requests: &[&[&str]] = &[
+        &["reindex", "--full"],
+        &["archive", &archived],
+        &["forget", &forgotten, "--yes"],
+    ];
+    let children = requests
+        .iter()
+        .map(|args| {
+            fixture
+                .nunc(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert!(fixture.entry_bytes(&forgotten).is_ok());
+    drop(index_lock);
+    let during: Value = serde_json::from_slice(&checked(reader.wait_with_output()?)?.stdout)?;
+    assert!(contains(&during, &archived));
+    assert!(contains(&during, &forgotten));
+    for child in children {
+        checked(child.wait_with_output()?)?;
+    }
+
+    // An explicit successful sync after the durable receipt is the visibility
+    // barrier. Archive and tombstones remain authoritative across all orders.
+    fixture.run(&["reindex"])?;
+    let normal = search(false)?;
+    assert!(contains(&normal, &new));
+    assert!(!contains(&normal, &archived));
+    assert!(!contains(&normal, &forgotten));
+    let raw = search(true)?;
+    assert!(contains(&raw, &archived));
+    assert!(!contains(&raw, &forgotten));
+    assert!(fixture.entry_bytes(&forgotten).is_err());
+    Ok(())
+}

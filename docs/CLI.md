@@ -145,3 +145,11 @@ Deep diagnostics and repair dry runs open the index read-only and do not downloa
 Repair rebuilds the disposable SQLite index atomically when the cached model is available. When inference is unavailable, it can remove demonstrably stale, orphaned, invalid, or forgotten rows from a compatible index. Run `nunc models download` if needed, then retry repair to restore missing vectors. A malformed ledger or a missing consolidation target requires manual restoration or correction. The index uses rollback journaling. Unexpected WAL or shared-memory files require inspection before repair will replace the index. Repair does not edit or delete memory Markdown, including files left by interrupted forget. Retry the explicit forget operation to finish its durable file cleanup.
 
 The audit detects wrong model metadata, mismatches between indexed text and its durable source, and invalid vector sizes or values. A finite vector with the correct size and matching provenance cannot be authenticated by this audit. No keyword index is present in the current schema.
+
+## Read-after-write across processes
+
+Use `nunc log` or a `nunc write` that reports `Saved` when a caller needs a durable Markdown receipt. The receipt includes the new entry UUID. Follow it with a successful `nunc reindex` in the same checkout before starting a semantic search that must consider that entry. Normal ranking, filters, archive state, and the result limit still apply. The running watcher can catch up automatically, and a search may warn about a stale snapshot while it does.
+
+A FIFO receipt reports that the client wrote its frame. Wait until the server publishes the Markdown or confirms the saved entry before reindexing for read-after-write visibility. After a stopped server, direct capture still works via `nunc log` or the direct fallback in `nunc write`.
+
+Independent processes in one worktree share Markdown, the ledger, and the index. Search and rebuild coordinate with local advisory locks. A search already in progress may observe the prior state. A new search after a completed archive or forget observes the ledger update, including when older rows remain in SQLite. Worktrees and separate clones have separate local journals and index paths. Intentional Git distribution can share tracked entries and configuration, and each checkout builds its own index.

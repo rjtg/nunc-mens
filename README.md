@@ -2,7 +2,7 @@
 
 **Instant CLI journal and searchable memory for humans and coding agents.**
 
-`nunc-mens` is a small, local-first Rust command-line tool. Its executable is **`nunc`**. Capture free-text notes immediately in human-readable Markdown, then retrieve relevant entries from the shell using exact keyword search and local semantic embeddings. **No MCP server, cloud account or always-on daemon is required.**
+`nunc-mens` is a small, local-first Rust command-line tool. Its executable is **`nunc`**. Capture free-text notes immediately in human-readable Markdown, then retrieve relevant entries from the shell using exact keyword search and local semantic embeddings. **No MCP server, Ollama, cloud account or always-on daemon is required.**
 
 > Status: specification and agent-ready bootstrap. Application code has not yet been implemented.
 
@@ -28,7 +28,7 @@ The CLI examples describe the **target interface**, not currently working comman
 - **Small and understandable:** one Rust binary, small dependencies, no daemon or MCP requirement.
 - **Search that works for agents:** machine-readable JSON, stable entry identifiers, timestamps, provenance and useful exit codes.
 - **Hybrid retrieval:** SQLite FTS5 keyword search plus cosine similarity of locally generated embeddings; exact identifiers should not disappear in semantic scores.
-- **Opt-in embedding backend:** initial implementation talks to a locally running Ollama embedding API. No automatic remote upload, no downloaded models without explicit user action.
+- **In-process embeddings:** use the Rust `fastembed` crate to run a small Hugging Face-hosted ONNX embedding model locally, without Ollama or any HTTP inference service. Explicit `nunc models download` prepares the local cache; indexing/search never downloads models implicitly.
 - **Safe and private:** don't log secrets; enforce local-only defaults; never commit journals, index files, or credentials.
 - **Dogfood the CLI:** contributors and coding agents must use `nunc` to capture work notes and retrieve prior decisions once commands are implemented, and verify actual output rather than pretending tests succeeded.
 
@@ -39,7 +39,7 @@ nunc log / nunc "..."
     -> $NUNC_JOURNAL_DIR/YYYY-MM-DD.md  (append-only Markdown; source of truth)
 
 nunc reindex
-    -> parse Markdown entries -> stable IDs -> Ollama embeddings -> SQLite index
+    -> parse Markdown entries -> stable IDs -> fastembed embeddings -> SQLite index
 
 nunc search
     -> FTS5 keyword retrieval + cosine vector retrieval -> merged ranked results
@@ -52,7 +52,7 @@ Recommended defaults: journal in `$HOME/.local/share/nunc-mens/journal`, index i
 
 The first deliverable is a working, tested MVP, not an MCP integration or a sophisticated reranker. Follow [AGENTS.md](AGENTS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/ROADMAP.md](docs/ROADMAP.md).
 
-Planned Rust stack: `clap`, `serde`, `serde_json`, `rusqlite` (bundled SQLite with FTS5), `ureq` (HTTP to Ollama), `sha2`, and standard-library file operations. Add dependencies only when justified. Initialize the crate and its `Cargo.lock` during the MVP implementation.
+Planned Rust stack: `clap`, `serde`, `serde_json`, `rusqlite` (bundled SQLite with FTS5), `fastembed` (in-process ONNX embeddings), `sha2`, and standard-library file operations. Add dependencies only when justified. Initialize the crate and its `Cargo.lock` during the MVP implementation.
 
 ```sh
 # Once the CLI has been implemented:

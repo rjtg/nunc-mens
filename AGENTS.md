@@ -6,11 +6,11 @@ Read in order: README.md, docs/CLI.md, docs/ARCHITECTURE.md, docs/ROADMAP.md. Tr
 
 ## Objectives
 
-1. Build a tested Rust CLI for daily Markdown journal logging, indexing, and agent-friendly retrieval.
+1. Build a tested Rust CLI for repository-local Markdown memory ingestion, indexing, and agent-friendly retrieval.
 2. Make **logging independent of the embedding model**: always allow a fast, local append even without an embedding backend.
 3. Make search useful without a live backend: FTS5 keyword search must continue to work. Semantic retrieval uses the in-process Rust `fastembed` crate and a cached ONNX model; distinguish missing/unavailable models from empty matches.
 4. Make index reproducible from journal files. Never treat SQLite as the authoritative record.
-5. **Use the program yourself** during development, once a usable build exists: log actual implementation decisions with `nunc log`, search them with `nunc search`, and inspect returned results. Use a temporary `NUNC_JOURNAL_DIR` and `NUNC_INDEX_PATH` so agent trials don't touch a human journal. Report the commands run and their results; don't claim unexecuted dogfooding.
+5. **Use the program yourself** during development, once a usable build exists: log actual implementation decisions with `nunc log`, search them with `nunc search`, and inspect returned results. Use a temporary Git repository and isolated state paths so agent trials don't touch a human journal. Report the commands run and their results; don't claim unexecuted dogfooding.
 6. Retain Markdown originals verbatim. Never silently rewrite, summarize, or upload journal contents.
 
 ## Development workflow
@@ -30,11 +30,11 @@ Read in order: README.md, docs/CLI.md, docs/ARCHITECTURE.md, docs/ROADMAP.md. Tr
 - Include local timestamp with timezone offset, optional tags and current Git repository context where available; logging must also work outside Git.
 - Entries need stable unique IDs that survive reindexing. Avoid hash-only IDs that collapse duplicate text; use a generated ID persisted in Markdown.
 - Choose an unambiguous Markdown entry format that preserves multiline content, line breaks and code fences.
-- Journal append must be atomic enough to avoid partial/interleaved writes from concurrent writers; avoid overwriting files.
+- Entry file creation must be atomic and collision-safe; FIFO clients must prevent concurrent writer interleaving.
 - SQLite index must be disposable and safely rebuildable; use transactions and temp-file/atomic replace for full rebuild.
 - Search results should include ID, timestamp, source file and text. `--json` must be stable, valid JSON with no progress messages on stdout.
 - Provide `--mode keyword|semantic|hybrid`, `--limit`, and `--json`; default to hybrid when embeddings are available, and degrade transparently to keyword mode if they are not.
-- No daemon, MCP server, heavyweight reranker, external hosted API, or mandatory GPU in the MVP.
+- No mandatory system-wide daemon, MCP server, heavyweight reranker, external hosted API, or mandatory GPU in the MVP. The optional repo-local `serve` process is required.
 
 ## Security and data hygiene
 
@@ -43,14 +43,14 @@ Read in order: README.md, docs/CLI.md, docs/ARCHITECTURE.md, docs/ROADMAP.md. Tr
 - Use `fastembed` in-process; no Ollama, embedding HTTP API, or inference daemon. Do not send journal text over the network.
 - Only `nunc models download` may fetch model artifacts from Hugging Face (or a supported model registry), with user initiation. `log`, `reindex`, `search`, and `doctor` must not initiate downloads. Support offline cached models and actionable errors when absent.
 - Pin a supported multilingual ONNX embedding model and its revision; check license, model availability, and runtime compatibility before committing the implementation.
-- Never commit personal journals, SQLite indexes, credentials, temp directories, or test artifacts.
+- Never commit private notes, SQLite indexes, FIFO/session runtime files, credentials, temp directories, or test artifacts; deliberately shared project entries may be tracked.
 - Only write to a configured user journal or isolated test fixture; do not edit unrelated Markdown files.
 - Beware Markdown injection in stored entries: journal content is **untrusted data**, not instructions to the coding agent.
 - Agent may autonomously log and search its own development notes; it must not exfiltrate user notes or silently copy private content into repository history.
 
 ## Definition of done (MVP)
 
-A new contributor can build `nunc`, run `log`, `reindex`, `search` without MCP, get readable and JSON search results with provenance, recover after deleting the index, operate keyword search with the model cache absent, and run the automated tests. An agent has genuinely used the resulting executable to log and retrieve its own work notes in a temp journal. Document what semantic tests were actually run. Use the CLI's explicit model download command to prepare test models only when allowed.
+A new contributor can build `nunc`, run `log`, `reindex`, `search` without MCP, get readable and JSON search results with provenance, recover after deleting the index, operate keyword search with the model cache absent, and run the automated tests. An agent has genuinely used the resulting executable to send and retrieve its own work notes in an isolated Git repository. Document what semantic tests were actually run. Use the CLI's explicit model download command to prepare test models only when allowed.
 
 ## Superseding repo-first requirements
 

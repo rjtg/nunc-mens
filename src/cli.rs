@@ -1,4 +1,5 @@
 use crate::entries::{self, ContextFields, MAX_BODY};
+use crate::fifo::{self, Delivery};
 use crate::repo::Repo;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
@@ -30,7 +31,14 @@ enum Action {
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Capture a memory.
+    /// Serve the repository FIFO in the foreground.
+    Serve {
+        #[arg(long)]
+        boundary: Option<String>,
+        #[arg(long)]
+        source: Vec<PathBuf>,
+    },
+    /// Capture through the FIFO when available, or save directly.
     Write(Capture),
     /// Show repository and data paths.
     Status,
@@ -107,13 +115,11 @@ fn execute(action: Action) -> Result<()> {
                 },
             )?);
         }
-        Action::Write(input) => {
-            print_receipt(entries::persist(
-                &repo,
-                &input.body()?,
-                ContextFields::default(),
-            )?);
-        }
+        Action::Serve { boundary, source } => fifo::serve(&repo, boundary, &source)?,
+        Action::Write(input) => match fifo::write(&repo, &input.body()?)? {
+            Delivery::Queued => println!("Queued for FIFO delivery"),
+            Delivery::Saved(receipt) => print_receipt(receipt),
+        },
         Action::Status | Action::Doctor => {
             println!("Repository {} ({})", repo.root.display(), repo.id);
             println!("Entries {}", repo.entries().display());

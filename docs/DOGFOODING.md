@@ -113,3 +113,9 @@ The opt-in `standalone_read_after_write_and_concurrent_visibility_follow_the_con
 In an isolated Git worktree, the compiled binary logged a real decision about filtering candidates before scoring and registered two sibling documentation paths. From a nested working directory, `nunc search --json --limit 1 "what should constrain search candidates early" --source-file ./docs/decisions/source.md` returned exactly that file, with matched-chunk line provenance.
 
 Formatting, Clippy, and 35 default tests passed. The opt-in `exact_source_filters_union_and_apply_before_ranking` test used real ONNX inference and covered ADRs, design files, RFCs, plans, incidents, research, recursive paths, multi-chunk documents, empty directories, and both directory and direct-file registration. A deleted file remained selectable until reindex removed its stale rows. Invalid paths were rejected without producing search output. The LSP timed out on the edited files, so Cargo supplied verification.
+
+## Ranked shell output
+
+The compiled CLI recorded and indexed a two-chunk development note about ranking parents for shell selection. `nunc search --type memory --ids --limit 1 "How can I send a unique memory selection into another command?" | xargs -r nunc archive --dry-run --json` passed exactly the UUID from the capture receipt to the archive preview. The first run placed the index inside Git and failed with the expected path error. Moving the index to a sibling directory fixed the fixture.
+
+Formatting, Clippy, and 36 default tests passed. The opt-in `search_ids_orders_unique_parent_ids_and_preserves_visibility` test passed with the cached ONNX model in 34.91 s. It covered ranked IDs, chunk deduplication, Git entries, path filtering, empty output, archive visibility and forgotten entries. The LSP timed out on the edited files, so Cargo supplied verification.

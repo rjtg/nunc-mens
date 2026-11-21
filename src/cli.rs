@@ -85,6 +85,9 @@ enum Action {
         limit: u32,
         #[arg(long)]
         json: bool,
+        /// Print ranked parent IDs, one per line.
+        #[arg(long, conflicts_with_all = ["json", "explain"])]
+        ids: bool,
         #[arg(long = "type")]
         kind: Option<Kind>,
         #[arg(long)]
@@ -354,6 +357,7 @@ fn execute(action: Action) -> Result<()> {
             query,
             limit,
             json,
+            ids,
             kind,
             source,
             source_file,
@@ -371,12 +375,12 @@ fn execute(action: Action) -> Result<()> {
                     kind,
                     sources: &source,
                     source_files: &source_file,
-                    context,
+                    context: if ids { ContextMode::Chunk } else { context },
                     sort,
                     recency_boost,
                     explain,
                     raw,
-                    one_per_parent: false,
+                    one_per_parent: ids,
                 },
             )?;
             let mut out = io::stdout().lock();
@@ -386,6 +390,17 @@ fn execute(action: Action) -> Result<()> {
             } else {
                 for warning in found.warnings {
                     eprintln!("nunc: {warning}");
+                }
+                if ids {
+                    for hit in found.results {
+                        let id = hit
+                            .source
+                            .matched_chunk
+                            .as_ref()
+                            .map_or(hit.source.id.as_str(), |chunk| chunk.parent_id.as_str());
+                        writeln!(out, "{id}")?;
+                    }
+                    return Ok(());
                 }
                 if found.results.is_empty() {
                     writeln!(out, "No results")?;

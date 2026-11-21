@@ -15,7 +15,7 @@
 | `nunc unarchive ID... [--dry-run] [--json]` | Restores manually archived memories. |
 | `nunc forget ID... [--dry-run\|--yes] [--json]` | Deletes only the specified entries after warning about dependencies. |
 | `nunc reindex [--full] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
-| `nunc search QUERY... [--limit N] [--json] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Ranks compatible indexed vectors by cosine similarity. |
+| `nunc search QUERY... [--limit N] [--json\|--ids] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Ranks compatible indexed vectors by cosine similarity. |
 | `nunc models download` | Explicitly downloads and validates the pinned model and tokenizer. |
 | `nunc status` | Shows repository, server, sources, cache, and index paths. |
 | `nunc doctor` | Also compares index freshness against the current repository snapshot. |
@@ -42,6 +42,15 @@ Use absolute overrides outside the worktree. The index is `<state>/<repo-id>/ind
 ## Search output
 
 Default limit is 5, with a range of 1–1000. `--type` selects memories or sources. An empty result set is successful.
+
+### Ranked IDs for shell pipelines
+
+```sh
+nunc search "SQLite locks" --ids --type memory
+nunc search "SQLite locks" --ids --type memory | xargs -r nunc archive --dry-run
+```
+
+`--ids` emits one parent ID per line in rank order, with each parent's best-ranked eligible chunk determining its position. The limit counts unique parents. Captured and Git-derived memories both use UUIDs. Project sources use stable `source:<hash>` parent IDs. Use `--type memory` when passing IDs to a command that accepts only memory UUIDs. Existing source, sort, recency, and visibility rules apply. `--json` and `--explain` conflict with `--ids`. Empty searches succeed with empty stdout. Errors and index-freshness warnings go to stderr.
 
 ### Search selected project documents
 

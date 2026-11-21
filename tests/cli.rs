@@ -1688,3 +1688,110 @@ fn exact_source_filters_union_and_apply_before_ranking() -> Result<()> {
     assert_eq!(direct["results"][0]["path"], "docs/rfcs/sqlite.md");
     Ok(())
 }
+
+#[test]
+fn search_ids_rejects_incompatible_output_and_keeps_errors_off_stdout() -> Result<()> {
+    let fixture = Fixture::new()?;
+    for option in ["--json", "--explain"] {
+        let output = fixture
+            .nunc(&["search", "memory", "--ids", option])
+            .output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+    let output = fixture.nunc(&["search", "memory", "--ids"]).output()?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)?.contains("model unavailable"));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn search_ids_orders_unique_parent_ids_and_preserves_visibility() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let multi = fixture.log_id("# SQLite\n\nSQLite writer locks.\n\n## Locks\n\nSQLite guard ordering.\n\n## Safety\n\nSQLite reindex and lock ordering.")?;
+    let short = fixture.log_id("A brief note about SQLite concurrency.")?;
+    fixture.commit("Git-derived lock information", "SQLite lock history")?;
+    fixture.run(&["git", "ingest", "HEAD"])?;
+    fs::write(
+        fixture.repo.join("spec.md"),
+        "# SQLite\n\nIndexed source.\n\n## Writer\n\nWriter mutex.",
+    )?;
+    fixture.run(&["reindex", "--source", "spec.md"])?;
+
+    let json = fixture.json(&[
+        "search",
+        "SQLite locks",
+        "--type",
+        "memory",
+        "--json",
+        "--limit",
+        "30",
+    ])?;
+    let hits = json["results"].as_array().context("missing hits")?;
+    assert!(hits.iter().filter(|hit| hit["id"] == multi).count() > 1);
+    let mut seen = std::collections::BTreeSet::new();
+    let expected: Vec<_> = hits
+        .iter()
+        .filter_map(|hit| hit["id"].as_str())
+        .filter(|id| seen.insert(*id))
+        .collect();
+    assert_eq!(expected.len(), 3);
+    assert!(hits.iter().any(|hit| hit["entry_kind"] == "git-commit"));
+    let output = fixture.run(&[
+        "search",
+        "SQLite locks",
+        "--type",
+        "memory",
+        "--ids",
+        "--limit",
+        "2",
+    ])?;
+    assert_eq!(
+        output.stdout,
+        format!("{}\n{}\n", expected[0], expected[1]).as_bytes()
+    );
+
+    let sources = fixture.run(&[
+        "search",
+        "SQLite locks",
+        "--source-file",
+        "spec.md",
+        "--ids",
+    ])?;
+    let source = String::from_utf8(sources.stdout)?;
+    assert_eq!(source.lines().count(), 1);
+    assert!(source.starts_with("source:"));
+
+    fixture.run(&["archive", &multi])?;
+    fixture.run(&["forget", &short, "--yes"])?;
+    let normal = String::from_utf8(
+        fixture
+            .run(&["search", "SQLite locks", "--type", "memory", "--ids"])?
+            .stdout,
+    )?;
+    assert!(!normal.contains(&multi));
+    assert!(!normal.contains(&short));
+    let raw = String::from_utf8(
+        fixture
+            .run(&[
+                "search",
+                "SQLite locks",
+                "--type",
+                "memory",
+                "--ids",
+                "--raw",
+            ])?
+            .stdout,
+    )?;
+    assert!(raw.lines().any(|id| id == multi));
+    assert!(!raw.contains(&short));
+    fs::create_dir(fixture.repo.join("empty"))?;
+    fixture.run(&["reindex", "--source", "empty"])?;
+    let empty = fixture.run(&["search", "SQLite locks", "--source", "empty", "--ids"])?;
+    assert!(empty.stdout.is_empty());
+    Ok(())
+}

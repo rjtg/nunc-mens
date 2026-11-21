@@ -17,6 +17,9 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.3"
+rusqlite = { version = "0.37", features = ["bundled"] }
+ignore = "0.4"
+rustix = { version = "1", features = ["fs"] }
 sha2 = "0.10"
 tempfile = "3"
 toml = "0.9"

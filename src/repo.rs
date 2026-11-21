@@ -30,9 +30,7 @@ impl Repo {
             return Self::new(Path::new(&path));
         }
         let git = git_root(&cwd)?;
-        let mut repo = Self::at(git.as_deref().unwrap_or(&cwd), git.is_some())?;
-        repo.git = git.is_some();
-        Ok(repo)
+        Self::at(git.as_deref().unwrap_or(&cwd), git.is_some())
     }
 
     pub fn new(root: &Path) -> Result<Self> {
@@ -161,18 +159,27 @@ impl Repo {
             path.push(part);
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
-                Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => {
+                Err(err)
+                    if allow_missing
+                        && matches!(
+                            err.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                {
                     return Ok(false);
                 }
                 Err(err) => {
                     return Err(err).with_context(|| format!("inspect source {}", path.display()));
                 }
             };
-            ensure!(
-                metadata.is_dir() || metadata.is_file(),
-                "source is a symlink or special file: {}",
-                path.display()
-            );
+            if !metadata.is_dir() && !metadata.is_file() {
+                ensure!(
+                    allow_missing,
+                    "source is a symlink or special file: {}",
+                    path.display()
+                );
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -206,7 +213,11 @@ pub(crate) fn excluded(path: &Path) -> bool {
     path.components().any(|part| {
         [".git", ".nunc", "target", "node_modules", ".venv"]
             .iter()
-            .any(|name| part.as_os_str() == OsStr::new(name))
+            .any(|name| {
+                part.as_os_str()
+                    .as_encoded_bytes()
+                    .eq_ignore_ascii_case(name.as_bytes())
+            })
     })
 }
 

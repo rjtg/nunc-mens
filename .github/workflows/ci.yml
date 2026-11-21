@@ -1,0 +1,31 @@
+name: Rust checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check whether Rust crate has been initialized
+        id: crate
+        shell: bash
+        run: |
+          if test -f Cargo.toml; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Format
+        if: steps.crate.outputs.present == 'true'
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        if: steps.crate.outputs.present == 'true'
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        if: steps.crate.outputs.present == 'true'
+        run: cargo test --locked
+      - name: Bootstrap specification only
+        if: steps.crate.outputs.present != 'true'
+        run: echo "Spec-only bootstrap; next milestone initializes Cargo.toml."

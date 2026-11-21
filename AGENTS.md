@@ -1,6 +1,6 @@
 # Instructions for coding agents
 
-You are implementing **nunc-mens**, a local-first Rust journal CLI whose binary is **nunc**. The repository currently contains a specification; shipping working software is your assignment.
+You are implementing **nunc-mens**, a local-first Rust journal CLI whose binary is **nunc**. The repository includes the MVP and its product contract.
 
 Read in order: README.md, docs/CLI.md, docs/ARCHITECTURE.md, docs/ROADMAP.md. Treat these files as the current product contract. Prefer a simple working end-to-end slice to framework scaffolding.
 
@@ -50,7 +50,7 @@ Read in order: README.md, docs/CLI.md, docs/ARCHITECTURE.md, docs/ROADMAP.md. Tr
 
 ## Definition of done (MVP)
 
-A new contributor can build `nunc`, run `log`, `reindex`, `search` without MCP, get readable and JSON search results with provenance, recover after deleting the index, operate semantic search with the model cache absent, and run the automated tests. An agent has genuinely used the resulting executable to send and retrieve its own work notes in an isolated Git repository. Document what semantic tests were actually run. Use the CLI's explicit model download command to prepare test models only when allowed.
+A new contributor can build `nunc`, run `log`, `reindex`, `search` without MCP, get readable and JSON search results with provenance, recover after deleting the index, capture with the model cache absent and receive an actionable search error, and run the automated tests. An agent has genuinely used the resulting executable to send and retrieve its own work notes in an isolated Git repository. Document what semantic tests were actually run. Use the CLI's explicit model download command to prepare test models only when allowed.
 
 ## Superseding repo-first requirements
 

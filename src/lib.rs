@@ -12,3 +12,4 @@ mod protocol;
 pub mod repo;
 mod search;
 mod vectors;
+mod watch;

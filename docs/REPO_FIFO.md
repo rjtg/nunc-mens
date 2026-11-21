@@ -1,77 +1,46 @@
-# Repository-local runtime, FIFO protocol, and source indexing
+# Repository-local FIFO and sources
 
-**Status:** target design; not implemented. This document supersedes the earlier global daily-journal-first layout. The implementation issue and roadmap refer here.
-
-## Repo-first lifecycle
-
-Run `nunc serve` from any directory inside a Git repository. Discover the root with `git rev-parse --show-toplevel`; keep runtime and generated entries under that root, not under the current subdirectory. `nunc init` can create the optional checked-in `.nunc/config.toml` and storage directories. For non-Git directories, use the working directory as an explicit standalone root (documented, without walking into unrelated parents). Do not index arbitrary paths by default.
+## Lifecycle
 
 ```text
-my-repo/
-  .git/
-  AGENTS.md
-  src/
-  docs/
-  .nunc/
-    config.toml           # optional, shareable
-    entries/
-      <unique-id>.md      # one immutable-ish entry per message
-    input.fifo            # runtime only; never tracked
-    session.json          # runtime only; never tracked
+.nunc/
+  .gitignore    # local collection and runtime ignore rules
+  config.toml   # optional repository-relative source registrations
+  entries/      # authoritative Markdown, one file per complete note
+  input.fifo    # owner-only live endpoint
+  session.json  # version, ID, boundary, PID, FIFO device and inode
+  *.lock        # advisory lock files
 ```
 
-Index DB: XDG state directory keyed by canonical repository identity (avoid collisions for repositories with identical basenames). Embedding model cache: XDG cache directory. Neither belongs in Git. `.nunc/entries/` is **eligible** for version control but not automatically committed; document secret/privacy implications and offer an explicit ignore/private option. `.nunc/input.fifo` and `.nunc/session.json` must be gitignored; never commit runtime artifacts. The runtime should remove stale session artifacts safely, verify ownership and reject symlink/path traversal attacks.
+A single server holds a worktree ownership lock for its whole run. It verifies the type and ownership of stale runtime artifacts before removing them. Runtime objects use owner-only permissions and the runtime directories reject symbolic links and directories writable by other users. The foreground server prints the FIFO path and boundary on startup. SIGINT or SIGTERM unpublishes the endpoint, drains the already open pipe for up to one second, and lets an active index transaction finish. A forced exit can leave endpoints and locks on disk, which the next server handles. Existing session data has no effect when its server lock is free.
 
-## Start server and sources
+## Framing
 
-```sh
-nunc serve --source ./src --source ./docs --source ./AGENTS.md
-nunc serve --boundary 'my-session-token' --source ./docs
-nunc status
+The default boundary is a random UUID v4 rendered as ASCII without hyphens. `--boundary` accepts 1–70 ASCII letters, digits, hyphens or underscores. The token is a delimiter. Filesystem permissions control access.
+
+A complete line `--<boundary>` with LF or CRLF ends a frame. Neither the delimiter nor its line ending enters the saved body. Every other byte in a raw input frame is preserved, including the LF or CRLF preceding the delimiter. Multiple records and arbitrary read splits are accepted. Start `nunc serve --boundary demo` from the repository before sending this example.
+
+````sh
+cat > .nunc/input.fifo <<'NOTE'
+Versioned cache keys let old deployments finish.
+
+```text
+A fenced block is still part of the note.
 ```
+--demo
+NOTE
+````
 
-`--source` is repeatable and accepts repo-relative files or directories; canonicalize, validate scope, avoid symlink escapes and deduplicate overlapping roots. Sources are **read-only**; only `.nunc/entries/` receives newly ingested memory. For directories, recursively enumerate supported text/Markdown files with documented limits and Git-ignore-aware filtering; do not index binaries, `.git`, build directories, the index or runtime artifacts. Use a file watcher with initial scan, debounced incremental updates and deletion reconciliation; offer a periodic/manual `reindex` fallback. Chunk source documents deterministically with source path and line ranges; memory entries remain individual documents. Search must expose `source` and `kind=memory|source` and support `--type` filters. Unconfigured sources must not be crawled.
+Empty, invalid UTF-8, NUL-containing or oversized frames are rejected. An oversized frame is discarded up to the next delimiter. Writer EOF discards an unfinished frame when the reader observes the end of the stream. A line exactly equal to the delimiter always ends a raw frame, even inside a code fence. A CLI frame starts with `!` plus LF and a reserved line `nunc-client-frame:<boundary>`. The first byte breaks a possible partial delimiter and the control line discards any abandoned record even if the FIFO reader has yet to observe EOF. The CLI refuses note text that collides with a reserved control line. The first body line `nunc-no-final-lf:<boundary>` is also reserved for the CLI. It indicates that the added LF just before the delimiter should be removed to preserve the note's original final byte.
 
-## Session-specific boundary protocol
+## Delivery
 
-At startup generate a cryptographically random, sufficiently long boundary (e.g. 128+ random bits encoded as ASCII), or accept `--boundary VALUE` after validation (nonempty, bounded, safe ASCII without CR/LF). Print the exact FIFO path and boundary to stdout and atomically publish a permission-restricted `.nunc/session.json` for clients. The boundary is a **delimiter, not authentication**.
+`nunc write` validates framing, acquires the cooperative cross-process writer lock and opens the FIFO nonblocking. It checks the current session and the opened FIFO identity before sending. If a reader is unavailable and no bytes were sent, it falls back to direct capture. It reports a bounded delivery failure if a partial transfer cannot complete. A current client falls back to direct capture while a version 1 server still owns the endpoint. `nunc log` always saves directly.
 
-A record ends when a **complete line** exactly equals `--<boundary>` followed by LF (accept CRLF consistently if documented). The delimiter line is excluded from the entry body; blank lines and Markdown code fences are otherwise preserved byte-for-byte. A partial delimiter is not a delimiter. Buffer until a complete delimiter arrives; allow multiple records in a stream and delimiters split across reads. Reject empty records or oversized messages with bounded memory and actionable errors. A line equal to the delimiter inside the body collides; document this and test it. Random boundaries make accidental collisions very unlikely, not impossible. EOF without delimiter is an incomplete record, **not** an implicit commit; define discard/recovery behavior. This is a simple line-delimited multipart-inspired framing protocol, not full HTTP multipart MIME.
+A FIFO is a byte stream. Raw concurrent writers must coordinate externally unless each entire frame is sent with one write within the platform's `PIPE_BUF`. Raw writers share the parser and must finish a record before releasing their writer slot. Client delivery confirms a pipe write. A durable receipt comes from direct capture or a separately observed saved file. An indexing failure leaves saved Markdown in place.
 
-```sh
-# Example only: actual boundary is printed at runtime.
-nunc serve --boundary 'demo-123' --source ./docs
-cat > .nunc/input.fifo <<'EOF'
-Cache invalidation uses versioned keys.
+## Source selection
 
-This is a second paragraph.
+Register files and directories with `nunc init --source`, `nunc serve --source`, `nunc reindex --source`, or the config file. The settings affect the repository regardless of the directory from which `nunc` is invoked. Git worktrees use tracked and nonignored untracked paths according to Git's exclusion rules. Standalone roots apply repo-local ignore rules. Overlapping sources are deduplicated. Symlinks, special files, internal paths (`.git`, `.nunc`, `target`, `node_modules`, `.venv`), binary/NUL-containing content, non-UTF-8 text or paths, and files larger than 2 MiB are skipped. Explicit source paths must stay inside the worktree and must exist when registered. A tracked file remains eligible when matched by a later Git ignore rule.
 
---demo-123
-EOF
-```
-
-On completion, allocate a collision-resistant stable ID, timestamp with offset and repository/source metadata, write a **separate Markdown file** (e.g. YAML front matter + original body) via temporary file + atomic rename, then enqueue or perform immediate cached-fastembed vector indexing in SQLite. The original body must not be rewritten or summarized. Indexing failure must not lose the committed Markdown entry; report pending/error state and permit `reindex`.
-
-## FIFO concurrency, delivery and fallback
-
-A FIFO is a byte stream, **not** a durable queue or transactional IPC. A writer opening it without a reader can block; successful write does not prove persistence or indexing. Large concurrent writes can interleave (atomicity only up to OS `PIPE_BUF` per write). Do not promise multiwriter safety from boundaries alone. Provide `nunc write TEXT...` / `nunc write --stdin` as a client that reads the current session metadata, frames input correctly and serializes writers using a robust cross-process lock or a Unix-domain socket where supported. Document what guarantees can be made for raw FIFO writers. Use restrictive directory/FIFO permissions and avoid exposing private entries to other local users.
-
-When `serve` is absent, `nunc write` and `nunc log` must **not block indefinitely**: atomically write the entry file directly and leave indexing for `reindex` or the next server startup. Prefer an explicit acknowledgement protocol for clients that need durable/indexed confirmation; FIFO writes alone cannot supply it. On restart generate a new default boundary and replace session metadata safely. Only one server may own a repo runtime at a time.
-
-## Search, model and Git behavior
-
-`nunc search QUERY` searches the current repository's SQLite-stored vectors generated by cached `fastembed`. `--source` filters registered source paths/names, `--type memory|source` filters document kind; `--json` remains supported; semantic-only search is the MVP. Include repo identity, source path, kind, entry ID or chunk ID, and line range for source chunks in results. `nunc reindex` reconciles entries and registered source files, including deletions. The watcher may keep search fresh during `serve`; without server, `reindex` remains usable. No Ollama, mandatory daemon, external inference API or surprise model download. `nunc models download` explicitly prepares a compatible multilingual ONNX model for in-process Rust `fastembed`.
-
-## Required tests
-
-- Git root discovery from nested working directories; standalone mode and multiple independent repositories.
-- Random and user-specified boundary, split reads, multiple records, CRLF behavior, Markdown blank lines/code fences, collisions, oversized/empty/incomplete messages.
-- FIFO absence, no reader, server restart/stale metadata, simultaneous writers and cross-process locking, shutdown and recovery.
-- One entry per file, atomic write, metadata/body roundtrip, crash between write and index, reindex recovery.
-- Multiple `--source` flags, overlapping roots, ignored/binary files, source changes/deletions, path escapes, chunk provenance.
-- Capture without model cache; clear search/indexing errors when absent; fastembed semantic ranking when cached; JSON provenance.
-- Agent dogfooding: run `nunc serve` in an isolated fixture Git repo, send a real note through FIFO or `nunc write`, verify saved file and search result. Record actual commands and results.
-
-## Binding MVP semantic-only search and index
-
-The **search index is a repository-scoped SQLite file outside Git**: `$XDG_STATE_HOME/nunc-mens/<repo-id>/index.sqlite3` (default `~/.local/state/nunc-mens/<repo-id>/index.sqlite3`). `fastembed` only generates vectors; SQLite persists them as `f32` BLOBs with content, IDs, hashes, paths, kind, source line ranges and model metadata. Search embeds the query with the cached model and computes cosine similarity over the stored vectors in Rust (linear scan), returning top-k with provenance. **No FTS5, BM25, keyword fallback, hybrid mode, ANN index or external vector DB in MVP.** If no model is cached, FIFO/CLI capture still persists Markdown, indexing is pending, and search reports a clear error. `nunc reindex` catches up after explicit `nunc models download`; never download implicitly.
+The server performs an initial refresh and polls for modifications and deletions every two seconds after the preceding pass. It rereads the config, source files and entries. Inference runs separately from FIFO capture. With the model absent, indexing is pending and capture continues. `nunc reindex` is available when the server is stopped.

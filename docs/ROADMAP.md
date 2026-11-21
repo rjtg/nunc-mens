@@ -1,60 +1,14 @@
 # Implementation roadmap
 
-The bootstrap contains the **specification only**. Start implementing without waiting for further product decisions; record sensible deviations in docs.
+The MVP implementation follows [the implementation plan](IMPLEMENTATION_PLAN.md). The verified command outputs and progressive development use are in [the dogfooding report](DOGFOODING.md).
 
-## M0 — Runnable Rust project
+| Milestone | Deliverable |
+| --- | --- |
+| C–D | Git/standalone scope, configuration and durable one-file Markdown capture |
+| E | Foreground FIFO, byte-preserving framing, cooperative clients and restart recovery |
+| F | Read-only source snapshots, incremental SQLite vectors and staged full rebuild |
+| G | Explicit pinned ONNX download, local FastEmbed inference and cosine-ranked search |
+| H | Automatic polling refresh, index diagnostics, CLI documentation and CI |
+| I | Real executable verification with a development conversation journal and source changes |
 
-- [ ] Initialize `Cargo.toml`, `src/main.rs`, `Cargo.lock` and minimal modules.
-- [ ] Add clap CLI, `--help`, `--version`, meaningful errors; set binary name to `nunc`.
-- [ ] Add `.gitignore` and CI workflow for format, clippy, tests.
-- [ ] Provide test fixture setup with isolated temporary data directories.
-
-Acceptance: `cargo run -- --help` and `cargo test` work from a clean checkout.
-
-## M1 — Reliable journal
-
-- [ ] `nunc log TEXT...`, `nunc "TEXT..."`, and `nunc log --stdin`.
-- [ ] One `.nunc/entries/<id>.md` file per memory with timezone-aware timestamp and persistent unique ID.
-- [ ] Optional tags, best-effort Git context, configuration and collision-safe append.
-- [ ] Roundtrip tests for Unicode, newlines, fenced code, duplicate text and concurrent writes.
-- [ ] **Dogfood:** create a temporary Git repository, start `nunc serve`, and ingest at least one actual implementation decision with the compiled CLI.
-
-Acceptance: writes are durable, human-readable, lossless and independent of model inference.
-
-## M2 — Searchable local index
-
-- [ ] SQLite entry/chunk storage with `f32` vector BLOBs and schema migration/version marker.
-- [ ] Parser of per-entry Markdown files and configured read-only sources; incremental `reindex` and `reindex --full`.
-- [ ] Handle file edits/deletions, stable IDs, stale-index diagnostics, safe full rebuild.
-- [ ] Semantic `search`, `--limit`, and machine-readable `--json` (requires cached model).
-- [ ] **Dogfood:** search the M1 decision and verify stable ID and source path.
-
-Acceptance: empty/new journals work; deleted index can be rebuilt; capture remains available without cached model files; search errors clearly until model is downloaded and records indexed.
-
-## M3 — Local fastembed semantic search
-
-- [ ] Integrate Rust `fastembed` with a pinned, verified multilingual ONNX model and deterministic test doubles; document ONNX Runtime platform constraints.
-- [ ] Implement explicit `nunc models download` with a configurable local cache. Other commands must never trigger model downloads.
-- [ ] Generate/store vectors, record model and dimension, reject mismatches.
-- [ ] Cosine-ranked semantic search with linear scan over SQLite-stored vectors.
-- [ ] Actionable errors when the model is absent or fails to load; writes persist and pending records can be indexed later.
-- [ ] **Dogfood:** search a real development note with paraphrased wording; report whether actual in-process fastembed inference was executed.
-
-Acceptance: semantic search works with a cached model; writes remain available without model files; JSON identifies semantic mode.
-
-## M4 — Agent-ready release
-
-- [ ] `doctor`, usage documentation and configuration examples.
-- [ ] Integration tests for errors, corrupt entries, missing model and JSON stability.
-- [ ] CI, lint, release/build instructions, benchmark notes if measured.
-- [ ] Test that an agent can log a decision, reindex, find it later, and cite the file and entry ID.
-
-Acceptance: README commands are genuine runnable commands; publish a concise verified test report and remaining limitations.
-
-## Future ideas (not required for MVP)
-
-Optional MCP adapter, fast ANN index if measured scale demands it, configurable alternative embedding providers, contextual chunking for longer notes, and a `nunc sync` alias if it becomes valuable. Do not implement speculatively.
-
-## MVP index location and search decision
-
-The index is **not inside Git**: `$XDG_STATE_HOME/nunc-mens/<repo-id>/index.sqlite3` (default `~/.local/state/nunc-mens/<repo-id>/index.sqlite3`), with model cache under XDG cache. `fastembed` generates embeddings but does not provide a search index. SQLite stores vector BLOBs, text and provenance; Rust scans vectors and ranks by cosine similarity. **Remove FTS5/BM25, keyword/hybrid modes and keyword fallback from MVP.** Add tests for top-k cosine ranking, model mismatch/dimensions, missing model, pending indexing, rebuild from files and repo separation. `nunc models download` is the only network-enabled model command.
+Possible later work includes an event-driven watcher for larger repositories, context-aware splitting for long memories, packaged binaries and measured search/indexing scale limits. Alternative retrieval modes and additional adapters are outside this MVP.

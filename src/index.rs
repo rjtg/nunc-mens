@@ -9,6 +9,7 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+const INDEX_NAME: &str = "index.sqlite3";
 const VERSION: u32 = 1;
 const BATCH: usize = 16;
 const SCHEMA: &str = "
@@ -64,7 +65,7 @@ impl<'a> Index<'a> {
     }
 
     pub(crate) fn path(&self) -> PathBuf {
-        self.dir.join("index.sqlite3")
+        self.dir.join(INDEX_NAME)
     }
 
     fn prepare(&self) -> Result<()> {
@@ -123,11 +124,17 @@ impl<'a> Index<'a> {
         temporary.as_file().sync_all()?;
         // A crashed rollback journal belongs to the old inode and must be recovered
         // before publishing a new inode at that name.
-        if existing && existing_private_file(&self.dir.join("index.sqlite3-journal"))? {
-            let connection = open(path, false)?;
-            connection
-                .pragma_query_value(None, "schema_version", |_| Ok(()))
-                .context("recover the old SQLite rollback journal before replacing the index")?;
+        let journal = self.dir.join(format!("{INDEX_NAME}-journal"));
+        if existing_private_file(&journal)? {
+            if existing {
+                let connection = open(path, false)?;
+                connection
+                    .pragma_query_value(None, "schema_version", |_| Ok(()))
+                    .context("recover the old rollback journal; move the old index and journal aside if they are damaged")?;
+            }
+            if existing_private_file(&journal)? {
+                fs::remove_file(&journal).context("remove the inactive SQLite rollback journal")?;
+            }
         }
         temporary.persist(path)?;
         sync_dir(&self.dir)?;

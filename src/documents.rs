@@ -144,7 +144,7 @@ fn source_files(repo: &Repo, roots: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
     let mut present = Vec::new();
     for path in roots {
         if repo.validate_source(path, true)? {
-            present.push(path);
+            present.push(path.clone());
         }
     }
     if present.is_empty() {
@@ -177,11 +177,22 @@ fn source_files(repo: &Repo, roots: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
             (!path.is_empty()).then(|| PathBuf::from(path))
         }));
     } else {
-        let mut walk = ignore::WalkBuilder::new(repo.root.join(present[0]));
-        for root in present.iter().skip(1) {
-            walk.add(repo.root.join(root));
-        }
-        for entry in walk.hidden(false).require_git(false).build() {
+        let anchor = repo.root.clone();
+        let walk = ignore::WalkBuilder::new(&repo.root)
+            .hidden(false)
+            .parents(false)
+            .require_git(false)
+            .filter_entry(move |entry| {
+                let Ok(path) = entry.path().strip_prefix(&anchor) else {
+                    return false;
+                };
+                !excluded(path)
+                    && present
+                        .iter()
+                        .any(|root| path.starts_with(root) || root.starts_with(path))
+            })
+            .build();
+        for entry in walk {
             let entry = entry.context("enumerate configured standalone sources")?;
             if let Some(error) = entry.error() {
                 return Err(anyhow::anyhow!("{error}")).context("read standalone ignore rules");

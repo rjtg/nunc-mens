@@ -1,6 +1,9 @@
 use crate::entries::{MAX_BODY, validate_body};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use uuid::Uuid;
+
+// Appending this byte cannot turn a truncated delimiter into a complete one.
+const RESYNC: &[u8] = b"!\n";
 
 #[derive(Clone, Debug)]
 pub(crate) struct Boundary(String);
@@ -26,6 +29,10 @@ impl Boundary {
         format!("--{}", self.0)
     }
 
+    fn client_start(&self) -> String {
+        format!("nunc-client-frame:{}", self.0)
+    }
+
     fn no_final_lf(&self) -> String {
         format!("nunc-no-final-lf:{}\n", self.0)
     }
@@ -33,18 +40,24 @@ impl Boundary {
     pub(crate) fn frame(&self, body: &str) -> Result<Vec<u8>> {
         validate_body(body)?;
         let delimiter = self.delimiter();
+        let start = self.client_start();
         let marker = self.no_final_lf();
         ensure!(
             !body.starts_with(&marker),
             "entry starts with the reserved FIFO marker; use nunc log"
         );
         ensure!(
-            !body
-                .split('\n')
-                .any(|line| line.strip_suffix('\r').unwrap_or(line) == delimiter),
-            "entry contains the session delimiter; use nunc log"
+            !body.split('\n').any(|line| {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                line == delimiter || line == start
+            }),
+            "entry contains a reserved FIFO control line; use nunc log"
         );
-        let mut frame = Vec::with_capacity(body.len() + marker.len() + delimiter.len() + 2);
+        let mut frame =
+            Vec::with_capacity(body.len() + marker.len() + start.len() + delimiter.len() + 5);
+        frame.extend_from_slice(RESYNC);
+        frame.extend_from_slice(start.as_bytes());
+        frame.push(b'\n');
         if !body.ends_with('\n') {
             frame.extend_from_slice(marker.as_bytes());
         }
@@ -60,6 +73,7 @@ impl Boundary {
 
 pub(crate) struct Parser {
     delimiter: String,
+    start: String,
     marker: String,
     line: Vec<u8>,
     body: Vec<u8>,
@@ -71,6 +85,7 @@ impl Parser {
     pub(crate) fn new(boundary: &Boundary) -> Self {
         Self {
             delimiter: boundary.delimiter(),
+            start: boundary.client_start(),
             marker: boundary.no_final_lf(),
             line: Vec::new(),
             body: Vec::new(),
@@ -86,7 +101,7 @@ impl Parser {
     pub(crate) fn push(&mut self, bytes: &[u8], mut record: impl FnMut(Result<String>)) {
         for part in bytes.split_inclusive(|byte| *byte == b'\n') {
             let ceiling = if self.oversized {
-                self.delimiter.len() + 2
+                self.start.len() + 2
             } else {
                 self.limit()
             };
@@ -103,12 +118,23 @@ impl Parser {
                 continue;
             }
 
-            let delimiter = !self.long_line
-                && self.line.strip_suffix(b"\n").is_some_and(|line| {
-                    line.strip_suffix(b"\r").unwrap_or(line) == self.delimiter.as_bytes()
-                });
-            if delimiter {
+            let control = if self.long_line {
+                &[][..]
+            } else {
+                self.line
+                    .strip_suffix(b"\n")
+                    .map_or(&[][..], |line| line.strip_suffix(b"\r").unwrap_or(line))
+            };
+            if control == self.delimiter.as_bytes() {
                 record(self.finish());
+            } else if control == self.start.as_bytes() {
+                if self.oversized || self.body != RESYNC {
+                    record(Err(anyhow!(
+                        "discarded an incomplete FIFO entry before the next client frame"
+                    )));
+                }
+                self.body.clear();
+                self.oversized = false;
             } else if !self.oversized {
                 if self.body.len() + self.line.len() <= self.limit() {
                     self.body.extend_from_slice(&self.line);
@@ -169,6 +195,25 @@ mod tests {
             [contents[0], contents[1], contents[2], "raw\r\n\n", "next\n"]
         );
         assert!(!parser.end_stream());
+        Ok(())
+    }
+
+    #[test]
+    fn client_start_cannot_commit_an_abandoned_partial_delimiter() -> Result<()> {
+        let boundary = Boundary::new(Some("demo".into()))?;
+        let mut parser = Parser::new(&boundary);
+        let mut frames = Vec::new();
+        parser.push(b"previous incomplete\n--demo", |frame| frames.push(frame));
+        parser.push(&boundary.frame("the next complete note")?, |frame| {
+            frames.push(frame)
+        });
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].is_err());
+        assert_eq!(
+            frames.pop().transpose()?.as_deref(),
+            Some("the next complete note")
+        );
+        assert!(boundary.frame("x\nnunc-client-frame:demo").is_err());
         Ok(())
     }
 

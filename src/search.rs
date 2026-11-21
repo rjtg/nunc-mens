@@ -69,12 +69,12 @@ pub(crate) fn search(
     ensure!(!query.trim().is_empty(), "search query must be nonblank");
     let filter = Filter::new(kind, sources)?;
     let mut model = LocalModel::load(repo)?;
-    let reader = Index::for_repo(repo)?
-        .read(MODEL)?
-        .context("index is absent; run nunc reindex")?;
     let query = model.query(query)?;
     let query_norm = vectors::norm(&query, MODEL.dimensions)?;
     drop(model);
+    let reader = Index::for_repo(repo)?
+        .read(MODEL)?
+        .context("index is absent; run nunc reindex")?;
 
     let mut best: Vec<Match> = Vec::with_capacity(limit);
     reader.scan(

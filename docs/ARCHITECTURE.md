@@ -1,61 +1,30 @@
-# Architecture and decision log
+# Architecture
 
-## Scope
+```text
+CLI → Repo + Config
+    ├→ log or offline write → Markdown entry
+    ├→ serve → boundary parser → Markdown entry
+    ├→ reindex or watcher → snapshot of Markdown and sources → FastEmbed → SQLite
+    └→ search → FastEmbed query → SQLite scan → cosine-ranked results
+```
 
-A minimal shell-accessible memory tool, built in Rust, for a human and coding agents. Authoritative data is human-readable Markdown; an optional cached ONNX embedding model, executed in-process via Rust `fastembed`, improves search relevance. **MCP support is deliberately out of scope for MVP.**
+## Ownership and reuse
 
-## Data flow
+- `repo` owns discovery, scope, validated source paths and configuration. `fs` handles bounded reads, private directories, locks and atomic writes.
+- `entries` is the shared authoritative capture service. Its fixed, versioned front matter starts with `---`, contains one JSON object (valid YAML) and closes with `---`. The remainder is original UTF-8 input. Metadata holds a UUID v4, an offset-aware RFC3339 timestamp, optional repository label and tags. Filename and UUID must agree. Same-directory temporary files are synced and published without clobbering another note, followed by a directory sync.
+- `protocol` parses a bounded stream independently of Linux or macOS I/O. `fifo` owns session metadata, reader, cooperative writer locks and lifecycle. `watch` refreshes on a separate thread and keeps the ONNX session warm. Every committed Markdown entry is available for retry after an indexing failure or restart.
+- `documents` builds deterministic snapshots of authoritative memories and configured source files. Source opens are anchored at the worktree via component-wise `openat` with symlink following disabled. Source chunks fit a 1,200-byte budget, preserve UTF-8 and carry inclusive line ranges. An exceptionally long line may span chunks sharing its line number. Source IDs hash the chunker version, relative path, and chunk ordinal. Stable paths and ordinals preserve IDs across rebuilds. Editing earlier lines can change chunk boundaries and IDs' associated text. SHA-256 of each chunk's content identifies reusable embeddings, and the snapshot digest covers source scope, provenance and content.
+- `model` is the only production embedder and the only downloader. `vectors` describes embedding compatibility and the binary representation. The index accepts an embedder interface so SQLite and failure tests can use fixed vectors.
+- `index` serializes writers and protects database readers against same-directory replacement with a shared lock. `search` filters candidates by provenance, computes cosine in Rust with f64 accumulation, and retains the best K. Storage, capture, and indexing failures retain their own error context.
 
-1. Discover Git root; capture with `nunc serve` FIFO or `nunc log`/`nunc write` -> atomically create one `.nunc/entries/<id>.md` file.
-2. Parse entry files and explicitly registered read-only `--source` paths -> update repo-scoped SQLite.
-3. Query vector storage and optional cosine similarity -> fuse rankings -> print plaintext or JSON.
+## SQLite and recovery
 
-## Format
+Schema version 1 is stored in SQLite `user_version`. A single metadata row records the repository ID, model ID and revision, dimensions and snapshot digest. Document rows contain ID, kind, path, optional timestamp or line range, original text, content hash and vector. The vector is exactly 384 little-endian IEEE-754 f32 values for the pinned model. Ingestion and ranking reject invalid dimensions and non-finite or zero-norm embeddings.
 
-Proposed entry boundary: a dedicated heading or marker with stable generated ID and metadata, followed by verbatim Markdown body until the next recognized entry marker. The implementer must choose a format where arbitrary user text (including headings, code fences and marker-like strings) cannot accidentally split entries. Prefer explicit length-delimited or escaped boundaries and add roundtrip tests. Journal is readable without the app. Do not use the entry text itself as identity, since identical thoughts may be logged twice.
+An incremental refresh reuses unchanged embeddings, updates metadata, and deletes absent documents in one rollback-journal transaction. A full rebuild stages a separate file and publishes it after successful indexing and sync. Index schema or model changes require a full rebuild. Corrupt source Markdown stops a refresh and preserves the previous index. Correct or move the indicated entry, then retry. If a corrupt index also has an unrecoverable rollback journal, move both files aside before rebuilding.
 
-Individual files: `.nunc/entries/<id>.md`, with stable IDs and timestamps; no automatic editing of old entries. Preserve the original body. Provenance uses relative path + stable entry ID.
+## Embeddings
 
-## Persistence
+FastEmbed 5.15.0 runs `intfloat/multilingual-e5-small` at revision `614241f622f53c4eeff9890bdc4f31cfecc418b3` with CPU ONNX Runtime 1.24, mean pooling, and the model's `query: ` and `passage: ` prefixes. The explicit HTTPS downloader verifies artifact sizes and the weights/tokenizer checksums, probes inference, and atomically publishes the revision directory. Inference initializes from local files and sends no project text over the network.
 
-- `rusqlite` with bundled SQLite (vector storage) for entry text and metadata.
-
-- Index schema version, model identifier and vector dimensions; reject mismatches.
-- Index is cache, not user data: support rebuild from Markdown and removal/reconciliation of deleted entries.
-- Use transactions for incremental writes. Full rebuild to a temporary DB and atomic rename on the same filesystem where feasible; preserve the previous valid index on failure.
-- Ensure journal append concurrency safety and crash behavior. Avoid shelling out to append arbitrary text.
-
-## Embedding interface
-
-Use the **Rust `fastembed` crate** to load a small multilingual Hugging Face ONNX embedding model directly in the CLI process (ONNX Runtime is a native dependency). No Ollama, embedding server, HTTP inference or daemon. Pin the model ID and revision after verifying support in the chosen crate version. Cache models locally; only the explicit `nunc models download` command may access the network to fetch model artifacts. `log`, `reindex`, `search`, and `doctor` never download. Keep the embedding interface isolated for deterministic tests. Logging and keyword search never need model files. Model loading may incur startup latency; lazy-load only for indexing and semantic/hybrid queries.
-
-## Ranking
-
-Semantic retrieval only: cached fastembed query vector + cosine similarity against compatible vectors loaded from SQLite, linear scan in Rust.
-
-## Explicit non-goals for MVP
-
-- MCP server or mandatory global background daemon (optional repo-local foreground `serve` is supported)
-- Hosted/vector SaaS, remote telemetry, Ollama and auto-sync
-- QMD dependency or heavy local reranking LLM
-- Distributed multiuser journal, cloud backup, automatic AI summarization
-- Automatic indexing of arbitrary directories
-- Rewriting the user's original notes
-
-## Implementation guidance
-
-Keep dependency and binary footprint modest; check ONNX Runtime distribution, model licensing and cross-platform build support. Ensure no network/model dependency for fast capture, good error messages, and fully isolated unit/integration tests. Document actual latency and footprint only after measuring, not as promises.
-
-## Superseding architecture decision: Git-repository-first FIFO ingestion
-
-**[REPO_FIFO.md](REPO_FIFO.md) is normative and replaces the daily append-only journal and 'no background process' assumptions above.** The server is an **optional foreground, repository-local process**, not a mandatory global daemon.
-
-- Discover Git root from nested paths; `.nunc/entries/<id>.md` stores one memory per completed FIFO frame, with stable ID, timestamp, metadata and original Markdown body. Persist atomically before indexing.
-- `nunc serve` creates a named pipe and session metadata with a generated or explicit multipart-style boundary. Only complete delimiter lines terminate messages. FIFO is not durable, and concurrent writers need serialization or socket-based coordination; no implicit persistence acknowledgement.
-- `nunc write`/`nunc log` fall back to direct file persistence when the server is absent. Indexing errors never discard saved Markdown; `reindex` recovers.
-- Repeatable `--source` flags index explicitly selected **read-only** source files/directories with deterministic chunks and file/line provenance. Watch changes, reconcile deletions, deduplicate overlaps, respect ignore rules and avoid symlink escapes.
-- SQLite is a disposable **repo-scoped** index outside Git; `fastembed` uses locally cached ONNX models. Runtime FIFO/session files and indexes must never be committed. Memory entries may be Git-tracked intentionally after privacy review.
-
-## Binding MVP indexing decision
-
-`fastembed` is an embedding generator, **not** a search index. Use a repo-scoped SQLite file at `$XDG_STATE_HOME/nunc-mens/<repo-id>/index.sqlite3` (default `~/.local/state/nunc-mens/<repo-id>/index.sqlite3`), outside Git. Persist IDs, source paths, kind, content, content hashes, model identifier/revision/dimensions and embeddings as `f32` BLOBs. For queries, generate one vector with the cached model, read compatible vectors and compute cosine similarity in Rust, sorting top-k results. Start with linear scan; no SQLite vector extension or separate vector DB. **No FTS5, BM25, keyword or hybrid search in MVP.** If model unavailable, writes persist but indexing remains pending and search errors clearly. Reindex is reproducible from Markdown and registered sources, and must never implicitly download a model.
+Freshness checks and polling reread eligible files. Search ranks a full linear scan of the selected vectors. These choices suit modest project corpora. Long memory entries retain their entire body, and inference truncates inputs to the model's 512-token context. The index caches project text as well as vectors.

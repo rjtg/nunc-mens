@@ -152,6 +152,13 @@ fn fifo_preserves_raw_and_client_records_under_concurrency() -> Result<()> {
         fifo.write_all(b"raw\r\n\n```\ncode\n```\n--test-")?;
         fifo.write_all(b"boundary\r\nsecond raw\n--test-boundary\n")?;
     }
+    {
+        // Keep a writer open so there is no EOF between an incomplete raw note
+        // and the next cooperative client frame.
+        let mut fifo = raw_writer(&fixture.local().join("input.fifo"))?;
+        fifo.write_all(b"abandoned record\n--test-boundary")?;
+        fixture.run(&["write", "recovered client note"])?;
+    }
     let collision = fixture
         .nunc(&["write", "--", "collision\n--test-boundary"])
         .output()?;
@@ -160,6 +167,7 @@ fn fifo_preserves_raw_and_client_records_under_concurrency() -> Result<()> {
     let mut expected = vec![
         "raw\r\n\n```\ncode\n```\n".to_owned(),
         "second raw\n".to_owned(),
+        "recovered client note".to_owned(),
     ];
     for id in 0..6 {
         let msg = format!("client {id}\n\n{}", "x".repeat(21_000));
@@ -320,5 +328,143 @@ fn real_fastembed_semantic_search_and_json_provenance() -> Result<()> {
     assert_eq!(source["results"][0]["path"], "docs/policies.md");
     assert_eq!(source["results"][0]["line_start"], 1);
     assert_eq!(source["results"][0]["line_end"], 2);
+    Ok(())
+}
+
+#[test]
+fn no_fifo_reader_falls_back_and_runtime_symlinks_are_rejected() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.run(&["init"])?;
+    let fifo = fixture.local().join("input.fifo");
+    checked(
+        Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .output()?,
+    )?;
+    let owner = fixture.local().join("serve.lock");
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let lock = fs::File::options()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(owner)?;
+    lock.lock()?;
+    let meta = fs::metadata(&fifo)?;
+    fs::write(
+        fixture.local().join("session.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2, "id": uuid::Uuid::new_v4(), "pid": std::process::id(),
+            "boundary": "fake", "device": meta.dev(), "inode": meta.ino()
+        }))?,
+    )?;
+    let receipt = fixture.run(&["write", "no reader"])?;
+    assert!(String::from_utf8(receipt.stdout)?.starts_with("Saved "));
+    drop(lock);
+
+    fs::remove_file(fixture.local().join("session.json"))?;
+    fs::remove_file(&fifo)?;
+    let target = fixture.repo.join("untouched");
+    fs::write(&target, "existing content")?;
+    std::os::unix::fs::symlink(&target, &fifo)?;
+    let output = fixture.nunc(&["serve"]).output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)?.contains("unexpected runtime file"));
+    assert_eq!(fs::read_to_string(target)?, "existing content");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn real_watcher_reconciles_changes_deletions_and_restart() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    fs::create_dir(fixture.repo.join("docs"))?;
+    fs::create_dir(fixture.repo.join("src"))?;
+    let doc = fixture.repo.join("docs/rotation.md");
+    let deleted = fixture.repo.join("src/old.rs");
+    fs::write(&doc, "Keys rotate weekly.\n")?;
+    fs::write(
+        &deleted,
+        "// Old procedure: disable access during key rollover.\n",
+    )?;
+    let mut server = Server::start(&fixture, &["--source", "docs", "--source", "src"])?;
+    fixture.run(&[
+        "write",
+        "During rollover, clients keep the preceding token in memory for one minute.",
+    ])?;
+
+    let index_path = || -> Result<Option<PathBuf>> {
+        let states = match fs::read_dir(&fixture.state) {
+            Ok(states) => states,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        for state in states {
+            let path = state?.path().join("index.sqlite3");
+            if path.is_file() {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    };
+    eventually(|| {
+        let Some(path) = index_path()? else {
+            return Ok(false);
+        };
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        Ok(conn.query_row("SELECT count(*) FROM documents", [], |row| {
+            row.get::<_, usize>(0)
+        })? == 3)
+    })?;
+
+    fs::write(
+        doc,
+        "Keys rotate weekly.\nThe previous token stays valid for sixty seconds.\n",
+    )?;
+    fs::remove_file(deleted)?;
+    eventually(|| {
+        let Some(path) = index_path()? else {
+            return Ok(false);
+        };
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let hits: usize = conn.query_row(
+            "SELECT count(*) FROM documents WHERE (path = 'docs/rotation.md' AND line_end = 2)
+             OR path = 'src/old.rs'",
+            [],
+            |row| row.get(0),
+        )?;
+        let count: usize =
+            conn.query_row("SELECT count(*) FROM documents", [], |row| row.get(0))?;
+        Ok(hits == 1 && count == 2)
+    })?;
+
+    let search = || -> Result<Value> {
+        Ok(serde_json::from_slice(
+            &fixture
+                .run(&["search", "--json", "credentials grace period"])?
+                .stdout,
+        )?)
+    };
+    let before = search()?;
+    assert_eq!(before["warnings"], serde_json::json!([]));
+    let rows = before["results"].as_array().context("missing hits")?;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .any(|row| row["kind"] == "source" && row["line_end"] == 2)
+    );
+    assert!(rows.iter().any(|row| row["kind"] == "memory"));
+    server.stop()?;
+    let mut server = Server::start(&fixture, &[])?;
+    fixture.run(&["reindex", "--full"])?;
+    assert_eq!(search()?, before);
+    server.stop()?;
     Ok(())
 }

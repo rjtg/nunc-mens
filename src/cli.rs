@@ -218,6 +218,10 @@ fn status(repo: &Repo, detail: bool) -> Result<()> {
     let config = repo.config()?;
     let index = Index::for_repo(repo)?;
     println!("Repository {} ({})", repo.root.display(), repo.id);
+    match fifo::status(repo)? {
+        Some((pid, boundary)) => println!("Server: running (PID {pid}, boundary {boundary})"),
+        None => println!("Server: stopped"),
+    }
     println!("Entries {}", repo.entries().display());
     println!("Index {}", index.path().display());
     println!("Model cache {}", repo.model_cache()?.display());

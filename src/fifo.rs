@@ -2,6 +2,7 @@ use crate::entries::{self, ContextFields, Receipt};
 use crate::fs::{atomic_write, effective_uid, lockfile, missing, private_dir, read_regular};
 use crate::protocol::{Boundary, Parser};
 use crate::repo::Repo;
+use crate::watch;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use signal_hook::{
@@ -23,7 +24,9 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const POLL: Duration = Duration::from_millis(20);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const SEND_TIMEOUT: Duration = Duration::from_secs(3);
+const SESSION_VERSION: u8 = 2;
 const FLAGS: i32 = libc::O_NONBLOCK | libc::O_NOFOLLOW;
 
 #[derive(Deserialize, Serialize, PartialEq, Eq)]
@@ -54,9 +57,30 @@ impl Runtime {
         }
     }
 
+    fn existing(repo: &Repo) -> Result<Option<Self>> {
+        match fs::symlink_metadata(repo.local()) {
+            Ok(_) => private_dir(&repo.local())?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).context("inspect FIFO runtime directory"),
+        }
+        Ok(Some(Self::new(repo)))
+    }
+
     fn remove_artifacts(&self) -> Result<()> {
         remove_owned(&self.session, Metadata::is_file)?;
         remove_owned(&self.fifo, |meta| meta.file_type().is_fifo())
+    }
+
+    fn live_session(&self) -> Result<Option<Session>> {
+        if !self.owner.try_exists()? {
+            return Ok(None);
+        }
+        let owner = lockfile(&self.owner)?;
+        match owner.try_lock_shared() {
+            Ok(()) => Ok(None),
+            Err(TryLockError::WouldBlock) => self.session(),
+            Err(TryLockError::Error(err)) => Err(err).context("check FIFO ownership"),
+        }
     }
 
     fn session(&self) -> Result<Option<Session>> {
@@ -67,7 +91,10 @@ impl Runtime {
         };
         let session: Session =
             serde_json::from_slice(&bytes).context("parse FIFO session metadata")?;
-        ensure!(session.version == 1, "unsupported FIFO session version");
+        ensure!(
+            (1..=SESSION_VERSION).contains(&session.version),
+            "unsupported FIFO session version"
+        );
         Ok(Some(session))
     }
 }
@@ -140,7 +167,7 @@ pub fn serve(repo: &Repo, boundary: Option<String>, sources: &[PathBuf]) -> Resu
         .context("open FIFO reader")?;
     let meta = fifo_metadata(&pipe)?;
     let session = Session {
-        version: 1,
+        version: SESSION_VERSION,
         id: Uuid::new_v4(),
         boundary: boundary.value().to_owned(),
         pid: std::process::id(),
@@ -152,13 +179,21 @@ pub fn serve(repo: &Repo, boundary: Option<String>, sources: &[PathBuf]) -> Resu
         &serde_json::to_vec_pretty(&session)?,
         false,
     )?;
-    println!(
-        "FIFO {}\nBoundary {}",
-        runtime.fifo.display(),
-        boundary.value()
-    );
-    io::stdout().flush().context("publish server endpoint")?;
-    read_frames(&mut pipe, &stop, &boundary, repo)
+    let publish = || -> Result<()> {
+        let mut out = io::stdout().lock();
+        writeln!(
+            out,
+            "FIFO {}\nBoundary {}",
+            runtime.fifo.display(),
+            boundary.value()
+        )?;
+        out.flush()?;
+        Ok(())
+    };
+    publish().context("print server endpoint")?;
+    watch::during_capture(repo, || {
+        read_frames(&mut pipe, &stop, &boundary, repo, &runtime)
+    })
 }
 
 struct Signals(Vec<signal_hook::SigId>);
@@ -183,11 +218,26 @@ impl Drop for Signals {
     }
 }
 
-fn read_frames(pipe: &mut File, stop: &AtomicBool, boundary: &Boundary, repo: &Repo) -> Result<()> {
+fn read_frames(
+    pipe: &mut File,
+    stop: &AtomicBool,
+    boundary: &Boundary,
+    repo: &Repo,
+    runtime: &Runtime,
+) -> Result<()> {
     let mut parser = Parser::new(boundary);
     let mut bytes = [0; 16 * 1024];
+    let mut drain_until = None;
     loop {
+        if drain_until.is_none() && stop.load(Ordering::Relaxed) {
+            runtime.remove_artifacts()?;
+            drain_until = Some(Instant::now() + DRAIN_TIMEOUT);
+        }
+        if drain_until.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
         match pipe.read(&mut bytes) {
+            Ok(0) if drain_until.is_some() => break,
             Ok(0) => {
                 if parser.end_stream() {
                     eprintln!("nunc: discarded incomplete FIFO entry at end of stream");
@@ -198,29 +248,38 @@ fn read_frames(pipe: &mut File, stop: &AtomicBool, boundary: &Boundary, repo: &R
                     match record
                         .and_then(|body| entries::persist(repo, &body, ContextFields::default()))
                     {
-                        Ok(receipt) => println!("Saved {} {}", receipt.id, receipt.path.display()),
+                        Ok(receipt) => {
+                            let _ = writeln!(
+                                io::stdout().lock(),
+                                "Saved {} {}",
+                                receipt.id,
+                                receipt.path.display()
+                            );
+                        }
                         Err(error) => eprintln!("nunc: FIFO capture failed: {error:#}"),
                     }
                 });
-                if !stop.load(Ordering::Relaxed) {
-                    continue;
-                }
+                continue;
             }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => return Err(err).context("read FIFO"),
-        }
-        if stop.load(Ordering::Relaxed) {
-            if parser.end_stream() {
-                eprintln!("nunc: discarded incomplete FIFO entry during shutdown");
-            }
-            return Ok(());
         }
         thread::sleep(POLL);
     }
+    if parser.end_stream() {
+        eprintln!("nunc: discarded incomplete FIFO entry during shutdown");
+    }
+    Ok(())
+}
+
+pub(crate) fn status(repo: &Repo) -> Result<Option<(u32, String)>> {
+    let Some(runtime) = Runtime::existing(repo)? else {
+        return Ok(None);
+    };
+    Ok(runtime
+        .live_session()?
+        .map(|session| (session.pid, session.boundary)))
 }
 
 pub enum Delivery {
@@ -230,12 +289,9 @@ pub enum Delivery {
 
 pub fn write(repo: &Repo, body: &str) -> Result<Delivery> {
     entries::validate_body(body)?;
-    match fs::symlink_metadata(repo.local()) {
-        Ok(_) => private_dir(&repo.local())?,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return direct(repo, body),
-        Err(err) => return Err(err).context("inspect FIFO runtime directory"),
-    }
-    let runtime = Runtime::new(repo);
+    let Some(runtime) = Runtime::existing(repo)? else {
+        return direct(repo, body);
+    };
     if deliver(&runtime, body)? {
         return Ok(Delivery::Queued);
     }
@@ -263,15 +319,12 @@ fn deliver(runtime: &Runtime, body: &str) -> Result<bool> {
             Err(TryLockError::Error(err)) => return Err(err).context("lock FIFO writer"),
         }
     }
-    let owner = lockfile(&runtime.owner)?;
-    match owner.try_lock_shared() {
-        Ok(()) => return Ok(false),
-        Err(TryLockError::WouldBlock) => (),
-        Err(TryLockError::Error(err)) => return Err(err).context("check FIFO ownership"),
-    }
-    let Some(session) = runtime.session()? else {
+    let Some(session) = runtime.live_session()? else {
         return Ok(false);
     };
+    if session.version < SESSION_VERSION {
+        return Ok(false);
+    }
     let mut pipe = match File::options()
         .write(true)
         .custom_flags(FLAGS)

@@ -69,3 +69,19 @@ If you are a coding agent, **read `AGENTS.md` first**. Implement the milestones 
 ## License
 
 No license has been selected yet. Do not add one without a project-owner decision.
+
+## Repository-local FIFO mode (new target architecture)
+
+**The repo-first design in [docs/REPO_FIFO.md](docs/REPO_FIFO.md) supersedes the older global daily-journal layout above.** This repository still contains specifications, not a working CLI.
+
+```sh
+cd my-repo
+nunc serve --source ./src --source ./docs --source ./AGENTS.md
+# Prints .nunc/input.fifo and a random session boundary; --boundary can override
+nunc write "Cache invalidation uses versioned keys"
+nunc search --type memory "Why did caching change?"
+nunc search --type source --source ./docs "cache"
+nunc reindex
+```
+
+The foreground `serve` process accepts boundary-framed messages through a repo-local FIFO. Each complete message becomes one `.nunc/entries/<id>.md` file with metadata and is indexed immediately. Repeatable `--source` flags register read-only files/directories for initial indexing and watching. `nunc log`/`nunc write` must also work without a running server, persisting entries directly for later indexing. The SQLite index is repo-scoped in XDG state; the model cache is outside Git. Project entry files may be intentionally Git-tracked; FIFO, session files, indexes and secrets must not be committed. No Ollama or mandatory daemon. See [docs/REPO_FIFO.md](docs/REPO_FIFO.md) for framing, concurrency and security guarantees.

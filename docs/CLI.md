@@ -11,11 +11,11 @@ printf 'Multiline note\nwith context\n' | nunc log --stdin
 nunc log --tag auth --tag staging --repo myservice "Fixed deploy failure"
 ```
 
-- `nunc log TEXT...` appends one timestamped entry. Argument text joined with spaces; don't infer formatting or execute it.
+- `nunc log TEXT...` creates one timestamped entry file. Argument text joined with spaces; don't infer formatting or execute it.
 - `nunc TEXT...` is an exact shorthand for `nunc log TEXT...` when no recognized subcommand is supplied; use robust clap dispatch and document ambiguity.
 - `nunc log --stdin` reads one complete entry until EOF, preserving newline structure; reject empty/whitespace-only entries.
 - `--tag` repeatable, `--repo` optional explicit context; otherwise best-effort detect `git rev-parse --show-toplevel` from current directory. Never fail just because no Git repo is found.
-- Use local ISO-8601 / RFC3339 timestamp with timezone offset. File naming: `YYYY-MM-DD.md` based on local date. Store stable entry ID, timestamp, repo/tags (if supplied) and original text in a documented, parseable Markdown structure.
+- Use local ISO-8601 / RFC3339 timestamp with timezone offset. File naming: `.nunc/entries/<id>.md` in the discovered Git root. Store stable entry ID, timestamp, repo/tags (if supplied) and original text in a documented, parseable Markdown structure.
 - Preserve line breaks and code fences. Handle Unicode and special characters without quoting errors.
 - Log writes must not call the embedding model. On success, show ID and path; nonzero exit on failure.
 
@@ -28,7 +28,7 @@ nunc doctor
 nunc models download
 ```
 
-- Index all supported entries in the configured journal directory, and **only** there. `reindex` incrementally refreshes changed and removed entries when possible; `--full` recreates the SQLite search index from source and discards stale data.
+- Index `.nunc/entries/` plus explicitly configured read-only `--source` files/directories, and nothing else. `reindex` incrementally refreshes changed and removed entries when possible; `--full` recreates the SQLite search index from source and discards stale data.
 - FTS5 is always available for indexed entries. Generate embeddings in-process with `fastembed` only when the configured model is already cached. If it is missing or cannot load, still build the keyword index and report counts and the reason. Never download during indexing.
 - Persist embedding provider/model/dimensions/version. When those change, invalidate/rebuild affected embeddings; never compare vectors with incompatible dimensions.
 - No silent stale results: writes either trigger freshness validation on search or show a clear 'index needs refresh' warning. For MVP, explicit reindex with clear stale warning is acceptable.
@@ -53,8 +53,8 @@ nunc search --mode hybrid --json "CI failures"
 ## Configuration (initial)
 
 ```sh
-export NUNC_JOURNAL_DIR="$HOME/.local/share/nunc-mens/journal"
-export NUNC_INDEX_PATH="$HOME/.local/state/nunc-mens/index.sqlite3"
+export NUNC_REPO_ROOT="/path/to/repo" # optional explicit override
+export NUNC_STATE_DIR="$HOME/.local/state/nunc-mens" # repo-scoped index
 export NUNC_EMBED_MODEL="<supported-multilingual-fastembed-model-id>"
 export NUNC_MODEL_CACHE_DIR="$HOME/.cache/nunc-mens/models"
 ```

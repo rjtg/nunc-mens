@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "queries": [
+    {"id": "exact-cli-flag", "category": "exact", "query": "--from-checkpoint", "grades": {"upgrade-runbook": 3}, "evidence": {"upgrade-runbook": "replay-cursor reset --from-checkpoint"}}
+  ]
+}

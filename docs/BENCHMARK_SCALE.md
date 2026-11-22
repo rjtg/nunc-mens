@@ -96,3 +96,17 @@ A follow-up touched the exact source file's mtime while preserving its contents.
 All three modes returned byte-identical JSON for both the touch and unchanged comparisons. Unchanged-source freshness moved from 0.863–0.888 s to 0.890–0.947 s in these single pairs. The SQLite manifest occupied 22.2 MiB of pages on this 100,000-chunk fixture and is decoded only when the aggregate fingerprint cannot confirm freshness. Search still hashes the journal. These measurements are from the same host and corpus as the earlier comparisons.
 
 The after binary SHA-256 was `f558d0d8f1cf0a0219b7e65680cf7c8312e2df6dec2cde66ccc8c55173a9df05`.
+
+### Indexed directory and mixed scopes
+
+The directory probe searched for `staging` inside `docs/decisions` in the same 100,000-chunk index. The new scope combines indexed equality and range lookups across file, directory and memory filters. The range plan reports `SEARCH d USING COVERING INDEX chunk_path (path>? AND path<?)`. The bounds include descendants after the slash and exclude neighboring names with a shared prefix. The eligibility list is shared by the vector and FTS branches. Both versions returned byte-identical JSON in three pairs per mode. [Directory samples](../benchmarks/performance/results/directory-scope-100000-linux-x86_64.jsonl)
+
+| Mode | Median total before / after | Vector scan before / after | Keyword scan before / after |
+| --- | ---: | ---: | ---: |
+| Semantic | 3.109 / 3.009 s | 221.214 / 100.733 ms | — |
+| Keyword | 1.288 / 1.164 s | — | 261.636 / 176.483 ms |
+| Hybrid | 3.562 / 3.416 s | 236.898 / 108.099 ms | 273.983 / 179.793 ms |
+
+A separate exact-file control still returned byte-identical JSON across all modes. Its semantic vector scan took 0.113 ms before and 0.224 ms after. Its keyword scan took 2.479 ms before and 4.471 ms after. These are individual samples of the added scope-union overhead. [Exact-file control](../benchmarks/performance/results/directory-exact-control-100000-linux-x86_64.jsonl)
+
+The profiling binary SHA-256 was `7336a6de7517ebdac91bb8cad8e576c612b42e37da52ed517233a3800d0c3c9d`.

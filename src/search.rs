@@ -400,15 +400,21 @@ impl Filter {
         Ok(())
     }
 
-    fn exact_files(&self) -> Result<Option<String>> {
-        if self.kind == Some(Kind::Source)
-            && !self.sources.is_empty()
-            && self.sources.iter().all(|source| !source.recursive)
-        {
-            let files: Vec<_> = self.sources.iter().map(|source| &source.path).collect();
-            return Ok(Some(serde_json::to_string(&files)?));
+    fn indexed_scope(&self) -> Result<Option<String>> {
+        if self.sources.is_empty() {
+            return Ok(None);
         }
-        Ok(None)
+        let mut paths = Vec::new();
+        for source in &self.sources {
+            let path = source.path.to_str().context("source path must be UTF-8")?;
+            paths.push((path, source.recursive.then(|| format!("{path}0"))));
+        }
+        if self.memory {
+            paths.push((MEMORY_PATH, Some(format!("{MEMORY_PATH}0"))));
+        }
+        // Binary collation places '0' immediately after '/'. Only the
+        // explicitly selected directory and its descendants qualify.
+        Ok(Some(serde_json::to_string(&paths)?))
     }
 
     fn includes(&self, path: &str) -> bool {
@@ -672,16 +678,16 @@ pub(crate) fn search_with(
         Ok(())
     };
     // Explain must still count the complete type scope before the path filter.
-    let exact_files = if options.explain {
+    let indexed_scope = if options.explain {
         None
     } else {
-        filter.exact_files()?
+        filter.indexed_scope()?
     };
     if options.mode != Mode::Keyword {
         let _scan = profile::span(Stage::VectorScan);
         reader.scan_scoped(
             filter.kind,
-            exact_files.as_deref(),
+            indexed_scope.as_deref(),
             include,
             |row, vector| visit(row, Evidence::Vector(vector)),
         )?;
@@ -694,7 +700,7 @@ pub(crate) fn search_with(
         reader.scan_keyword(
             filter.kind,
             text,
-            exact_files.as_deref(),
+            indexed_scope.as_deref(),
             |path| {
                 if hybrid {
                     let _filter = profile::span(Stage::SourceFilter);

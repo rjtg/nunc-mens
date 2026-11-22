@@ -15,7 +15,9 @@ def main():
     for key in ("repo", "state", "model-cache", "before", "after", "output"):
         parser.add_argument(f"--{key}", required=True, type=Path)
     parser.add_argument("--query", required=True)
-    parser.add_argument("--source-file", required=True)
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--source-file")
+    scope.add_argument("--source")
     parser.add_argument("--samples", type=int, default=1)
     parser.add_argument("--touch-source", action="store_true", help="trigger validation with a metadata-only change")
     args = parser.parse_args()
@@ -33,9 +35,11 @@ def main():
     # binary ignores the additive table and checks the same content digest.
     measure_command([after, "reindex", "--keyword-only"], args.repo, env)
     root = args.repo.resolve()
-    source = root / args.source_file
+    source = root / (args.source_file or args.source)
     stat = None
     if args.touch_source:
+        if not args.source_file:
+            parser.error("--touch-source requires --source-file")
         if not source.is_relative_to(root) or source.resolve() != source:
             parser.error("--touch-source requires an ordinary path inside the fixture")
         stat = source.stat()
@@ -46,7 +50,8 @@ def main():
     try:
         with args.output.open("x", encoding="utf-8") as output:
             for mode in MODES:
-                command = ["search", "--mode", mode, "--source-file", args.source_file,
+                flag = "--source-file" if args.source_file else "--source"
+                command = ["search", "--mode", mode, flag, args.source_file or args.source,
                            "--json", "--", args.query]
                 for sample in range(args.samples):
                     baseline = None
@@ -61,7 +66,8 @@ def main():
                             raise ValueError(f"{mode} results differ between versions")
                         print(json.dumps({
                             "version": tag, "sample": sample, "mode": mode,
-                            "scope": "file", "path": args.source_file,
+                            "scope": "file" if args.source_file else "directory",
+                            "path": args.source_file or args.source,
                             **({"metadata_only_touch": True} if args.touch_source else {}),
                             **timing, "stages_ns": read_profile(stderr),
                         }), file=output, flush=True)

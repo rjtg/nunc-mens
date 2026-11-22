@@ -1058,6 +1058,60 @@ fn keyword_index_upgrades_to_shared_semantic_chunks() -> Result<()> {
 }
 
 #[test]
+fn indexed_source_union_matches_diagnostic_scope_and_respects_component_boundaries() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let memory = fixture.log_id("WriterLock serializes commits.")?;
+    for path in ["docs/guide/sub", "docs/guide2"] {
+        fs::create_dir_all(fixture.repo.join(path))?;
+    }
+    for path in [
+        "docs/guide/sub/a.md",
+        "docs/guide2/excluded.md",
+        "docs/guide2/included.md",
+    ] {
+        fs::write(fixture.repo.join(path), "WriterLock serializes commits.")?;
+    }
+    fixture.run(&["reindex", "--keyword-only", "--source", "docs"])?;
+    let mut args = vec![
+        "search",
+        "--mode",
+        "keyword",
+        "WriterLock",
+        "--json",
+        "--source",
+        "docs/guide",
+        "--source",
+        ".nunc/entries",
+        "--source-file",
+        "docs/guide2/included.md",
+        "--source-file",
+        "docs/guide/sub/a.md",
+    ];
+    let ordinary = fixture.json(&args)?;
+    args.push("--explain");
+    let explained = fixture.json(&args)?;
+    let hits = |result: &Value| -> Result<Vec<(Value, Value, Value)>> {
+        Ok(result["results"]
+            .as_array()
+            .context("missing results")?
+            .iter()
+            .map(|row| (row["id"].clone(), row["path"].clone(), row["score"].clone()))
+            .collect())
+    };
+    let results = hits(&ordinary)?;
+    assert_eq!(results, hits(&explained)?);
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().any(|(id, _, _)| id == &memory));
+    assert!(
+        results
+            .iter()
+            .all(|(_, path, _)| path != "docs/guide2/excluded.md")
+    );
+    assert_eq!(explained["pipeline"]["chunks_after_source_filter"], 3);
+    Ok(())
+}
+
+#[test]
 fn freshness_detects_changed_sources_with_restored_mtime_and_handles_legacy_indexes() -> Result<()>
 {
     let fixture = Fixture::new()?;

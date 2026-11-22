@@ -219,3 +219,7 @@ Formatting, Clippy in both build configurations, all 67 default Rust tests, two 
 ### Changed sources at scale
 
 On the 100,000-chunk fixture, the manifest comparator changed and restored the requested source's mtime. The exact-file query stayed current and matched the older binary byte for byte in all three modes. The freshness stage took 1.31–1.43 seconds after the touch, compared with 3.08–3.18 seconds before. The unit test checks that only changed and unreliable sources are reopened. Formatting, both Clippy configurations, 68 default Rust tests, the real-model search-by-example test, and six Python tests passed. Cargo replaced timed-out Rust diagnostics. The Python language server was unavailable. [Measurements](BENCHMARK_SCALE.md#changed-source-metadata)
+
+### Directory and mixed scope
+
+The local journal captured the binary path-range decision and recovered it first with keyword search for “binary SQLite path interval”. The 100,000-chunk directory comparison and exact-file control returned byte-identical before and after JSON in all three modes. A CLI test verifies a mixed directory, file and memory union, including a nested file selected twice and an excluded sibling directory with a shared prefix. Formatting, both Clippy configurations, 69 default Rust tests, the targeted E5 source-filter test, and six Python tests passed. Rust LSP diagnostics timed out, and the Python language server was unavailable. [Measurements](BENCHMARK_SCALE.md#indexed-directory-and-mixed-scopes)

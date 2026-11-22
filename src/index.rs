@@ -38,6 +38,15 @@ const KEYWORD_SCHEMA: &str = "
     END;
     INSERT INTO chunk_terms(chunk_terms) VALUES ('rebuild');
 ";
+// The same scoped row IDs constrain both cosine and lexical retrieval.
+const SCOPED_ROWS: &str = "
+    SELECT d.rowid FROM json_each(?1) AS scope
+    JOIN documents AS d ON d.path=json_extract(scope.value,'$[0]')
+    UNION ALL
+    SELECT d.rowid FROM json_each(?1) AS scope
+    JOIN documents AS d ON d.path>=json_extract(scope.value,'$[0]') || '/'
+        AND d.path<json_extract(scope.value,'$[1]')
+";
 const BATCH: usize = 16;
 const SCHEMA: &str = "
     CREATE TABLE metadata (
@@ -736,7 +745,7 @@ impl Reader {
         &self,
         kind: Option<Kind>,
         query: &str,
-        exact_files: Option<&str>,
+        indexed_scope: Option<&str>,
         include: impl Fn(&str) -> bool,
         mut visit: impl FnMut(IndexedRow<'_, '_>, Option<f64>, bool) -> Result<()>,
     ) -> Result<()> {
@@ -754,42 +763,41 @@ impl Reader {
             && query.bytes().all(|ch| ch.is_ascii_hexdigit()))
         .then(|| format!("{}*", query.to_ascii_lowercase()));
         let literal = single.then_some(query);
-        let mut stmt = self.conn.prepare_cached(
-            "WITH lexical AS MATERIALIZED (
+        let sql = format!(
+            "WITH selected AS MATERIALIZED ({SCOPED_ROWS}), lexical AS MATERIALIZED (
                 SELECT rowid, bm25(chunk_terms) AS quality FROM chunk_terms
-                WHERE chunk_terms MATCH ?1 AND (?7 IS NULL OR rowid IN (
-                    SELECT rowid FROM documents WHERE path IN (SELECT value FROM json_each(?7))
-                ))
+                WHERE chunk_terms MATCH ?2 AND (?1 IS NULL OR rowid IN (SELECT rowid FROM selected))
              ), exact AS MATERIALIZED (
-                SELECT d.rowid FROM documents d WHERE ?2 IS NOT NULL AND d.parent_id=?2
+                SELECT d.rowid FROM documents d WHERE ?3 IS NOT NULL AND d.parent_id=?3
                 UNION
-                SELECT d.rowid FROM documents d WHERE d.path=?3
+                SELECT d.rowid FROM documents d WHERE d.path=?4
                 UNION
                 SELECT d.rowid FROM documents d
-                WHERE instr(?3,'/') > 0 AND NOT EXISTS (SELECT 1 FROM documents WHERE path=?3)
-                    AND d.kind='source' AND substr(d.path,-length(?3)-1)='/' || ?3
+                WHERE instr(?4,'/') > 0 AND NOT EXISTS (SELECT 1 FROM documents WHERE path=?4)
+                    AND d.kind='source' AND substr(d.path,-length(?4)-1)='/' || ?4
                 UNION
                 SELECT d.rowid FROM parents p JOIN documents d ON d.parent_id=p.id
-                    WHERE ?4 IS NOT NULL AND json_extract(p.origin,'$[1].sha') GLOB ?4
+                    WHERE ?5 IS NOT NULL AND json_extract(p.origin,'$[1].sha') GLOB ?5
              ), hits AS (
                 SELECT rowid FROM lexical UNION SELECT rowid FROM exact
              )
              SELECT d.id,d.kind,d.path,d.timestamp,d.line_start,d.line_end,d.text,d.vector,
                     d.parent_id,d.chunk,d.section_start,d.section_end,l.quality,
-                    (e.rowid IS NOT NULL OR (?5 IS NOT NULL AND instr(lower(d.text),lower(?5)) > 0))
+                    (e.rowid IS NOT NULL OR (?6 IS NOT NULL AND instr(lower(d.text),lower(?6)) > 0))
              FROM hits h JOIN documents d ON d.rowid=h.rowid
              LEFT JOIN lexical l ON l.rowid=h.rowid LEFT JOIN exact e ON e.rowid=h.rowid
-             WHERE (?6 IS NULL OR d.kind=?6)
-                AND (?7 IS NULL OR d.path IN (SELECT value FROM json_each(?7)))",
-        )?;
+             WHERE (?7 IS NULL OR d.kind=?7)
+                AND (?1 IS NULL OR d.rowid IN (SELECT rowid FROM selected))",
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let mut rows = stmt.query(params![
+            indexed_scope,
             expression,
             parent,
             path.as_ref().and_then(|value| value.to_str()),
             sha,
             literal,
             kind.map(Kind::as_str),
-            exact_files,
         ])?;
         while let Some(row) = rows.next()? {
             let path = row.get_ref(2)?.as_str()?;
@@ -805,7 +813,7 @@ impl Reader {
         let path = path.to_str().context("source path is not UTF-8")?;
         Ok(self.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM documents WHERE kind = 'source'
-              AND (path = ?1 OR (?2 AND substr(path, 1, length(?1) + 1) = ?1 || '/')))",
+              AND (path = ?1 OR (?2 AND path >= ?1 || '/' AND path < ?1 || '0')))",
             params![path, recursive],
             |row| row.get(0),
         )?)
@@ -884,25 +892,26 @@ impl Reader {
     pub(crate) fn scan_scoped(
         &self,
         kind: Option<Kind>,
-        exact_files: Option<&str>,
+        indexed_scope: Option<&str>,
         include: impl Fn(&str) -> bool,
         mut visit: impl FnMut(IndexedRow<'_, '_>, &[f32]) -> Result<()>,
     ) -> Result<()> {
-        let kind = kind.map(Kind::as_str);
-        let (predicate, argument) = match exact_files {
-            Some(files) => (
-                "kind='source' AND path IN (SELECT value FROM json_each(?1))",
-                Some(files),
-            ),
-            None => ("?1 IS NULL OR kind = ?1", kind),
+        let predicate = if indexed_scope.is_some() {
+            format!("(?2 IS NULL OR kind=?2) AND rowid IN ({SCOPED_ROWS})")
+        } else {
+            "(?1 IS NULL OR kind=?1)".to_owned()
         };
-        // Only fixed predicates are assembled here. File scopes stay bound parameters.
         let sql = format!(
             "SELECT id, kind, path, timestamp, line_start, line_end, text, vector, parent_id, chunk, section_start, section_end
              FROM documents WHERE {predicate}"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query([argument])?;
+        let kind = kind.map(Kind::as_str);
+        let mut rows = if let Some(scope) = indexed_scope {
+            stmt.query(params![scope, kind])?
+        } else {
+            stmt.query([kind])?
+        };
         while let Some(row) = rows.next()? {
             let path: &str = row.get_ref(2)?.as_str()?;
             if !include(path) {

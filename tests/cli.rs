@@ -1058,6 +1058,58 @@ fn keyword_index_upgrades_to_shared_semantic_chunks() -> Result<()> {
 }
 
 #[test]
+fn freshness_detects_changed_sources_with_restored_mtime_and_handles_legacy_indexes() -> Result<()>
+{
+    let fixture = Fixture::new()?;
+    fs::create_dir(fixture.repo.join("docs"))?;
+    let document = fixture.repo.join("docs/checkpoint.md");
+    fs::write(&document, "WriterLock publishes the checkpoint.")?;
+    fixture.run(&["reindex", "--keyword-only", "--source", "docs"])?;
+    let search = || {
+        fixture.json(&[
+            "search",
+            "--mode",
+            "keyword",
+            "--source-file",
+            "docs/checkpoint.md",
+            "--explain",
+            "--json",
+            "WriterLock",
+        ])
+    };
+    let original = search()?;
+    assert_eq!(original["pipeline"]["index_freshness"], "current");
+    assert_eq!(original["results"][0]["path"], "docs/checkpoint.md");
+    let mtime = fs::metadata(&document)?.modified()?;
+    let restore_mtime = || {
+        fs::File::options()
+            .write(true)
+            .open(&document)?
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+    };
+    restore_mtime()?;
+    assert_eq!(search()?, original);
+    fs::write(&document, "ReaderLock publishes the checkpoint.")?;
+    restore_mtime()?;
+    assert_eq!(search()?["pipeline"]["index_freshness"], "stale");
+    fs::write(&document, "WriterLock publishes the checkpoint.")?;
+    fixture.run(&["reindex", "--keyword-only"])?;
+    let index = fs::read_dir(&fixture.state)?
+        .next()
+        .context("missing index")??
+        .path();
+    {
+        let conn = rusqlite::Connection::open(index.join("index.sqlite3"))?;
+        conn.execute("DROP TABLE snapshot_freshness", [])?;
+    }
+    assert_eq!(search()?, original);
+    fixture.run(&["reindex", "--keyword-only"])?;
+    fs::remove_file(&document)?;
+    assert_eq!(search()?["pipeline"]["index_freshness"], "stale");
+    Ok(())
+}
+
+#[test]
 fn socket_search_preserves_formats_visibility_and_rebuilds() -> Result<()> {
     let fixture = Fixture::new()?;
     let note = fixture.log_id("WriterLock guards commit publication")?;

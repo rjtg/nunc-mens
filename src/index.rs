@@ -157,11 +157,10 @@ impl<'a> Index<'a> {
                 }
                 let digest = check(&connection, self.repo, model)?;
                 if digest == snapshot.digest && (keyword_only || semantic_ready(&connection)?) {
-                    if !has_keyword_schema(&connection)? {
-                        let tx = connection.transaction()?;
-                        ensure_keyword_schema(&tx)?;
-                        tx.commit()?;
-                    }
+                    let tx = connection.transaction()?;
+                    ensure_keyword_schema(&tx)?;
+                    store_freshness(&tx, &snapshot)?;
+                    tx.commit()?;
                     return Ok(Refresh {
                         documents: connection.query_row(
                             "SELECT count(*) FROM documents",
@@ -325,6 +324,27 @@ impl<'a> Index<'a> {
             )
         })
     }
+}
+
+fn store_freshness(tx: &Transaction<'_>, snapshot: &Snapshot) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS snapshot_freshness (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            digest TEXT NOT NULL,
+            stamps TEXT NOT NULL
+        ) STRICT;",
+    )?;
+    if let Some(freshness) = &snapshot.freshness {
+        tx.execute(
+            "INSERT INTO snapshot_freshness VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET digest=excluded.digest, stamps=excluded.stamps
+             WHERE digest != excluded.digest OR stamps != excluded.stamps",
+            params![snapshot.digest, freshness],
+        )?;
+    } else {
+        tx.execute("DELETE FROM snapshot_freshness", [])?;
+    }
+    Ok(())
 }
 
 fn has_keyword_schema(conn: &Connection) -> Result<bool> {
@@ -561,6 +581,7 @@ fn update_rows(
             serde_json::to_string(&snapshot.chunking.strategy)?
         ],
     )?;
+    store_freshness(&transaction, &snapshot)?;
     transaction.commit()?;
     Ok(report)
 }
@@ -641,6 +662,25 @@ fn store_batch(
 }
 
 impl Reader {
+    pub(crate) fn freshness(&self) -> Result<Option<String>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='snapshot_freshness')",
+            [],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(self
+                .conn
+                .query_row(
+                    "SELECT stamps FROM snapshot_freshness WHERE singleton=1 AND digest=?1",
+                    [&self.digest],
+                    |row| row.get(0),
+                )
+                .optional()?);
+        }
+        Ok(None)
+    }
+
     pub(crate) fn chunk<T>(
         &self,
         id: &str,

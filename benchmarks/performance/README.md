@@ -52,3 +52,17 @@ python3 -B -m benchmarks.performance.compare_socket \
 The output includes separate client wall times and server stages. The first socket request is marked cold. Socket publication happens before a model load necessarily finishes, so the first query includes any wait for model initialization. Later samples each start a fresh CLI client while the server stays alive. Use a fixture path short enough for the platform's Unix socket pathname limit.
 
 Add `--measure-cache` for a vector-mode run that starts with a distinct primer, then measures one warm miss and repeated exact hits. The comparator validates cache events against the embedding timing stage and compares the measured query's JSON against standalone output. Server profiling emits one `nunc-cache` record per embedding lookup with boolean `hit` and `cacheable` fields. The record contains no query text.
+
+## Source freshness comparison
+
+Build both revisions with `search-profile`. Use the same isolated, already indexed scale fixture for both executables.
+
+```sh
+python3 -B -m benchmarks.performance.compare_freshness \
+  --repo "$scratch/fixtures/100000/repo" --state "$scratch/fixtures/100000/state" \
+  --before /path/to/before/nunc --after target/release/nunc \
+  --model-cache "$NUNC_MODEL_CACHE_DIR" --source-file docs/decisions/note-000000.md \
+  --query SPW-000000 --output "$scratch/freshness.jsonl"
+```
+
+The comparator seeds the new additive fingerprint via a keyword-only reindex, then requires current and byte-identical results from both executables in all three modes. It records total wall time and timed stages. Increase `--samples` for a larger comparison. [Measured result](../../docs/BENCHMARK_SCALE.md#source-freshness-shortcut-at-100000-chunks)

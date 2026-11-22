@@ -1,5 +1,5 @@
 use crate::chunk::Strategy;
-use crate::documents::{Kind, Provenance, Snapshot};
+use crate::documents::{Kind, Provenance, Snapshot, source_freshness};
 use crate::index::{Index, IndexedRow, ReadCache, Reader};
 use crate::ledger::Guard;
 use crate::model::{LocalModel, MODEL, SharedModel};
@@ -509,12 +509,12 @@ pub(crate) fn search_with(
             }
         })?;
     filter.validate_missing(&reader)?;
-    let (vector, reference, snapshot_digest) = match example {
+    let (vector, reference) = match example {
         Some(example) => {
-            let (vector, reference, digest) = example.embed(&reader)?;
-            (Some(vector), Some(reference), digest)
+            let (vector, reference) = example.embed(&reader)?;
+            (Some(vector), Some(reference))
         }
-        None => (text_vector, None, None),
+        None => (text_vector, None),
     };
     let query_norm = vector
         .as_ref()
@@ -747,17 +747,20 @@ pub(crate) fn search_with(
     };
     drop(context);
     let digest = reader.digest.clone();
+    let stored_freshness = reader.freshness()?;
     drop(reader);
     checkpoint()?;
-    let current = match snapshot_digest {
-        Some(digest) => Ok(digest),
-        None => profile::measure(Stage::Freshness, || {
-            Snapshot::read(repo).map(|snapshot| snapshot.digest)
-        }),
-    };
+    let current = profile::measure(Stage::Freshness, || -> Result<bool> {
+        if let Some(expected) = stored_freshness
+            && source_freshness(repo, &guard.ledger)?.as_ref() == Some(&expected)
+        {
+            return Ok(true);
+        }
+        Ok(Snapshot::read(repo)?.digest == digest)
+    });
     let (freshness, warning) = match current {
-        Ok(snapshot_digest) if snapshot_digest == digest => ("current", None),
-        Ok(_) => (
+        Ok(true) => ("current", None),
+        Ok(false) => (
             "stale",
             Some(
                 if options.mode == Mode::Keyword {

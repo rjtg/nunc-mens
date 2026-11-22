@@ -52,3 +52,19 @@ The profiling binary SHA-256 was `cd973ad777bbb1a307491ffade103e1022ef75f626bec7
 The 1,000-chunk semantic comparator used `--measure-cache` and sent a distinct primer before the first measured query. The primer and the warm miss each embedded a query. The next five exact repetitions returned the same standalone JSON and skipped embedding. The warm miss spent 8.312 ms in inference and 38.803 ms in the server. Hit median server time was 30.816 ms. Client wall time was 69.150 ms for the single warm miss and 49.901 ms at the hit median. One miss is enough to show that inference ran and gives a limited latency comparison. This workload exercises a query-vector cache. The server still performs index eligibility, visibility and snapshot validation on every request. [Raw cache comparison](../benchmarks/performance/results/cache-1000-linux-x86_64.jsonl)
 
 The profiling binary SHA-256 was `18bde79beb4388a1a9a77f013e2a6af90d0f58d6c5ba02dcf142ced1b1cfb1c4`.
+
+## Source freshness shortcut at 100,000 chunks
+
+A controlled comparison ran the exact-file query `SPW-000000` against `docs/decisions/note-000000.md` on the same index. Each binary ran a fresh process per mode. An unchanged keyword-only reindex installed the source fingerprint used by the new binary. Both versions returned byte-identical JSON in every mode. [Raw measurements](../benchmarks/performance/results/freshness-100000-linux-x86_64.jsonl) · [Reproduction instructions](../benchmarks/performance/README.md#source-freshness-comparison)
+
+| Mode | Search before | Search after | Freshness before | Freshness after |
+| --- | ---: | ---: | ---: | ---: |
+| Semantic | 5.097 s | 3.043 s | 2.957 s | 0.877 s |
+| Keyword | 2.969 s | 1.032 s | 2.819 s | 0.885 s |
+| Hybrid | 5.180 s | 3.160 s | 2.874 s | 0.886 s |
+
+These are individual before/after samples from a later run of the same fixture, with both paths measured together. The new path still enumerates eligible source names and checks file metadata. A mismatch falls back to comparing the full content digest. Ranking and SQL plans stayed the same for this change.
+
+The exact-path predicate `kind=? AND path=?` currently plans as a scan of `documents`. The chunk-ID lookup uses the primary-key index, the parent lookup uses `chunk_parent`, and the lexical `MATCH` uses the FTS virtual-table index. Exact source filter pushdown and its impact on ranking and pipeline counts remain part of [#32](https://github.com/rjtg/nunc-mens/issues/32).
+
+The profiling binary SHA-256 values were `18bde79beb4388a1a9a77f013e2a6af90d0f58d6c5ba02dcf142ced1b1cfb1c4` before and `cfed3a68eca97171b08280e8ab1a5156d496a8cedc792a21a9b0e11edd645efc` after.

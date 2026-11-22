@@ -58,12 +58,12 @@ pub(crate) fn read_regular(path: &Path, limit: usize) -> Result<Vec<u8>> {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
-        bounded_read(file, limit)
+        bounded_read(&file, limit)
     };
     read().with_context(|| format!("read {}", path.display()))
 }
 
-pub(crate) fn bounded_read(file: File, limit: usize) -> Result<Vec<u8>> {
+pub(crate) fn bounded_read(file: &File, limit: usize) -> Result<Vec<u8>> {
     let metadata = file.metadata()?;
     ensure!(metadata.is_file(), "expected a regular file");
     ensure!(metadata.len() <= limit as u64, "file exceeds {limit} bytes");

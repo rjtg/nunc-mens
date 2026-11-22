@@ -2,7 +2,7 @@ use crate::chunk::{Chunk, Settings};
 use crate::entries::{self, Commit, EntryKind};
 use crate::fs::{bounded_read, private_dir};
 use crate::ledger::{Ledger, Visibility};
-use crate::repo::{Repo, excluded, hash};
+use crate::repo::{Config, Repo, excluded, hash};
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use rustix::fs::{Mode, OFlags, openat};
@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -125,6 +126,7 @@ pub(crate) struct Snapshot {
     pub documents: Vec<Document>,
     pub digest: String,
     pub chunking: Settings,
+    pub freshness: Option<String>,
 }
 
 impl Snapshot {
@@ -132,43 +134,138 @@ impl Snapshot {
         let config = repo.config()?;
         let ledger = Ledger::read(repo)?;
         let mut documents = memories(repo, &ledger)?;
+        documents.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
+        let mut fingerprint = Freshness::new(&config, &documents)?;
+        let mut sources = Sources::open(repo)?;
         for path in source_files(repo, &config.sources)? {
-            if let Some(text) = read_source(&repo.root, &path)? {
-                let name = path.to_str().context("source path must be UTF-8")?;
-                let markdown = Kind::Source.is_markdown(&path);
-                if !text.trim().is_empty() {
-                    documents.push(Document::new(
-                        Provenance {
-                            id: format!("source:{}", hash(name.as_bytes())),
-                            kind: Kind::Source,
-                            path: name.to_owned(),
-                            timestamp: None,
-                            line_start: None,
-                            line_end: None,
-                            matched_chunk: None,
-                            entry_kind: None,
-                            git: None,
-                            visibility: None,
-                        },
-                        text,
-                        markdown,
-                    ));
+            if let Some(file) = sources.file(&path)? {
+                let meta = file.metadata()?;
+                let stamp = stamp(&meta);
+                if let Some(text) = source_text(&file, &meta, &path)? {
+                    documents.push(source_document(&path, text)?);
                 }
+                // A racing read still gets a content digest. It cannot seed the shortcut.
+                fingerprint.reliable &= stamp == self::stamp(&file.metadata()?);
+                fingerprint.record(&path, Some(stamp));
+            } else {
+                fingerprint.record(&path, None);
             }
         }
         documents.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
-        let mut digest = Sha256::new();
-        digest.update(serde_json::to_vec(&(&config.sources, &config.chunking))?);
-        for doc in &documents {
-            digest.update(serde_json::to_vec(&doc.provenance)?);
-            digest.update(doc.hash.as_bytes());
-        }
+        let mut digest = configuration_digest(&config)?;
+        hash_documents(&mut digest, &documents)?;
         Ok(Self {
             documents,
             digest: format!("{:x}", digest.finalize()),
             chunking: config.chunking,
+            freshness: fingerprint.finish(),
         })
     }
+}
+
+fn hash_documents(digest: &mut Sha256, documents: &[Document]) -> Result<()> {
+    for doc in documents {
+        digest.update(serde_json::to_vec(&doc.provenance)?);
+        digest.update(doc.hash.as_bytes());
+    }
+    Ok(())
+}
+
+fn configuration_digest(config: &Config) -> Result<Sha256> {
+    let mut digest = Sha256::new();
+    digest.update(serde_json::to_vec(&(&config.sources, &config.chunking))?);
+    Ok(digest)
+}
+
+struct Freshness {
+    digest: Sha256,
+    reliable: bool,
+}
+
+impl Freshness {
+    fn new(config: &Config, memories: &[Document]) -> Result<Self> {
+        let mut digest = configuration_digest(config)?;
+        hash_documents(&mut digest, memories)?;
+        digest.update(b"nunc-source-stamps-v1");
+        Ok(Self {
+            digest,
+            reliable: true,
+        })
+    }
+
+    fn record(&mut self, path: &Path, stamp: Option<SourceStamp>) {
+        let path = path.as_os_str().as_bytes();
+        self.digest.update((path.len() as u64).to_le_bytes());
+        self.digest.update(path);
+        if let Some(stamp) = stamp {
+            self.digest.update([1]);
+            self.reliable &= stamp.changed.1 != 0;
+            for field in stamp.fields {
+                self.digest.update(field.to_le_bytes());
+            }
+            for field in [
+                stamp.changed.0,
+                stamp.changed.1,
+                stamp.modified.0,
+                stamp.modified.1,
+            ] {
+                self.digest.update(field.to_le_bytes());
+            }
+        } else {
+            self.digest.update([0]);
+        }
+    }
+
+    fn finish(self) -> Option<String> {
+        self.reliable
+            .then(|| format!("{:x}", self.digest.finalize()))
+    }
+}
+
+pub(crate) fn source_freshness(repo: &Repo, ledger: &Ledger) -> Result<Option<String>> {
+    let config = repo.config()?;
+    let mut memories = memories(repo, ledger)?;
+    memories.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
+    let mut fingerprint = Freshness::new(&config, &memories)?;
+    let mut sources = Sources::open(repo)?;
+    for path in source_files(repo, &config.sources)? {
+        let stamp = sources
+            .file(&path)?
+            .map(|file| file.metadata().map(|metadata| stamp(&metadata)))
+            .transpose()?;
+        fingerprint.record(&path, stamp);
+    }
+    Ok(fingerprint.finish())
+}
+
+pub(crate) fn reference_source(repo: &Repo, path: &Path) -> Result<Option<Document>> {
+    if source_files(repo, &[path.to_path_buf()])?.contains(path)
+        && let Some(file) = Sources::open(repo)?.file(path)?
+        && let Some(text) = source_text(&file, &file.metadata()?, path)?
+    {
+        return Ok(Some(source_document(path, text)?));
+    }
+    Ok(None)
+}
+
+fn source_document(path: &Path, text: String) -> Result<Document> {
+    let name = path.to_str().context("source path must be UTF-8")?;
+    Ok(Document::new(
+        Provenance {
+            id: format!("source:{}", hash(name.as_bytes())),
+            kind: Kind::Source,
+            path: name.to_owned(),
+            timestamp: None,
+            line_start: None,
+            line_end: None,
+            matched_chunk: None,
+            entry_kind: None,
+            git: None,
+            visibility: None,
+        },
+        text,
+        Kind::Source.is_markdown(path),
+    ))
 }
 
 pub(crate) fn memories(repo: &Repo, ledger: &Ledger) -> Result<Vec<Document>> {
@@ -283,44 +380,91 @@ fn source_files(repo: &Repo, roots: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
     Ok(files)
 }
 
-fn read_source(root: &Path, path: &Path) -> Result<Option<String>> {
-    use rustix::io::Errno;
+struct Sources {
+    root: File,
+    parent: Option<(PathBuf, File)>,
+}
 
-    let open = |mut dir: File| -> Result<Option<File>, Errno> {
-        let mut parts = path.components().peekable();
-        while let Some(part) = parts.next() {
-            let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
-            if parts.peek().is_none() {
-                return openat(&dir, part.as_os_str().as_bytes(), flags, Mode::empty())
-                    .map(File::from)
-                    .map(Some);
+impl Sources {
+    fn open(repo: &Repo) -> Result<Self> {
+        Ok(Self {
+            root: File::open(&repo.root)?,
+            parent: None,
+        })
+    }
+
+    fn file(&mut self, path: &Path) -> Result<Option<File>> {
+        const FLAGS: OFlags = OFlags::RDONLY
+            .union(OFlags::CLOEXEC)
+            .union(OFlags::NOFOLLOW)
+            .union(OFlags::NONBLOCK);
+        use rustix::io::Errno;
+
+        let mut open = || -> Result<File, Errno> {
+            let parent = path.parent().ok_or(Errno::INVAL)?;
+            let name = path.file_name().ok_or(Errno::INVAL)?;
+            if !self
+                .parent
+                .as_ref()
+                .is_some_and(|(cached, _)| cached == parent)
+            {
+                self.parent = None;
+                let mut dir = None;
+                for component in parent.components() {
+                    dir = Some(
+                        openat(
+                            dir.as_ref().unwrap_or(&self.root),
+                            component.as_os_str(),
+                            FLAGS | OFlags::DIRECTORY,
+                            Mode::empty(),
+                        )?
+                        .into(),
+                    );
+                }
+                self.parent = dir.map(|dir| (parent.to_path_buf(), dir));
             }
-            dir = openat(
-                &dir,
-                part.as_os_str().as_bytes(),
-                flags | OFlags::DIRECTORY,
-                Mode::empty(),
-            )?
-            .into();
-        }
-        Ok(None)
-    };
-    let read = || -> Result<Option<String>> {
-        let file = match open(File::open(root)?) {
-            Ok(Some(file)) => file,
-            Ok(None) | Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => return Ok(None),
-            Err(err) => return Err(err.into()),
+            let dir = self.parent.as_ref().map_or(&self.root, |(_, dir)| dir);
+            openat(dir, name, FLAGS, Mode::empty()).map(File::from)
         };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > SOURCE_LIMIT as u64 {
-            return Ok(None);
+        match open() {
+            Ok(file) => Ok(Some(file)),
+            Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("read source {}", path.display())),
         }
-        let bytes = bounded_read(file, SOURCE_LIMIT)?;
-        Ok(String::from_utf8(bytes)
-            .ok()
-            .filter(|text| !text.contains('\0')))
-    };
-    read().with_context(|| format!("read source {}", path.display()))
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct SourceStamp {
+    fields: [u64; 6],
+    changed: (i64, i64),
+    modified: (i64, i64),
+}
+
+fn stamp(meta: &fs::Metadata) -> SourceStamp {
+    SourceStamp {
+        fields: [
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mode().into(),
+            meta.uid().into(),
+            meta.gid().into(),
+        ],
+        changed: (meta.ctime(), meta.ctime_nsec()),
+        modified: (meta.mtime(), meta.mtime_nsec()),
+    }
+}
+
+fn source_text(file: &File, metadata: &fs::Metadata, path: &Path) -> Result<Option<String>> {
+    if !metadata.is_file() || metadata.len() > SOURCE_LIMIT as u64 {
+        return Ok(None);
+    }
+    let bytes = bounded_read(file, SOURCE_LIMIT)
+        .with_context(|| format!("read source {}", path.display()))?;
+    Ok(String::from_utf8(bytes)
+        .ok()
+        .filter(|text| !text.contains('\0') && !text.trim().is_empty()))
 }
 
 #[cfg(test)]

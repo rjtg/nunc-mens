@@ -209,3 +209,9 @@ Formatting, Clippy in both feature configurations, all 63 default Rust tests, th
 The profiling-enabled real executable compared a distinct primer, one warm miss, and five exact hits using the pinned model and 1,000-chunk scale fixture. Each measured query returned byte-identical standalone JSON. Cache diagnostics showed two misses followed by five hits. The embedding timer ran only on misses. The opt-in socket test verified that repeated, previously warmed queries immediately respect archive and forget, including after a full rebuild.
 
 Formatting, Clippy in both feature configurations, 66 default Rust tests, the targeted real ONNX socket test and six Python benchmark tests passed. The Rust LSP diagnostics timed out, and the Python language server was unavailable. Cargo and the executable runs verified the changes.
+
+## Source freshness shortcut
+
+The 100,000-chunk comparator confirmed byte-identical exact-file results in semantic, keyword, and hybrid modes. Freshness validation fell from 2.8–3.0 seconds to roughly 0.88 seconds per request. An isolated development journal saved this finding and recovered it first with keyword search for “source metadata byte identical”. [Benchmark](BENCHMARK_SCALE.md#source-freshness-shortcut-at-100000-chunks)
+
+Formatting, Clippy in both build configurations, all 67 default Rust tests, two real ONNX tests for source filtering and search by example, and six Python benchmark tests passed. The freshness regression detects edits with restored mtime, preserves warnings after a metadata-only touch, and checks legacy fallback. Rust diagnostics timed out and the Python language server was unavailable. Cargo and the Python harness verified the touched paths.

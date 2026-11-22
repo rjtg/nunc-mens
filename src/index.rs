@@ -249,14 +249,18 @@ impl<'a> Index<'a> {
     }
 
     pub(crate) fn read(&self, model: Model) -> Result<Option<Reader>> {
-        self.read_mode(model, false)
+        self.read_mode(model, true, false)
     }
 
     pub(crate) fn read_keyword(&self, model: Model) -> Result<Option<Reader>> {
-        self.read_mode(model, true)
+        self.read_mode(model, false, true)
     }
 
-    fn read_mode(&self, model: Model, keyword: bool) -> Result<Option<Reader>> {
+    pub(crate) fn read_hybrid(&self, model: Model) -> Result<Option<Reader>> {
+        self.read_mode(model, true, true)
+    }
+
+    fn read_mode(&self, model: Model, semantic: bool, keyword: bool) -> Result<Option<Reader>> {
         let path = self.path();
         if !existing_private_file(&path)? {
             return Ok(None);
@@ -275,7 +279,8 @@ impl<'a> Index<'a> {
                     has_keyword_schema(&conn)?,
                     "keyword index is absent; run nunc reindex --keyword-only"
                 );
-            } else {
+            }
+            if semantic {
                 ensure!(
                     semantic_ready(&conn)?,
                     "semantic embeddings are pending; run nunc reindex with the model"
@@ -611,6 +616,20 @@ fn store_batch(
 }
 
 impl Reader {
+    pub(crate) fn chunk<T>(
+        &self,
+        id: &str,
+        read: impl FnOnce(IndexedRow<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id,kind,path,timestamp,line_start,line_end,text,vector,parent_id,chunk,section_start,section_end
+             FROM documents WHERE id=?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        let row = rows.next()?.context("ranked chunk missing from index")?;
+        read(IndexedRow { row })
+    }
+
     pub(crate) fn scan_keyword(
         &self,
         kind: Option<Kind>,
@@ -636,8 +655,15 @@ impl Reader {
             "WITH lexical AS MATERIALIZED (
                 SELECT rowid, bm25(chunk_terms) AS quality FROM chunk_terms WHERE chunk_terms MATCH ?1
              ), exact AS MATERIALIZED (
-                SELECT d.rowid FROM documents d WHERE (?2 IS NOT NULL AND d.parent_id=?2)
-                    OR (?3 IS NOT NULL AND d.path=?3)
+                SELECT d.rowid FROM documents d WHERE ?2 IS NOT NULL AND d.parent_id=?2
+                UNION
+                SELECT d.rowid FROM documents d WHERE ?3 IS NOT NULL AND (
+                    d.path=?3 OR (
+                        d.kind='source' AND instr(?3,'/') > 0
+                        AND substr(d.path,-length(?3)-1)='/' || ?3
+                        AND NOT EXISTS (SELECT 1 FROM documents WHERE path=?3)
+                    )
+                )
                 UNION
                 SELECT d.rowid FROM parents p JOIN documents d ON d.parent_id=p.id
                     WHERE ?4 IS NOT NULL AND json_extract(p.origin,'$[1].sha') GLOB ?4

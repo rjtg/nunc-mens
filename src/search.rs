@@ -16,6 +16,7 @@ use std::path::{Component, Path, PathBuf};
 
 mod budget;
 mod example;
+mod fusion;
 pub(crate) mod markdown;
 mod pipeline;
 pub(crate) use budget::{Encoding as BudgetEncoding, Usage as BudgetUsage};
@@ -46,6 +47,7 @@ pub(crate) enum Query<'a> {
 pub(crate) enum Mode {
     Semantic,
     Keyword,
+    Hybrid,
 }
 
 impl Mode {
@@ -53,6 +55,7 @@ impl Mode {
         match self {
             Self::Semantic => "semantic",
             Self::Keyword => "keyword",
+            Self::Hybrid => "hybrid",
         }
     }
 }
@@ -135,6 +138,8 @@ pub(crate) struct Explanation {
     pub bm25: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exact_match: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fusion: Option<fusion::Contribution>,
     pub recency_contribution: f64,
     pub final_score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,15 +152,30 @@ pub(crate) struct Explanation {
 
 impl Explanation {
     pub fn score_summary(&self) -> String {
-        let evidence = if let Some(similarity) = self.similarity {
-            format!("cosine {similarity:.4}")
-        } else {
+        let mut evidence = Vec::new();
+        if let Some(similarity) = self.similarity {
+            evidence.push(format!("cosine {similarity:.4}"));
+        }
+        if let Some(exact) = self.exact_match {
             let lexical = self.bm25.map_or_else(
                 || "metadata match".into(),
                 |score| format!("BM25 {score:.4}"),
             );
-            format!("{lexical}, exact {}", self.exact_match.unwrap_or(false))
-        };
+            evidence.push(format!("{lexical}, exact {exact}"));
+        }
+        if let Some(fusion) = self.fusion {
+            evidence.push(format!(
+                "semantic rank {}, keyword rank {}, RRF {:.4}",
+                fusion
+                    .semantic_rank
+                    .map_or_else(|| "—".into(), |rank| rank.to_string()),
+                fusion
+                    .keyword_rank
+                    .map_or_else(|| "—".into(), |rank| rank.to_string()),
+                fusion.score(),
+            ));
+        }
+        let evidence = evidence.join(", ");
         format!(
             "{evidence}; recency {:.4}; final {:.4}",
             self.recency_contribution, self.final_score
@@ -179,9 +199,115 @@ pub(crate) struct Match {
 struct Ranked {
     hit: Match,
     parent: String,
+    section: Option<Range<usize>>,
+}
+
+struct Candidate {
+    parent: String,
     chunk: String,
     timestamp: Option<DateTime<Utc>>,
-    section: Option<Range<usize>>,
+    visibility: Option<crate::ledger::Visibility>,
+    score: f64,
+    similarity: Option<f64>,
+    bm25: Option<f64>,
+    exact_match: Option<bool>,
+    boost: f64,
+    fusion: Option<fusion::Contribution>,
+}
+
+struct RankKey<'a> {
+    parent: &'a str,
+    chunk: &'a str,
+    timestamp: Option<DateTime<Utc>>,
+    score: f64,
+}
+
+fn rank_position(
+    best: &mut Vec<Candidate>,
+    key: RankKey<'_>,
+    limit: usize,
+    sort: Sort,
+    one_per_parent: bool,
+) -> Option<usize> {
+    let order = |item: &Candidate| {
+        recent_order(sort, item.timestamp, key.timestamp)
+            .then_with(|| compare(item.score, &item.chunk, key.score, key.chunk))
+    };
+    if one_per_parent && let Some(existing) = best.iter().position(|hit| hit.parent == key.parent) {
+        if order(&best[existing]).is_le() {
+            return None;
+        }
+        best.remove(existing);
+    }
+    let offset = best.partition_point(|item| order(item).is_lt());
+    (offset < limit).then_some(offset)
+}
+
+fn insert_ranked(best: &mut Vec<Candidate>, offset: usize, candidate: Candidate, limit: usize) {
+    if best.len() == limit {
+        best.pop();
+    }
+    best.insert(offset, candidate);
+}
+
+fn materialize(
+    reader: &Reader,
+    candidate: Candidate,
+    rank: usize,
+    options: &Options<'_>,
+) -> Result<Ranked> {
+    reader.chunk(&candidate.chunk, |row| {
+        let (mut source, mut text) = row.document()?;
+        if source.kind == Kind::Memory {
+            (source.entry_kind, source.git) = reader.origin(&candidate.parent)?;
+        }
+        source.visibility = candidate.visibility;
+        let matched_text = if options.explain && options.max_tokens.is_none() {
+            text.clone()
+        } else {
+            String::new()
+        };
+        let section = if options.max_tokens.is_some() {
+            text.clear();
+            Some(row.section()?)
+        } else {
+            None
+        };
+        if options.max_tokens.is_none() && !matches!(options.context, ContextMode::Chunk) {
+            let original = reader.parent(&candidate.parent)?;
+            text = match options.context {
+                ContextMode::Section => original
+                    .get(row.section()?)
+                    .context("invalid indexed section")?
+                    .to_owned(),
+                _ => original,
+            };
+        }
+        Ok(Ranked {
+            parent: candidate.parent,
+            section,
+            hit: Match {
+                source,
+                text,
+                score: candidate.score,
+                rank,
+                context_window: None,
+                explanation: options.explain.then_some(Explanation {
+                    similarity: candidate.similarity,
+                    bm25: candidate.bm25,
+                    exact_match: candidate.exact_match,
+                    fusion: candidate.fusion,
+                    recency_contribution: candidate.boost,
+                    final_score: candidate.score,
+                    model: candidate.similarity.map(|_| MODEL),
+                    chunking: reader.strategy,
+                    sort: options.sort,
+                    context: options.context,
+                    matched_text,
+                }),
+            },
+        })
+    })
 }
 
 const MEMORY_PATH: &str = ".nunc/entries";
@@ -313,7 +439,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
     let text_vector = match query {
         Query::Text(text) => {
             ensure!(!text.trim().is_empty(), "search query must be nonblank");
-            if options.mode == Mode::Semantic {
+            if options.mode != Mode::Keyword {
                 Some(LocalModel::load(repo)?.query(text)?)
             } else {
                 None
@@ -339,6 +465,9 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         Mode::Semantic => index
             .read(MODEL)?
             .context("index is absent; run nunc reindex")?,
+        Mode::Hybrid => index
+            .read_hybrid(MODEL)?
+            .context("index is absent; run nunc reindex")?,
         Mode::Keyword => index
             .read_keyword(MODEL)?
             .context("index is absent; run nunc reindex --keyword-only")?,
@@ -363,7 +492,16 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
     let mut counts = options
         .explain
         .then(|| pipeline::RankingCounts::new(one_per_parent));
-    let mut best: Vec<Ranked> = Vec::with_capacity(options.limit);
+    let hybrid = options.mode == Mode::Hybrid;
+    let branch_limit = if hybrid {
+        fusion::limit(options.limit)
+    } else {
+        options.limit
+    };
+    let mut semantic = Vec::new();
+    let mut keyword = Vec::new();
+    let keyword_scope = options.explain.then(pipeline::SourceCounts::default);
+    let mut keyword_eligible = 0;
     let include = |path: &str| {
         let included = filter.includes(path);
         if let Some(counts) = &source_counts {
@@ -372,9 +510,15 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         included
     };
     let mut visit = |row: IndexedRow<'_, '_>, evidence: Evidence<'_>| -> Result<()> {
+        let keyword_branch = matches!(evidence, Evidence::Keyword { .. });
+        let counts = if hybrid && keyword_branch {
+            None
+        } else {
+            counts.as_mut()
+        };
         let parent = row.parent_id()?;
         if reference.as_ref().is_some_and(|source| source.id == parent) {
-            if let Some(counts) = &mut counts {
+            if let Some(counts) = counts {
                 counts.reference += 1;
             }
             return Ok(());
@@ -382,13 +526,13 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         let entry = uuid::Uuid::parse_str(parent).ok();
         let visibility = if let Some(id) = entry {
             if guard.ledger.forgotten(id) {
-                if let Some(counts) = &mut counts {
+                if let Some(counts) = counts {
                     counts.forgotten += 1;
                 }
                 return Ok(());
             }
             if !options.raw && guard.ledger.hidden(&archives, id) {
-                if let Some(counts) = &mut counts {
+                if let Some(counts) = counts {
                     counts.archived += 1;
                 }
                 return Ok(());
@@ -402,7 +546,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         if !options.time.includes(timestamp)
             || (options.neighbor_window.is_some() && timestamp.is_none())
         {
-            if let Some(counts) = &mut counts {
+            if let Some(counts) = counts {
                 counts.temporal += 1;
             }
             return Ok(());
@@ -423,99 +567,119 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
                 (base, None, bm25, Some(exact))
             }
         };
-        if let Some(counts) = &mut counts {
+        if let Some(counts) = counts
+            && !hybrid
+        {
             counts.scored(parent);
         }
-        let boost = recency(timestamp, now, &settings);
-        let score = base + boost;
-        let order = |item: &Ranked| {
-            recent_order(options.sort, item.timestamp, timestamp)
-                .then_with(|| compare(item.hit.score, &item.chunk, score, id))
-        };
-        if one_per_parent && let Some(existing) = best.iter().position(|hit| hit.parent == parent) {
-            if order(&best[existing]).is_le() {
-                return Ok(());
-            }
-            best.remove(existing);
+        if hybrid && keyword_branch {
+            keyword_eligible += 1;
         }
-        let offset = best.partition_point(|item| order(item).is_lt());
-        if offset < options.limit {
-            let (mut source, mut text) = row.document()?;
-            if entry.is_some() {
-                (source.entry_kind, source.git) = reader.origin(parent)?;
-            }
-            source.visibility = visibility;
-            let matched_text = if options.explain && options.max_tokens.is_none() {
-                text.clone()
-            } else {
-                String::new()
-            };
-            let section = if options.max_tokens.is_some() {
-                text.clear();
-                Some(row.section()?)
-            } else {
-                None
-            };
-            if options.max_tokens.is_none() && !matches!(options.context, ContextMode::Chunk) {
-                let original = reader.parent(parent)?;
-                text = match options.context {
-                    ContextMode::Section => original
-                        .get(row.section()?)
-                        .context("invalid indexed section")?
-                        .to_owned(),
-                    _ => original,
-                };
-            }
-            best.insert(
+        let boost = recency(timestamp, now, &settings);
+        let score = if hybrid { base } else { base + boost };
+        let best = if keyword_branch {
+            &mut keyword
+        } else {
+            &mut semantic
+        };
+        let key = RankKey {
+            parent,
+            chunk: id,
+            timestamp,
+            score,
+        };
+        if let Some(offset) = rank_position(
+            best,
+            key,
+            branch_limit,
+            if hybrid { Sort::Semantic } else { options.sort },
+            !hybrid && one_per_parent,
+        ) {
+            insert_ranked(
+                best,
                 offset,
-                Ranked {
+                Candidate {
                     parent: parent.to_owned(),
                     chunk: id.to_owned(),
                     timestamp,
-                    section,
-                    hit: Match {
-                        source,
-                        text,
-                        score,
-                        rank: 0,
-                        context_window: None,
-                        explanation: options.explain.then_some(Explanation {
-                            similarity,
-                            bm25,
-                            exact_match,
-                            recency_contribution: boost,
-                            final_score: score,
-                            model: similarity.map(|_| MODEL),
-                            chunking: reader.strategy,
-                            sort: options.sort,
-                            context: options.context,
-                            matched_text,
-                        }),
-                    },
+                    visibility,
+                    score,
+                    similarity,
+                    bm25,
+                    exact_match,
+                    boost,
+                    fusion: None,
                 },
+                branch_limit,
             );
-            if best.len() > options.limit {
-                best.pop();
-            }
         }
         Ok(())
     };
-    match options.mode {
-        Mode::Semantic => reader.scan(filter.kind, include, |row, vector| {
+    if options.mode != Mode::Keyword {
+        reader.scan(filter.kind, include, |row, vector| {
             visit(row, Evidence::Vector(vector))
-        })?,
-        Mode::Keyword => {
-            let Query::Text(text) = query else {
-                anyhow::bail!("keyword mode requires a text query")
+        })?;
+    }
+    if options.mode != Mode::Semantic {
+        let Query::Text(text) = query else {
+            anyhow::bail!("keyword and hybrid modes require a text query")
+        };
+        reader.scan_keyword(
+            filter.kind,
+            text,
+            |path| {
+                if hybrid {
+                    let included = filter.includes(path);
+                    if let Some(counts) = &keyword_scope {
+                        counts.check(included);
+                    }
+                    included
+                } else {
+                    include(path)
+                }
+            },
+            |row, bm25, exact| visit(row, Evidence::Keyword { bm25, exact }),
+        )?;
+    }
+    let mut fusion_counts = None;
+    let candidates = if hybrid {
+        fusion_counts = keyword_scope.map(|scope| {
+            pipeline::FusionCounts::new(
+                branch_limit,
+                semantic.len(),
+                keyword.len(),
+                scope,
+                keyword_eligible,
+            )
+        });
+        let mut best = Vec::new();
+        for candidate in fusion::combine(semantic, keyword) {
+            if let Some(counts) = &mut counts {
+                counts.scored(&candidate.parent);
+            }
+            let key = RankKey {
+                parent: &candidate.parent,
+                chunk: &candidate.chunk,
+                timestamp: candidate.timestamp,
+                score: candidate.score,
             };
-            reader.scan_keyword(filter.kind, text, include, |row, bm25, exact| {
-                visit(row, Evidence::Keyword { bm25, exact })
-            })?;
+            if let Some(offset) =
+                rank_position(&mut best, key, options.limit, options.sort, one_per_parent)
+            {
+                insert_ranked(&mut best, offset, candidate, options.limit);
+            }
         }
-    }
-    for (offset, item) in best.iter_mut().enumerate() {
-        item.hit.rank = offset + 1;
-    }
+        best
+    } else if options.mode == Mode::Keyword {
+        keyword
+    } else {
+        semantic
+    };
+    let best = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(offset, candidate)| materialize(&reader, candidate, offset + 1, &options))
+        .collect::<Result<Vec<_>>>()?;
     let before_budget = best.len();
     let (results, budget) = match options.max_tokens {
         Some(limit) => {
@@ -540,7 +704,14 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         Ok(snapshot_digest) if snapshot_digest == digest => ("current", None),
         Ok(_) => (
             "stale",
-            Some("Index needs refresh; run nunc reindex or wait for nunc serve".to_owned()),
+            Some(
+                if options.mode == Mode::Keyword {
+                    "Index needs refresh; run nunc reindex --keyword-only or wait for nunc serve"
+                } else {
+                    "Index needs refresh; run nunc reindex or wait for nunc serve"
+                }
+                .to_owned(),
+            ),
         ),
         Err(error) => (
             "unknown",
@@ -571,14 +742,16 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         None
     };
     let pipeline = counts.zip(source_counts).map(|(counts, source)| {
-        counts.finish(
-            source,
-            options.mode,
-            freshness,
-            options.limit,
-            before_budget,
-            results.len(),
-        )
+        counts
+            .finish(
+                source,
+                options.mode,
+                freshness,
+                options.limit,
+                before_budget,
+                results.len(),
+            )
+            .with_fusion(fusion_counts)
     });
     Ok(Results {
         mode_used: options.mode.name(),

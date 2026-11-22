@@ -379,8 +379,6 @@ mod tests {
                 context_window: None,
             },
             parent: parent.into(),
-            chunk: format!("chunk-{parent}"),
-            timestamp: None,
             section: Some(0..body.len()),
         }
     }

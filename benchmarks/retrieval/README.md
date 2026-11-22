@@ -36,3 +36,16 @@ First-pass timing starts after index construction, with a fresh CLI process for 
 The [report](../../docs/BENCHMARK_QMD.md) gives the recorded results. Render the full category tables with `python3 -B benchmarks/retrieval/summarize.py benchmarks/retrieval/results/sparrow-v1.jsonl.gz`. Pass `--query-file benchmarks/retrieval/queries-technical.json --rounds 1 --case nunc-default --case qmd-lexical --case qmd-vector --case qmd-hybrid` in a separate scratch directory to reproduce the supplemental exact-flag probe.
 
 Use a nunc binary with `search --max-tokens` for the budget comparison. Pass `--case nunc-parent --case nunc-parent-800 --case nunc-parent-2000 --query long-cursor --query long-broken-manifest --query long-metrics` to the same runner. These optional modes preserve the original QMD matrix defaults.
+
+For a local comparison of all nunc retrieval modes, select cases explicitly and omit the QMD arguments:
+
+```sh
+scratch=$(mktemp -d)
+python3 -B benchmarks/retrieval/benchmark.py \
+  --root "$scratch/fixture" --output "$scratch/modes.jsonl" \
+  --nunc target/release/nunc --nunc-cache "$NUNC_MODEL_CACHE_DIR" \
+  --case nunc-default --case nunc-keyword --case nunc-hybrid --case nunc-keyword-offline
+python3 -B benchmarks/retrieval/summarize.py "$scratch/modes.jsonl"
+```
+
+The first three cases use the same database and tokenizer-based chunks. The offline case uses a separate database, an absent cache, and `reindex --keyword-only`. For the supplemental flag query, use a fresh scratch path and add `--query-file benchmarks/retrieval/queries-technical.json --rounds 1`.

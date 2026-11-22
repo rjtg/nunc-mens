@@ -30,7 +30,12 @@ BUDGET_CASES = {
     "nunc-parent-800": ["--context", "parent", "--max-tokens", "800"],
     "nunc-parent-2000": ["--context", "parent", "--max-tokens", "2000"],
 }
-NUNC_OPTIONS = {**NUNC_CASES, **BUDGET_CASES}
+MODE_CASES = {
+    "nunc-keyword": ["--mode", "keyword"],
+    "nunc-hybrid": ["--mode", "hybrid"],
+    "nunc-keyword-offline": ["--mode", "keyword"],
+}
+NUNC_OPTIONS = {**NUNC_CASES, **BUDGET_CASES, **MODE_CASES}
 QMD_CASES = (
     "qmd-lexical", "qmd-vector", "qmd-hybrid", "qmd-hybrid-reranked", "qmd-default",
 )
@@ -123,9 +128,15 @@ def qmd_env(args, state):
 
 
 def nunc_index(case, args, fixture, emit):
-    layout = case if case in ("nunc-semantic-chunks", "nunc-small-chunks") else "nunc-default"
+    offline = case == "nunc-keyword-offline"
+    alternate_layouts = ("nunc-semantic-chunks", "nunc-small-chunks", "nunc-keyword-offline")
+    layout = case if case in alternate_layouts else "nunc-default"
     state = fixture / f"state-{layout}"
     env = nunc_env(args, fixture, state)
+    reindex = [args.nunc, "reindex"]
+    if offline:
+        env["NUNC_MODEL_CACHE_DIR"] = str(fixture / "unused-model-cache")
+        reindex.append("--keyword-only")
     repo = fixture / "repo"
     config = repo / ".nunc/config.toml"
     strategy = "semantic" if layout == "nunc-semantic-chunks" else "structural"
@@ -135,12 +146,12 @@ def nunc_index(case, args, fixture, emit):
         encoding="utf-8",
     )
     if not state.exists():
-        invoke_record("full", layout, [args.nunc, "reindex", "--full"], repo, env, state, emit)
+        invoke_record("full", layout, [*reindex, "--full"], repo, env, state, emit)
         target = repo / "docs/design/agent-context.md"
         with change_doc(target):
-            invoke_record("incremental", layout, [args.nunc, "reindex"], repo, env, state, emit)
+            invoke_record("incremental", layout, reindex, repo, env, state, emit)
         # Restore the original definition before any judged queries execute.
-        measure([args.nunc, "reindex"], repo, env)
+        measure(reindex, repo, env)
     return env
 
 
@@ -279,8 +290,8 @@ def main():
     parser.add_argument("--output", required=True, type=Path, help="new JSONL results file")
     parser.add_argument("--nunc", required=True, type=Path)
     parser.add_argument("--nunc-cache", required=True, type=Path)
-    parser.add_argument("--qmd", required=True, type=Path)
-    parser.add_argument("--qmd-embed-model", required=True, type=Path)
+    parser.add_argument("--qmd", type=Path)
+    parser.add_argument("--qmd-embed-model", type=Path)
     parser.add_argument("--qmd-rerank-model", type=Path)
     parser.add_argument("--qmd-generate-model", type=Path)
     parser.add_argument("--rounds", type=int, default=2)
@@ -294,8 +305,6 @@ def main():
             setattr(args, name, value.absolute())
     if args.rounds < 1 or platform.system() != "Linux":
         parser.error("at least one round and a Linux host are required")
-    if digest(args.qmd_embed_model) != QMD_MODEL_SHA256:
-        parser.error("QMD embedding model checksum differs from the pinned benchmark model")
     if args.qmd_generate_model and not args.qmd_rerank_model:
         parser.error("the full QMD default also needs a local reranker model")
     cases = args.case or [*NUNC_CASES, *QMD_CASES[:3]]
@@ -308,6 +317,12 @@ def main():
         parser.error("qmd-hybrid-reranked needs --qmd-rerank-model")
     if "qmd-default" in cases and not args.qmd_generate_model:
         parser.error("qmd-default needs --qmd-generate-model and --qmd-rerank-model")
+    uses_qmd = any(case in QMD_CASES for case in cases)
+    if uses_qmd:
+        if not args.qmd or not args.qmd_embed_model:
+            parser.error("QMD cases require --qmd and --qmd-embed-model")
+        if digest(args.qmd_embed_model) != QMD_MODEL_SHA256:
+            parser.error("QMD embedding model checksum differs from the pinned benchmark model")
     queries = read_json(args.query_file)["queries"]
     if args.query:
         if set(args.query) - {query["id"] for query in queries}:
@@ -317,7 +332,9 @@ def main():
         def emit(row):
             # Record pasteable commands while removing machine-specific scratch paths.
             if "command" in row:
-                substitutions = [(str(args.root), "$FIXTURE"), (str(args.nunc), "nunc"), (str(args.qmd), "qmd")]
+                substitutions = [(str(args.root), "$FIXTURE"), (str(args.nunc), "nunc")]
+                if uses_qmd:
+                    substitutions.append((str(args.qmd), "qmd"))
                 row["command"] = [
                     substitute(argument, substitutions) for argument in map(str, row["command"])
                 ]
@@ -329,11 +346,14 @@ def main():
             print(json.dumps(row, ensure_ascii=False), file=out, flush=True)
 
         prepare(args.root, str(args.nunc))
+        binaries = {"nunc": args.nunc}
+        if uses_qmd:
+            binaries["qmd"] = args.qmd
         versions = {
             name: measure([binary, "--version"], args.root, os.environ)[0].decode().strip()
-            for name, binary in (("nunc", args.nunc), ("qmd", args.qmd))
+            for name, binary in binaries.items()
         }
-        if versions["qmd"] != "qmd 2.9.0 (aa247d0)":
+        if uses_qmd and versions["qmd"] != "qmd 2.9.0 (aa247d0)":
             parser.error("expected pinned QMD 2.9.0")
         emit({
             "record": "metadata", "versions": versions, "cases": cases, "rounds": args.rounds,
@@ -341,7 +361,7 @@ def main():
             "nunc_binary_sha256": digest(args.nunc),
             "corpus_sha256": digest(HERE / "corpus.json"), "queries_sha256": digest(args.query_file),
             "query_ids": [query["id"] for query in queries],
-            "qmd_embed_sha256": QMD_MODEL_SHA256,
+            "qmd_embed_sha256": QMD_MODEL_SHA256 if uses_qmd else None,
             "qmd_rerank_sha256": digest(args.qmd_rerank_model) if args.qmd_rerank_model else None,
             "qmd_generate_sha256": digest(args.qmd_generate_model) if args.qmd_generate_model else None,
         })

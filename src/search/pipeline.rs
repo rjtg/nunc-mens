@@ -59,17 +59,22 @@ impl RankingCounts {
         let ranked = self.parents.as_ref().map_or(self.scored, HashSet::len);
         Diagnostics {
             mode: mode.name(),
-            semantic: if mode == Mode::Semantic {
+            semantic: if mode != Mode::Keyword {
                 "applied"
             } else {
                 "skipped"
             },
-            keyword: if mode == Mode::Keyword {
+            keyword: if mode != Mode::Semantic {
                 "applied"
             } else {
                 "skipped"
             },
-            fusion: "unavailable",
+            fusion: if mode == Mode::Hybrid {
+                "applied"
+            } else {
+                "skipped"
+            },
+            fusion_counts: None,
             reranker: "unavailable",
             exact: true,
             index_freshness,
@@ -97,11 +102,42 @@ impl RankingCounts {
 }
 
 #[derive(Serialize)]
+pub(super) struct FusionCounts {
+    branch_limit: usize,
+    semantic_candidates: usize,
+    keyword_candidates: usize,
+    keyword_chunks_after_type_scope: usize,
+    keyword_chunks_after_source_filter: usize,
+    eligible_keyword_chunks: usize,
+}
+
+impl FusionCounts {
+    pub fn new(
+        branch_limit: usize,
+        semantic_candidates: usize,
+        keyword_candidates: usize,
+        keyword_scope: SourceCounts,
+        eligible_keyword_chunks: usize,
+    ) -> Self {
+        Self {
+            branch_limit,
+            semantic_candidates,
+            keyword_candidates,
+            keyword_chunks_after_type_scope: keyword_scope.checked.get(),
+            keyword_chunks_after_source_filter: keyword_scope.passed.get(),
+            eligible_keyword_chunks,
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub(crate) struct Diagnostics {
     mode: &'static str,
     semantic: &'static str,
     keyword: &'static str,
     fusion: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fusion_counts: Option<FusionCounts>,
     reranker: &'static str,
     exact: bool,
     index_freshness: &'static str,
@@ -123,11 +159,21 @@ pub(crate) struct Diagnostics {
 }
 
 impl Diagnostics {
+    pub(super) fn with_fusion(mut self, counts: Option<FusionCounts>) -> Self {
+        self.fusion_counts = counts;
+        self
+    }
+
     pub fn write(&self, out: &mut impl Write) -> io::Result<()> {
         writeln!(
             out,
             "nunc: {} retrieval, index {}",
             self.mode, self.index_freshness
+        )?;
+        writeln!(
+            out,
+            "  Stages: semantic {}, keyword {}, fusion {}, reranker {}",
+            self.semantic, self.keyword, self.fusion, self.reranker
         )?;
         writeln!(
             out,
@@ -142,6 +188,16 @@ impl Diagnostics {
             self.excluded_forgotten_chunks,
             self.excluded_temporal_chunks
         )?;
+        if let Some(fusion) = &self.fusion_counts {
+            writeln!(
+                out,
+                "  Fusion: {} semantic and {} keyword chunks retained (up to {} per branch, {} eligible keyword chunks)",
+                fusion.semantic_candidates,
+                fusion.keyword_candidates,
+                fusion.branch_limit,
+                fusion.eligible_keyword_chunks,
+            )?;
+        }
         writeln!(
             out,
             "  Ranking by {}: {} considered, {} chunks deduplicated, {} beyond limit {}, {} omitted by budget, {} returned",

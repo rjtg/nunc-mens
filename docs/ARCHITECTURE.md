@@ -32,6 +32,8 @@ An incremental refresh reuses unchanged embeddings, updates metadata, and delete
 
 Normal and keyword-only refreshes create an FTS5 external-content table over the shared chunk rows. The additive migration backfills terms in one transaction without regenerating existing vectors. SQLite triggers reconcile terms when chunk rows are inserted, edited, or removed. Keyword scoring uses native BM25 and literal text or provenance matches before the shared visibility, ranking and context path. A keyword-only refresh can construct new structural layouts with a UTF-8 byte budget. Those layouts have their own versioned settings key. If the resulting snapshot needs embeddings or canonical layouts, a readiness flag prevents incomplete semantic retrieval until a regular refresh.
 
+Hybrid search retains bounded cosine and FTS5 lists under the same read lock and durable visibility view. It combines the lists by chunk ID using normalized reciprocal rank fusion, then applies the optional recency adjustment, sort, deduplication and budget. All three modes load full provenance and any requested context only for their final ranked candidates.
+
 ## Embeddings
 
 FastEmbed 5.15.0 runs `intfloat/multilingual-e5-small` at revision `614241f622f53c4eeff9890bdc4f31cfecc418b3` with CPU ONNX Runtime 1.24, mean pooling, and the model's `query: ` and `passage: ` prefixes. The explicit HTTPS downloader verifies artifact sizes and the weights/tokenizer checksums, probes inference, and atomically publishes the revision directory. Inference initializes from local files and sends no project text over the network.

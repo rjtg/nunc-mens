@@ -16,7 +16,7 @@
 | `nunc unarchive ID... [--dry-run] [--json]` | Restores manually archived memories. |
 | `nunc forget ID... [--dry-run\|--yes] [--json]` | Deletes only the specified entries after warning about dependencies. |
 | `nunc reindex [--full] [--keyword-only] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
-| `nunc search [QUERY...\|--similar-to ID_OR_FILE] [--mode semantic\|keyword] [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Searches by text or example, or lists original events for a time filter. |
+| `nunc search [QUERY...\|--similar-to ID_OR_FILE] [--mode semantic\|keyword\|hybrid] [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Searches by text or example, or lists original events for a time filter. |
 | `nunc timeline [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--group-by day\|topic] [--entry-kind KIND] [--around ID --window DURATION] [--json\|--ids] [--raw]` | Lists recorded activity or finds neighboring records around a known ID. |
 | `nunc topics [--yesterday\|--since DURATION\|--around ID --window DURATION] [--threshold N] [--json\|--ids] [--raw]` | Groups recorded activity using existing indexed embeddings. |
 | `nunc models download` | Explicitly downloads and validates the pinned model and tokenizer. |
@@ -56,7 +56,18 @@ nunc search --mode keyword -- --summary-stdin
 
 Semantic search remains the default. Keyword search uses SQLite FTS5 and needs a text query. Run either kind of reindex once to prepare keyword search for an older database. `--keyword-only` uses existing compatible layouts and vectors when available. For new or edited documents it uses structural chunking with an approximate UTF-8 byte budget and can leave semantic indexing pending. A regular reindex restores the configured model-based layout and fills missing vectors. Chunk IDs are preserved wherever the actual chunk text stays identical.
 
-Keyword queries treat input as literal text. Multiword queries match any indexed term. A single path-like or flag-like argument searches the sequence of its terms and promotes literal matches when present. A single indexed relative path, memory UUID, or Git SHA (including prefixes of at least seven hex digits) can match provenance directly. Exact matches score one point plus the normalized BM25 contribution. The contribution is `-bm25 / (1 - bm25)` for SQLite's negative BM25 and zero without a lexical match. Recency contributes separately when requested. Keyword explanations report `exact_match`, `bm25` when scored by FTS5, and the final score.
+Keyword queries treat input as literal text. Multiword queries match any indexed term. A single path-like or flag-like argument searches the sequence of its terms and promotes literal matches when present. A single indexed relative path, memory UUID, or Git SHA (including prefixes of at least seven hex digits) can match provenance directly. A path with multiple components can also match the end of an indexed source path when there is no full path match. Exact matches score one point plus the normalized BM25 contribution. The contribution is `-bm25 / (1 - bm25)` for SQLite's negative BM25 and zero without a lexical match. Recency contributes separately when requested. Keyword explanations report `exact_match`, `bm25` when scored by FTS5, and the final score.
+
+### Hybrid search
+
+```sh
+nunc reindex
+nunc search --mode hybrid 'SQLite writer lock' --explain --json
+```
+
+Hybrid uses a text query, the cached embedding model, and a regular reindex to prepare both branches. Each independently retains up to `max(100, 2 × limit)` filtered chunks, in score order with chunk ID as the tiebreaker. Reciprocal rank fusion uses `k = 60`. Each present branch contributes `61 / (2 × (60 + rank))`, so two first-place ranks produce 1. The optional recency contribution is one quarter of the configured semantic contribution, capped at 0.05. It applies after fusion. `--sort recent` orders the fused shortlist by original time, and relevance or recency ties use the chunk ID. Parent deduplication when requested and output budgets apply after fusion, so repeated chunks can crowd a shortlist. Normal and raw visibility work across both branches.
+
+`--explain --json` exposes branch ranks and contributions under `fusion`, cosine and native BM25 when available, and the final score. A chunk can qualify through one branch. Branch evidence appears only when the chunk ranked in that branch, and a keyword provenance hit can lack BM25. Semantic search by example remains available through `--similar-to`.
 
 ### Ranked IDs for shell pipelines
 
@@ -82,9 +93,9 @@ Paths are relative to the worktree root, even from a subdirectory. A directory p
 Choose paths inside a registered source. Absolute paths, parent traversal, symlinks, special files and directories passed to `--source-file` are rejected. An existing empty directory yields no results. A deleted path remains usable while matching rows exist in the stale index, with a freshness warning. Once reindex removes those rows, that missing path produces an error.
 
 - `--context chunk` returns the matched slice and is the default. `section` returns its enclosing Markdown section up to the next heading. `parent` returns the original full note body or source file. For plain text, section context is the full file. These options change the returned text while ranking the same chunks.
-- `--sort semantic` orders by the final similarity score. `--sort recent` uses the original timestamp first, then score, with undated sources last. Exact ties use the stable chunk ID.
+- `--sort semantic` orders by the selected mode's final relevance score. `--sort recent` uses the original timestamp first, then score, with undated sources last. Exact ties use the stable chunk ID.
 - `--recency-boost` enables a maximum contribution of 0.05. Specify `--recency-boost=0.1` for a different maximum, with 0 disabling it and 0.2 as the limit. The contribution is `maximum × 2^(-age_days / half_life_days)`, with a default half-life of 90 days. Future timestamps are treated as age zero. Missing timestamps contribute zero. The final score is cosine plus the contribution and can exceed 1.
-- `--explain` exposes the matched text, provenance, model ID/revision/dimensions, chunk strategy, context, sort, cosine, recency contribution and final score. The CLI takes one reference time per search.
+- `--explain` exposes the matched text, provenance, chunk strategy, context, sort, recency contribution and final score. Semantic evidence includes cosine and the model ID, revision and dimensions. The CLI takes one reference time per search.
 - `--raw` includes archived and undone memories. Forgotten entries are excluded in every context.
 
 `--json` returns `mode_used`, `repo_id`, `warnings` and `results`. The original hit fields are retained. `matched_chunk` adds its ID, parent ID, chunk and parent SHA-256, heading hierarchy, one-based inclusive lines and zero-based half-open byte range. Memory locations are relative to the body after front matter. Memory rows keep their parent UUID as `id`. Git results include original commit provenance under `git` and `entry_kind: "git-commit"`. Memory rows expose status, optional archive target and originating source IDs. Search reports stale or unverifiable snapshots in `warnings`.
@@ -98,7 +109,7 @@ nunc search "SQLite lock" --since 7d --limit 10 --max-tokens 1000 --explain --js
 
 With `--explain`, console and Markdown pipeline diagnostics go to stderr. JSON adds a `pipeline` object with the retrieval mode, stage availability, index freshness and exact counts from the current scan. Counts start with indexed chunks in the selected type scope. The source filter runs first, followed by reference exclusion, ledger visibility and time filtering. After scoring, the report identifies the ranking unit, the count removed by parent deduplication, the count beyond the top-K limit, and budget omissions. Stage exclusions count chunks. Limit and budget counts use the named ranking unit.
 
-Compare the type-scope and source-filter counts to diagnose path scope. In keyword mode, the type-scope count starts at FTS5 and literal provenance matches in that type. Compare the scored, ranked, and returned counts to distinguish limits from budget omissions. A stale index can omit durable entries that the scan never saw. Use `nunc doctor --deep` or `nunc reindex` to check freshness. Diagnostics report aggregate counts for examined rows and never expose forgotten text or IDs. The report identifies the keyword or embedding stage used and the inactive stages.
+Compare the type-scope and source-filter counts to diagnose path scope. In keyword mode, the type-scope count starts at FTS5 and literal provenance matches in that type. In hybrid mode, the top-level filter counts describe the semantic scan, `fusion_counts` describes keyword scope and both shortlists, and `scored_chunks` counts distinct fused chunks. Compare the scored, ranked, and returned counts to distinguish limits from budget omissions. A stale index can omit durable entries that the scan never saw. Use `nunc doctor --deep` or `nunc reindex` to check freshness. Diagnostics report aggregate counts for examined rows and keep forgotten text and IDs private.
 
 ### Context budget
 

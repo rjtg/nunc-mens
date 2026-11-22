@@ -855,6 +855,12 @@ fn keyword_search_builds_and_updates_without_a_model() -> Result<()> {
     let fixture = Fixture::new()?;
     let note = fixture.log_id("# SQLite writer\n\nWriterLock reports SQLITE_BUSY. Pass --summary-stdin.\n\n## Cleanup\n\nRetain a backup.")?;
     let other = fixture.log_id("The summary stdin option reads from a pipe.")?;
+    let missing = fixture
+        .nunc(&["search", "--mode", "hybrid", "WriterLock", "--json"])
+        .output()?;
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8(missing.stderr)?.contains("model unavailable"));
     fs::create_dir_all(fixture.repo.join("docs/design"))?;
     fs::write(
         fixture.repo.join("docs/design/sqlite.md"),
@@ -897,10 +903,10 @@ fn keyword_search_builds_and_updates_without_a_model() -> Result<()> {
             .as_f64()
             .is_some_and(|bm25| bm25 < 0.0)
     );
-    assert_eq!(
-        search("docs/design/sqlite.md")?["results"][0]["path"],
-        "docs/design/sqlite.md"
-    );
+    for path in ["docs/design/sqlite.md", "design/sqlite.md"] {
+        assert_eq!(search(path)?["results"][0]["path"], "docs/design/sqlite.md");
+    }
+    assert_eq!(search("esign/sqlite.md")?["results"], serde_json::json!([]));
     for query in [&commit[..12], &commit] {
         assert_eq!(search(query)?["results"][0]["git"]["sha"], commit);
     }
@@ -918,7 +924,9 @@ fn keyword_search_builds_and_updates_without_a_model() -> Result<()> {
     ])?;
     assert!(String::from_utf8(format.stdout)?.contains("SQLITE_BUSY"));
     fixture.run(&["archive", &note])?;
-    assert_eq!(search("SQLITE_BUSY")?["results"], serde_json::json!([]));
+    let hidden = search("SQLITE_BUSY")?;
+    assert_eq!(hidden["results"], serde_json::json!([]));
+    assert_eq!(hidden["pipeline"]["excluded_archived_or_undone_chunks"], 1);
     let raw = fixture.json(&[
         "search",
         "--mode",
@@ -934,6 +942,11 @@ fn keyword_search_builds_and_updates_without_a_model() -> Result<()> {
     assert_eq!(search("SQLITE_BUSY")?["results"], serde_json::json!([]));
     let surviving = search("summary stdin")?;
     assert_eq!(surviving["results"][0]["id"], other);
+    let summary = fixture.summary(&other, "Stdin summary input contract.")?;
+    fixture.run(&["reindex", "--keyword-only"])?;
+    assert_eq!(search("summary stdin")?["results"][0]["id"], summary);
+    fixture.run(&["consolidate", "undo", &summary])?;
+    assert_eq!(search("summary stdin")?["results"][0]["id"], other);
     fs::remove_file(fixture.repo.join("docs/design/sqlite.md"))?;
     fixture.run(&["reindex", "--keyword-only"])?;
     assert_eq!(
@@ -952,6 +965,7 @@ fn keyword_search_builds_and_updates_without_a_model() -> Result<()> {
 fn keyword_index_upgrades_to_shared_semantic_chunks() -> Result<()> {
     let fixture = Fixture::new()?;
     let note = fixture.log_id("# Transactions\n\nWriterLock guards SQLite commit publication.")?;
+    let other = fixture.log_id("Concurrent database commits must serialize.")?;
     fixture.run(&["reindex", "--keyword-only"])?;
     let cache = real_model_cache()?;
     let run = |args: &[&str]| {
@@ -970,11 +984,73 @@ fn keyword_index_upgrades_to_shared_semantic_chunks() -> Result<()> {
         &checked(run(&["search", "serializing database commits", "--json"])?)?.stdout,
     )?;
     assert_eq!(lexical["results"][0]["id"], note);
-    assert_eq!(semantic["results"][0]["id"], note);
+    let semantic_note = semantic["results"]
+        .as_array()
+        .and_then(|results| results.iter().find(|hit| hit["id"] == note))
+        .context("semantic search omitted the keyword hit")?;
     assert!(lexical["results"][0]["matched_chunk"]["id"].is_string());
     assert_eq!(
         lexical["results"][0]["matched_chunk"]["id"],
-        semantic["results"][0]["matched_chunk"]["id"]
+        semantic_note["matched_chunk"]["id"]
+    );
+    let hybrid = |extra: &[&str]| -> Result<Value> {
+        let mut args = vec![
+            "search",
+            "--mode",
+            "hybrid",
+            "WriterLock",
+            "--explain",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        Ok(serde_json::from_slice(&checked(run(&args)?)?.stdout)?)
+    };
+    let mixed = hybrid(&[])?;
+    assert_eq!(mixed["mode_used"], "hybrid");
+    assert_eq!(mixed["pipeline"]["fusion"], "applied");
+    assert_eq!(mixed["pipeline"]["fusion_counts"]["keyword_candidates"], 1);
+    assert_eq!(mixed["results"][0]["id"], note);
+    let explanation = &mixed["results"][0]["explanation"];
+    let fusion = &explanation["fusion"];
+    assert_eq!(fusion["keyword_rank"], 1);
+    let native_sum = fusion["keyword_contribution"]
+        .as_f64()
+        .context("missing BM25 contribution")?
+        + fusion["semantic_contribution"]
+            .as_f64()
+            .context("missing cosine contribution")?;
+    let score = explanation["final_score"]
+        .as_f64()
+        .context("missing score")?;
+    assert!((score - native_sum).abs() < 1e-12);
+    assert_eq!(mixed["results"][1]["id"], other);
+    assert!(mixed["results"][1]["explanation"].get("bm25").is_none());
+    assert_eq!(mixed, hybrid(&[])?);
+    let budgeted = hybrid(&[
+        "--source",
+        ".nunc/entries",
+        "--limit",
+        "1",
+        "--max-tokens",
+        "1",
+    ])?;
+    assert_eq!(budgeted["results"], serde_json::json!([]));
+    assert_eq!(budgeted["pipeline"]["omitted_by_budget"], 1);
+    assert_eq!(budgeted["pipeline"]["beyond_limit"], 1);
+    let empty = hybrid(&["--type", "source"])?;
+    assert_eq!(empty["results"], serde_json::json!([]));
+    assert_eq!(empty["pipeline"]["fusion_counts"]["semantic_candidates"], 0);
+    assert_eq!(empty["pipeline"]["fusion_counts"]["keyword_candidates"], 0);
+    fixture.run(&["archive", &note])?;
+    let hidden = hybrid(&[])?;
+    assert_eq!(hidden["results"][0]["id"], other);
+    assert_eq!(hidden["pipeline"]["excluded_archived_or_undone_chunks"], 1);
+    assert_eq!(hybrid(&["--raw"])?["results"][0]["id"], note);
+    fixture.run(&["forget", &note, "--yes"])?;
+    checked(run(&["reindex", "--full"])?)?;
+    assert_eq!(
+        hybrid(&["--raw"])?["results"].as_array().map(Vec::len),
+        Some(1)
     );
     Ok(())
 }

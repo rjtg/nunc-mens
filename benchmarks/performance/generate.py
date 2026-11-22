@@ -41,12 +41,17 @@ def generate(repo, count, unique):
     queries = []
     for index, (folder, _, _, query, _) in enumerate(TOPICS[:count]):
         exact = f"docs/{folder}/note-{index:06d}.md"
-        for kind, flags in (
-            ("unfiltered", []),
-            ("directory", ["--source", f"docs/{folder}"]),
-            ("file", ["--source-file", exact]),
-        ):
-            queries.append({"query": query, "filter": kind, "args": flags})
+        prompts = (("concept", query), ("identifier", f"SPW-{index:06d}"))
+        for query_kind, prompt in prompts:
+            for filter_kind, flags in (
+                ("unfiltered", []),
+                ("directory", ["--source", f"docs/{folder}"]),
+                ("file", ["--source-file", exact]),
+            ):
+                queries.append({
+                    "query": prompt, "query_kind": query_kind,
+                    "filter": filter_kind, "args": flags,
+                })
     (repo / "queries.json").write_text(json.dumps(queries, indent=2) + "\n", encoding="utf-8")
 
 

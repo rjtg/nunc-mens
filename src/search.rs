@@ -15,6 +15,7 @@ use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
 mod budget;
+mod example;
 pub(crate) mod markdown;
 pub(crate) use budget::{Encoding as BudgetEncoding, Usage as BudgetUsage};
 
@@ -28,6 +29,14 @@ pub(crate) struct Results {
     pub budget: Option<budget::Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temporal_context: Option<NeighborReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<example::Reference>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Query<'a> {
+    Text(&'a str),
+    Example(&'a str),
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
@@ -240,8 +249,7 @@ pub(crate) fn dated(repo: &Repo, options: &Options<'_>) -> Result<Vec<DatedEvent
     timeline::events(repo, &guard.ledger, options.raw, options.time, None)
 }
 
-pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<Results> {
-    ensure!(!query.trim().is_empty(), "search query must be nonblank");
+pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Result<Results> {
     let config = repo.config()?;
     let filter = Filter::new(repo, &config.sources, &options)?;
     let mut settings = config.search;
@@ -250,22 +258,47 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
     }
     settings.validate()?;
     let now = Utc::now();
-    let mut model = LocalModel::load(repo)?;
-    let query = model.query(query)?;
-    let query_norm = vectors::norm(&query, MODEL.dimensions)?;
-    drop(model);
+    let text_vector = match query {
+        Query::Text(text) => {
+            ensure!(!text.trim().is_empty(), "search query must be nonblank");
+            Some(LocalModel::load(repo)?.query(text)?)
+        }
+        Query::Example(_) => None,
+    };
     let guard = Guard::acquire(repo, false)?;
     let archives = guard.ledger.archives()?;
+    let example = match query {
+        Query::Text(_) => None,
+        Query::Example(value) => Some(example::resolve(
+            repo,
+            &guard.ledger,
+            &archives,
+            &config.sources,
+            value,
+            options.raw,
+        )?),
+    };
     let reader = Index::for_repo(repo)?
         .read(MODEL)?
         .context("index is absent; run nunc reindex")?;
     filter.validate_missing(&reader)?;
+    let (query, reference, snapshot_digest) = match example {
+        Some(example) => {
+            let (vector, reference, digest) = example.embed(&reader)?;
+            (vector, Some(reference), digest)
+        }
+        None => (text_vector.context("missing query embedding")?, None, None),
+    };
+    let query_norm = vectors::norm(&query, MODEL.dimensions)?;
     let mut best: Vec<Ranked> = Vec::with_capacity(options.limit);
     reader.scan(
         filter.kind,
         |path| filter.includes(path),
         |row, vector| {
             let parent = row.parent_id()?;
+            if reference.as_ref().is_some_and(|source| source.id == parent) {
+                return Ok(());
+            }
             let entry = uuid::Uuid::parse_str(parent).ok();
             let visibility = if let Some(id) = entry {
                 if guard.ledger.forgotten(id) {
@@ -294,7 +327,8 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
             };
             if (options.one_per_parent
                 || options.max_tokens.is_some()
-                || options.neighbor_window.is_some())
+                || options.neighbor_window.is_some()
+                || reference.is_some())
                 && let Some(existing) = best.iter().position(|hit| hit.parent == parent)
             {
                 if order(&best[existing]).is_le() {
@@ -381,8 +415,12 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
     };
     let digest = reader.digest.clone();
     drop(reader);
-    let warning = match Snapshot::read(repo) {
-        Ok(snapshot) if snapshot.digest == digest => None,
+    let current = match snapshot_digest {
+        Some(digest) => Ok(digest),
+        None => Snapshot::read(repo).map(|snapshot| snapshot.digest),
+    };
+    let warning = match current {
+        Ok(snapshot_digest) if snapshot_digest == digest => None,
         Ok(_) => Some("Index needs refresh; run nunc reindex or wait for nunc serve".to_owned()),
         Err(error) => Some(format!("Cannot verify index freshness: {error:#}")),
     };
@@ -416,6 +454,7 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
         results,
         budget,
         temporal_context,
+        reference,
     })
 }
 

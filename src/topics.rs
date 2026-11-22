@@ -1,4 +1,3 @@
-use crate::documents::Kind;
 use crate::index::Index;
 use crate::model::MODEL;
 use crate::repo::Repo;
@@ -6,7 +5,7 @@ use crate::timeline::{Anchor, DatedEvent, Event};
 use crate::vectors;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 pub(crate) const DEFAULT_THRESHOLD: f64 = 0.90;
 
@@ -152,55 +151,12 @@ fn indexed_vectors(repo: &Repo, events: &[DatedEvent]) -> Result<Vec<Option<Vec<
     let reader = Index::for_repo(repo)?
         .read(MODEL)?
         .context("index is absent; run nunc reindex")?;
-    let paths: BTreeSet<_> = events
+    events
         .iter()
-        .map(|event| event.event.source.path.as_str())
-        .collect();
-    let by_id: BTreeMap<_, _> = events
-        .iter()
-        .enumerate()
-        .map(|(index, event)| (event.event.source.id.as_str(), index))
-        .collect();
-    let mut chunks = vec![BTreeMap::<String, Vec<f32>>::new(); events.len()];
-    reader.scan(
-        Some(Kind::Memory),
-        |path| paths.contains(path),
-        |row, vector| {
-            let Some(&index) = by_id.get(row.parent_id()?) else {
-                return Ok(());
-            };
-            let Some(chunk) = row.matched()? else {
-                return Ok(());
-            };
-            if chunk.parent_hash == events[index].content_hash {
-                chunks[index]
-                    .entry(chunk.content_hash)
-                    .or_insert_with(|| vector.to_vec());
-            }
-            Ok(())
-        },
-    )?;
-    chunks
-        .into_iter()
-        .map(|chunks| {
-            if chunks.is_empty() {
-                return Ok(None);
-            }
-            // Unit-normalize each distinct passage before averaging in hash order.
-            let mut sum = vec![0.0f64; MODEL.dimensions];
-            for vector in chunks.values() {
-                let norm = vectors::norm(vector, MODEL.dimensions)?;
-                for (value, component) in sum.iter_mut().zip(vector) {
-                    *value += f64::from(*component) / norm;
-                }
-            }
-            let center: Vec<_> = sum
-                .into_iter()
-                .map(|value| (value / chunks.len() as f64) as f32)
-                .collect();
-            Ok(vectors::norm(&center, MODEL.dimensions)
-                .is_ok()
-                .then_some(center))
+        .map(|event| {
+            reader
+                .pooled_passages(&event.event.source.id, &event.content_hash, usize::MAX)
+                .map(|pooled| pooled.map(|pooled| pooled.vector))
         })
         .collect()
 }

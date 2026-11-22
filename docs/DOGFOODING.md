@@ -161,3 +161,9 @@ An isolated repository grouped seven real development records from the context b
 `nunc topics --around "$calendar_id" --window 18h --threshold 0.85 --json` returned six other records, omitted the anchor from membership, and kept the time-window scope separate. The deterministic fixture tests also cover overlapping semantic workstreams, an unavailable model with usable vectors, a newly captured record without vectors, and archive and forget visibility.
 
 Formatting, Clippy, 53 default tests, and the real stored-vector integration test passed. The latter found separate SQLite and TLS groups without loading the model and completed in 7.78 s. Cargo verified files where Rust LSP diagnostics were stale or timed out.
+
+## Search by example
+
+An isolated Git fixture reused seven real development notes and indexed two excerpts from the CLI and architecture documentation. `nunc search --similar-to "$budget_id" --type memory --limit 3 --json` ranked the other budget allocation decision first at cosine 0.923. `nunc search --similar-to docs/context-budget.md --limit 4 --max-tokens 1500 --json` used two reference passages and returned the original budget decision first at cosine 0.928. Both runs excluded the reference and used an empty model-cache path.
+
+Formatting, Clippy, and 55 default tests passed. The real search-by-example and topic regression tests passed. They checked distinct parent ranking, Markdown, IDs, source filtering, stored-vector operation, and the archived, forgotten, changed and unindexed reference cases. Cargo verified files where Rust LSP diagnostics timed out.

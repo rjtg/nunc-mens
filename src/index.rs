@@ -61,6 +61,11 @@ pub(crate) struct Index<'a> {
     dir: PathBuf,
 }
 
+pub(crate) struct PooledPassages {
+    pub vector: Vec<f32>,
+    pub count: usize,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Refresh {
     pub documents: usize,
@@ -494,6 +499,50 @@ impl Reader {
             })?)
     }
 
+    pub(crate) fn pooled_passages(
+        &self,
+        parent: &str,
+        revision: &str,
+        limit: usize,
+    ) -> Result<Option<PooledPassages>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hash, vector, chunk FROM documents WHERE parent_id=?1 ORDER BY hash, id",
+        )?;
+        let mut rows = stmt.query([parent])?;
+        let mut sum = vec![0.0f64; self.dimensions];
+        let mut last_hash = String::new();
+        let mut count = 0;
+        while count < limit {
+            let Some(row) = rows.next()? else { break };
+            let hash = row.get_ref(0)?.as_str()?;
+            if hash == last_hash {
+                continue;
+            }
+            let chunk: MatchedChunk = serde_json::from_str(row.get_ref(2)?.as_str()?)?;
+            if chunk.parent_hash != revision {
+                continue;
+            }
+            let vector = vectors::decode(row.get_ref(1)?.as_blob()?, self.dimensions)?;
+            let norm = vectors::norm(&vector, self.dimensions)?;
+            for (value, component) in sum.iter_mut().zip(vector) {
+                *value += f64::from(component) / norm;
+            }
+            last_hash.clear();
+            last_hash.push_str(hash);
+            count += 1;
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+        let vector: Vec<_> = sum
+            .into_iter()
+            .map(|value| (value / count as f64) as f32)
+            .collect();
+        Ok(vectors::norm(&vector, self.dimensions)
+            .is_ok()
+            .then_some(PooledPassages { vector, count }))
+    }
+
     pub(crate) fn scan(
         &self,
         kind: Option<Kind>,
@@ -606,6 +655,40 @@ mod tests {
             }
             Ok(passages.iter().map(|_| vec![1.0, -0.5]).collect())
         }
+    }
+
+    #[test]
+    fn passage_pool_is_bounded_deduplicated_and_revision_checked() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir(&root)?;
+        let repo = Repo::new(&root)?;
+        let index = Index {
+            repo: &repo,
+            dir: temp.path().join("state"),
+        };
+        let body = "## Repeated\n\nSerialize database writes.\n\n## Repeated\n\nSerialize database writes.\n\n## Different\n\nVerify the retry limit.\n";
+        let entry = entries::persist(&repo, body, ContextFields::default())?;
+        let mut model = Mock::default();
+        let total = index.refresh(&mut model, false)?.documents;
+        let reader = index.read(MODEL)?.context("missing index")?;
+        let (id, revision) = (entry.id.to_string(), hash(body.as_bytes()));
+        let all = reader
+            .pooled_passages(&id, &revision, usize::MAX)?
+            .context("expected pooled passages")?;
+        assert!(all.count >= 2);
+        assert!(all.count < total);
+        let bounded = reader
+            .pooled_passages(&id, &revision, 1)?
+            .context("expected bounded pool")?;
+        assert_eq!(bounded.count, 1);
+        assert_eq!(all.vector, bounded.vector);
+        assert!(
+            reader
+                .pooled_passages(&id, "obsolete revision", 64)?
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

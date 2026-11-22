@@ -23,6 +23,7 @@ nunc search "authentication" --format markdown --max-tokens 2000 > context.md
 nunc search --json --type source --source docs "time synchronization"
 nunc timeline --yesterday --group-by day
 nunc topics --since 7d
+nunc search --similar-to "$memory_id" --ids
 nunc search "token rotation" --related-by time --window 2h --json
 ```
 

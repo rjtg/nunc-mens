@@ -16,7 +16,7 @@
 | `nunc unarchive ID... [--dry-run] [--json]` | Restores manually archived memories. |
 | `nunc forget ID... [--dry-run\|--yes] [--json]` | Deletes only the specified entries after warning about dependencies. |
 | `nunc reindex [--full] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
-| `nunc search [QUERY...] [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Searches indexed vectors with a query or lists original events for a time filter. |
+| `nunc search [QUERY...\|--similar-to ID_OR_FILE] [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Searches by text or example, or lists original events for a time filter. |
 | `nunc timeline [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--group-by day\|topic] [--entry-kind KIND] [--around ID --window DURATION] [--json\|--ids] [--raw]` | Lists recorded activity or finds neighboring records around a known ID. |
 | `nunc topics [--yesterday\|--since DURATION\|--around ID --window DURATION] [--threshold N] [--json\|--ids] [--raw]` | Groups recorded activity using existing indexed embeddings. |
 | `nunc models download` | Explicitly downloads and validates the pinned model and tokenizer. |
@@ -90,6 +90,19 @@ JSON and ordinary console output use the sum of `ceil((UTF-8 bytes in the compac
 A budgeted JSON response adds a `budget` object with `max_tokens`, `estimated_tokens`, `truncated_results`, `omitted_candidates`, and the estimate identifier. The omitted count refers to candidates considered after ranking and the unique-parent limit. Each result adds a `context_window` with the returned text's original byte and line ranges and a `truncated` flag. `matched_chunk` continues to describe the original match. With `--explain`, the matched text is the intersection of the original chunk and returned window. Text mode labels shortened results and reports aggregate budget usage on stderr.
 
 Markdown windows use complete top-level blocks and may extend a partial chunk to include its enclosing block. The budget still applies. A Markdown block that cannot fit is skipped whole, including oversized fenced code or very long paragraphs. Other sources use complete lines. When provenance and a matched excerpt cannot fit for any candidate, search succeeds with empty results and reports the omission count.
+
+### Search by example
+
+```sh
+nunc search --similar-to "$memory_id" --ids
+nunc search --similar-to docs/design/sqlite.md --source docs/decisions --max-tokens 2000 --json
+```
+
+Supply a memory UUID or a file path relative to the repository root. The reference must have current indexed embeddings. File references follow the registered-source and ignore rules. Use `--raw` to use an archived reference or include archived candidates. Forgotten references are unavailable. A changed or unindexed reference requests a reindex.
+
+Search uses the mean of up to 64 distinct unit-normalized passage vectors from the reference, selected in content-hash order. It uses only stored vectors, so a compatible index is sufficient with the model cache absent. The strongest matching chunk represents each eligible target parent. All chunks belonging to the reference are excluded. Filters and limits select the other documents, and the usual context, budget and formatting options apply. JSON adds a `reference` object with the ID, path, kind and passage count.
+
+Use this command to explore related records. Use `nunc duplicates` when you need duplicate-specific evidence or a cleanup preview.
 
 ### Markdown context bundle
 

@@ -845,6 +845,168 @@ fn topic_listing_handles_unindexed_events_and_ledger_visibility() -> Result<()> 
 }
 
 #[test]
+fn similar_to_rejects_invalid_references_and_text_conflicts_without_inference() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let conflict = fixture
+        .nunc(&["search", "--similar-to", "docs/design.md", "query"])
+        .output()?;
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(conflict.stdout.is_empty());
+    for (reference, expected) in [
+        ("../private.md", "repository-relative"),
+        ("docs/unknown.md", "outside the registered sources"),
+    ] {
+        let output = fixture
+            .nunc(&["search", "--similar-to", reference])
+            .output()?;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8(output.stderr)?.contains(expected));
+    }
+    assert!(!fixture.state.exists());
+    assert!(!fixture.cache.exists());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn real_search_by_example_reuses_indexed_passages_and_filters_distinct_parents() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let body = "# SQLite writer lock\n\nHold a SQLite mutex during writer transactions.\n\n## Publication\n\nSerialize commits to protect durable publication.";
+    let reference = fixture.log_id(body)?;
+    let exact = fixture.log_id(body)?;
+    let archived = fixture.log_id(body)?;
+    fixture.run(&["archive", &archived])?;
+    let docs = fixture.repo.join("docs");
+    fs::create_dir(&docs)?;
+    fs::write(docs.join("example.md"), body)?;
+    fs::write(
+        docs.join("rules.md"),
+        "# SQLite transaction ordering\n\nUse a writer mutex for atomic commit.\n\n## Recovery\n\nRelease the SQLite write lock after publication.",
+    )?;
+    fs::write(
+        docs.join("garden.md"),
+        "# Garden\n\nWater marigolds daily and add compost.",
+    )?;
+    fixture.run(&["reindex", "--source", "docs"])?;
+    fixture.cache = fixture.state.join("empty-model");
+    let args = [
+        "search",
+        "--similar-to",
+        &reference,
+        "--limit",
+        "10",
+        "--context",
+        "parent",
+        "--json",
+    ];
+    let report = fixture.json(&args)?;
+    assert_eq!(report, fixture.json(&args)?);
+    assert_eq!(report["reference"]["id"], reference);
+    assert!(
+        report["reference"]["passage_count"]
+            .as_u64()
+            .is_some_and(|n| n > 1)
+    );
+    let hits = report["results"].as_array().context("missing hits")?;
+    let parents: Vec<_> = hits
+        .iter()
+        .map(|hit| &hit["matched_chunk"]["parent_id"])
+        .collect();
+    assert_eq!(parents.len(), 4);
+    assert!(parents.iter().any(|id| **id == exact));
+    assert!(
+        parents
+            .iter()
+            .all(|id| **id != reference && **id != archived)
+    );
+    assert_eq!(
+        parents
+            .iter()
+            .filter_map(|id| id.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        parents.len()
+    );
+    let position = |path| {
+        hits.iter()
+            .position(|hit| hit["path"] == path)
+            .context("missing source")
+    };
+    assert!(position("docs/rules.md")? < position("docs/garden.md")?);
+    let ids = fixture.run(&[
+        "search",
+        "--similar-to",
+        &reference,
+        "--ids",
+        "--limit",
+        "10",
+    ])?;
+    assert_eq!(
+        String::from_utf8(ids.stdout)?.lines().collect::<Vec<_>>(),
+        parents
+            .iter()
+            .filter_map(|id| id.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let file = fixture.json(&[
+        "search",
+        "--similar-to",
+        "./docs/example.md",
+        "--source-file",
+        "docs/rules.md",
+        "--max-tokens",
+        "600",
+        "--json",
+    ])?;
+    assert_eq!(file["reference"]["path"], "docs/example.md");
+    assert_eq!(file["reference"]["kind"], "source");
+    assert_eq!(file["results"][0]["path"], "docs/rules.md");
+    assert_eq!(file["results"].as_array().map(Vec::len), Some(1));
+    let markdown = fixture.run(&[
+        "search",
+        "--similar-to",
+        "docs/example.md",
+        "--source",
+        "docs",
+        "--format",
+        "markdown",
+        "--max-tokens",
+        "300",
+    ])?;
+    assert!(markdown.stdout.len() <= 1200);
+    let document = String::from_utf8(markdown.stdout)?;
+    assert!(document.contains("docs/rules.md"));
+    assert!(!document.contains("docs/example.md"));
+    let unindexed = fixture.log_id("A newly saved design without a vector.")?;
+    fs::write(docs.join("example.md"), "Changed after indexing.")?;
+    for value in [&unindexed, "docs/example.md"] {
+        let output = fixture.nunc(&["search", "--similar-to", value]).output()?;
+        assert!(!output.status.success());
+        assert!(String::from_utf8(output.stderr)?.contains("no current indexed embeddings"));
+    }
+    let hidden = fixture
+        .nunc(&["search", "--similar-to", &archived])
+        .output()?;
+    assert!(!hidden.status.success());
+    assert!(String::from_utf8(hidden.stderr)?.contains("use --raw"));
+    assert_eq!(
+        fixture.json(&["search", "--similar-to", &archived, "--raw", "--json"])?["reference"]["id"],
+        archived
+    );
+    fixture.run(&["forget", &reference, "--yes"])?;
+    let forgotten = fixture
+        .nunc(&["search", "--similar-to", &reference, "--raw"])
+        .output()?;
+    assert!(!forgotten.status.success());
+    assert!(String::from_utf8(forgotten.stderr)?.contains("was forgotten"));
+    assert!(!fixture.cache.exists());
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires the explicitly prepared ONNX model cache"]
 fn real_topics_group_distinct_workstreams_using_only_stored_vectors() -> Result<()> {
     let mut fixture = Fixture::new()?;

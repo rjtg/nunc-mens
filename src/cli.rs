@@ -87,8 +87,11 @@ enum Action {
     },
     /// Search by semantic similarity or list recorded activities by date.
     Search {
-        #[arg(required_unless_present_any = ["yesterday", "date", "since", "from", "to"], num_args = 1..)]
+        #[arg(required_unless_present_any = ["similar_to", "yesterday", "date", "since", "from", "to"], num_args = 1..)]
         query: Vec<String>,
+        /// Rank other documents using this memory UUID or registered file.
+        #[arg(long, conflicts_with = "query", value_name = "ID_OR_FILE")]
+        similar_to: Option<String>,
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=1000))]
         limit: u32,
         #[arg(long)]
@@ -475,6 +478,7 @@ fn execute(action: Action) -> Result<ExitCode> {
         }
         Action::Search {
             query,
+            similar_to,
             limit,
             json,
             ids,
@@ -516,10 +520,10 @@ fn execute(action: Action) -> Result<ExitCode> {
                     .transpose()?,
             };
             let mut out = io::stdout().lock();
-            if query.is_empty() {
+            if query.is_empty() && similar_to.is_none() {
                 ensure!(
                     options.time.restricted(),
-                    "provide a query or a date filter"
+                    "provide a query, an example or a date filter"
                 );
                 ensure!(
                     !markdown
@@ -534,7 +538,11 @@ fn execute(action: Action) -> Result<ExitCode> {
                 print_events(events, limit as usize, json, ids, false, &mut out)?;
                 return Ok(ExitCode::SUCCESS);
             }
-            let found = search::search(&repo, &query.join(" "), options)?;
+            let text = query.join(" ");
+            let query = similar_to
+                .as_deref()
+                .map_or(search::Query::Text(&text), search::Query::Example);
+            let found = search::search(&repo, query, options)?;
             if json {
                 serde_json::to_writer(&mut out, &found)?;
                 writeln!(out)?;
@@ -1033,7 +1041,7 @@ fn consolidate(repo: &Repo, command: Consolidation) -> Result<()> {
         Consolidation::Candidates { query, limit, json } => {
             let found = search::search(
                 repo,
-                &query.join(" "),
+                search::Query::Text(&query.join(" ")),
                 search::Options {
                     limit: limit as usize,
                     kind: Some(Kind::Memory),

@@ -1,5 +1,5 @@
 use crate::chunk::{self, Chunk, Strategy};
-use crate::documents::{Document, Kind, MatchedChunk, Provenance, Snapshot, SourceManifest};
+use crate::documents::{Document, InputManifest, Kind, MatchedChunk, Provenance, Snapshot};
 use crate::entries::{Commit, EntryKind};
 use crate::fs::{effective_uid, lockfile, private_dir, sync_dir};
 use crate::ledger::Guard;
@@ -338,35 +338,21 @@ impl<'a> Index<'a> {
 fn store_search_metadata(tx: &Transaction<'_>, snapshot: &Snapshot) -> Result<()> {
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS chunk_path ON documents(path);
-        CREATE TABLE IF NOT EXISTS snapshot_freshness (
+        CREATE TABLE IF NOT EXISTS snapshot_inputs (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             digest TEXT NOT NULL,
-            stamps TEXT NOT NULL
-        ) STRICT;
-        CREATE TABLE IF NOT EXISTS snapshot_source_manifest (
-            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            digest TEXT NOT NULL,
+            stamps TEXT,
             manifest TEXT NOT NULL
-        ) STRICT;",
+        ) STRICT;
+        DROP TABLE IF EXISTS snapshot_freshness;
+        DROP TABLE IF EXISTS snapshot_source_manifest;",
     )?;
-    if let Some(freshness) = &snapshot.freshness {
-        tx.execute(
-            "INSERT INTO snapshot_freshness VALUES (1, ?1, ?2)
-             ON CONFLICT(singleton) DO UPDATE SET digest=excluded.digest, stamps=excluded.stamps
-             WHERE digest != excluded.digest OR stamps != excluded.stamps",
-            params![snapshot.digest, freshness],
-        )?;
-    } else {
-        tx.execute("DELETE FROM snapshot_freshness", [])?;
-    }
     tx.execute(
-        "INSERT INTO snapshot_source_manifest VALUES (1, ?1, ?2)
-         ON CONFLICT(singleton) DO UPDATE SET digest=excluded.digest, manifest=excluded.manifest
-         WHERE digest != excluded.digest OR manifest != excluded.manifest",
-        params![
-            snapshot.digest,
-            serde_json::to_string(&snapshot.source_manifest)?
-        ],
+        "INSERT INTO snapshot_inputs VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT(singleton) DO UPDATE SET digest=excluded.digest, stamps=excluded.stamps,
+                                            manifest=excluded.manifest
+         WHERE digest != excluded.digest OR stamps IS NOT excluded.stamps OR manifest != excluded.manifest",
+        params![snapshot.digest, snapshot.freshness, serde_json::to_string(&snapshot.input_manifest)?],
     )?;
     Ok(())
 }
@@ -686,44 +672,43 @@ fn store_batch(
 }
 
 impl Reader {
-    pub(crate) fn freshness(&self) -> Result<Option<String>> {
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='snapshot_freshness')",
+    fn has_input_metadata(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='snapshot_inputs')",
             [],
             |row| row.get(0),
-        )?;
-        if exists {
+        )?)
+    }
+
+    pub(crate) fn freshness(&self) -> Result<Option<String>> {
+        if self.has_input_metadata()? {
             return Ok(self
                 .conn
                 .query_row(
-                    "SELECT stamps FROM snapshot_freshness WHERE singleton=1 AND digest=?1",
+                    "SELECT stamps FROM snapshot_inputs WHERE singleton=1 AND digest=?1",
                     [&self.digest],
-                    |row| row.get(0),
+                    |row| row.get::<_, Option<String>>(0),
                 )
-                .optional()?);
+                .optional()?
+                .flatten());
         }
         Ok(None)
     }
 
-    pub(crate) fn source_manifest(&self) -> Result<Option<SourceManifest>> {
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='snapshot_source_manifest')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !exists {
+    pub(crate) fn input_manifest(&self) -> Result<Option<InputManifest>> {
+        if !self.has_input_metadata()? {
             return Ok(None);
         }
         let manifest: Option<String> = self
             .conn
             .query_row(
-                "SELECT manifest FROM snapshot_source_manifest WHERE singleton=1 AND digest=?1",
+                "SELECT manifest FROM snapshot_inputs WHERE singleton=1 AND digest=?1",
                 [&self.digest],
                 |row| row.get(0),
             )
             .optional()?;
         manifest
-            .map(|data| serde_json::from_str(&data).context("decode source manifest"))
+            .map(|data| serde_json::from_str(&data).context("decode input manifest"))
             .transpose()
     }
 

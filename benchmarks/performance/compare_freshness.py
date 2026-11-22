@@ -14,6 +14,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ("repo", "state", "model-cache", "before", "after", "output"):
         parser.add_argument(f"--{key}", required=True, type=Path)
+    parser.add_argument("--before-state", type=Path, help="separate baseline state for the same fixture")
     parser.add_argument("--query", required=True)
     scope = parser.add_mutually_exclusive_group(required=True)
     scope.add_argument("--source-file")
@@ -56,7 +57,10 @@ def main():
                 for sample in range(args.samples):
                     baseline = None
                     for tag, binary in (("before", args.before.resolve()), ("after", after)):
-                        stdout, stderr, timing = measure_command([binary, *command], args.repo, env)
+                        version_env = env
+                        if tag == "before" and args.before_state:
+                            version_env = {**env, "NUNC_STATE_DIR": str(args.before_state.resolve())}
+                        stdout, stderr, timing = measure_command([binary, *command], args.repo, version_env)
                         result = json.loads(stdout)
                         if not result["results"] or result["warnings"]:
                             raise ValueError("expected matches from a current index")

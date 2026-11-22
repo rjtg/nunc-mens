@@ -186,9 +186,17 @@ impl Ledger {
                 .any(|marker| marker.git_sha.as_deref() == Some(sha))
     }
 
+    pub(crate) fn published_summary_ids(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.summaries.keys().copied()
+    }
+
+    pub(crate) fn summary_published(&self, id: Uuid) -> bool {
+        self.summaries.contains_key(&id)
+    }
+
     pub fn pending_summary(&self, entry: &Entry) -> bool {
         entry.metadata.kind == EntryKind::Consolidation
-            && !self.summaries.contains_key(&entry.metadata.id)
+            && !self.summary_published(entry.metadata.id)
     }
 
     pub fn read_entry(&self, repo: &Repo, id: Uuid) -> Result<Entry> {

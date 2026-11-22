@@ -788,7 +788,7 @@ pub(crate) fn search_with(
                 if let Some(reader) = index.read_mode(MODEL, false, false, read_cache)?
                     && reader.digest == digest
                 {
-                    return reader.source_manifest();
+                    return reader.input_manifest();
                 }
                 Ok(None)
             },

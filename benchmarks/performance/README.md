@@ -70,3 +70,23 @@ The comparator seeds the new additive fingerprint via a keyword-only reindex, th
 Pass `--touch-source` to test one metadata-only mismatch on the isolated fixture. The harness temporarily changes and restores the selected file's mtime. The filesystem's ctime records the change. The query must still return current, identical JSON. [Recorded comparison](../../docs/BENCHMARK_SCALE.md#changed-source-metadata)
 
 Use `--source docs/decisions --query staging` in place of the exact-file arguments to reproduce the directory probe. [Directory measurements](../../docs/BENCHMARK_SCALE.md#indexed-directory-and-mixed-scopes)
+
+## Journal freshness probe
+
+Use the before binary to build the same fixture's initial index with a prepared model, then make a separate state copy. The comparator updates only the new state copy. Both binaries must have the `search-profile` feature.
+
+```sh
+scratch=$(mktemp -d target/nunc-journal.XXXXXX)
+python3 -B -m benchmarks.performance.generate_journal "$scratch/repo" 2000
+env NUNC_REPO_ROOT="$(realpath "$scratch/repo")" \
+  NUNC_STATE_DIR="$(realpath -m "$scratch/baseline-state")" \
+  NUNC_MODEL_CACHE_DIR="$NUNC_MODEL_CACHE_DIR" /path/to/before/nunc reindex
+cp -a "$scratch/baseline-state" "$scratch/state"
+python3 -B -m benchmarks.performance.compare_freshness \
+  --repo "$scratch/repo" --before-state "$scratch/baseline-state" --state "$scratch/state" \
+  --before /path/to/before/nunc --after target/release/nunc \
+  --model-cache "$NUNC_MODEL_CACHE_DIR" --source .nunc/entries \
+  --query WriterLock --samples 3 --output "$scratch/journal.jsonl"
+```
+
+[Recorded journal comparison](../../docs/BENCHMARK_SCALE.md#journal-body-validation)

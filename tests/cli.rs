@@ -1112,6 +1112,50 @@ fn indexed_source_union_matches_diagnostic_scope_and_respects_component_boundari
 }
 
 #[test]
+fn journal_freshness_handles_touches_same_size_edits_archive_and_bad_entries() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let id = fixture.log_id("WriterLock publishes the checkpoint.")?;
+    fixture.run(&["reindex", "--keyword-only"])?;
+    let status = || -> Result<Value> {
+        let report = fixture.json(&[
+            "search",
+            "--mode",
+            "keyword",
+            "--raw",
+            "--explain",
+            "--json",
+            "WriterLock",
+        ])?;
+        Ok(report["pipeline"]["index_freshness"].clone())
+    };
+    assert_eq!(status()?, "current");
+    fixture.run(&["archive", &id])?;
+    assert_eq!(status()?, "current");
+
+    let path = fixture.local().join("entries").join(format!("{id}.md"));
+    let original = fs::read_to_string(&path)?;
+    let mtime = fs::metadata(&path)?.modified()?;
+    let restore = || {
+        fs::File::options()
+            .write(true)
+            .open(&path)?
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+    };
+    restore()?;
+    assert_eq!(status()?, "current");
+    fs::write(&path, original.replace("WriterLock", "ReaderLock"))?;
+    restore()?;
+    assert_eq!(status()?, "stale");
+    fs::write(&path, "broken header")?;
+    assert_eq!(status()?, "unknown");
+    fs::write(&path, original)?;
+    fixture.run(&["forget", &id, "--yes"])?;
+    fixture.run(&["reindex", "--keyword-only"])?;
+    assert_eq!(status()?, "current");
+    Ok(())
+}
+
+#[test]
 fn freshness_detects_changed_sources_with_restored_mtime_and_handles_legacy_indexes() -> Result<()>
 {
     let fixture = Fixture::new()?;
@@ -1154,7 +1198,7 @@ fn freshness_detects_changed_sources_with_restored_mtime_and_handles_legacy_inde
         .path();
     {
         let conn = rusqlite::Connection::open(index.join("index.sqlite3"))?;
-        conn.execute_batch("DROP TABLE snapshot_freshness; DROP TABLE snapshot_source_manifest;")?;
+        conn.execute_batch("DROP TABLE snapshot_inputs;")?;
     }
     assert_eq!(search()?, original);
     fixture.run(&["reindex", "--keyword-only"])?;
@@ -1336,13 +1380,18 @@ fn socket_search_matches_standalone_with_real_embeddings() -> Result<()> {
     let mut fixture = Fixture::new()?;
     fixture.cache = real_model_cache()?;
     let id = fixture.log_id("WriterLock serializes commit publication in SQLite.")?;
-    fixture.run(&["reindex"])?;
+    fs::create_dir(fixture.repo.join("docs"))?;
+    fs::write(
+        fixture.repo.join("docs/lock.md"),
+        "WriterLock protects source publication.",
+    )?;
+    fixture.run(&["reindex", "--source", "docs"])?;
     let mut server = Server::start(&fixture, &["--search-socket"])?;
     for mode in ["semantic", "hybrid"] {
-        let standalone = fixture.run(&["search", "--mode", mode, "WriterLock", "--json"])?;
+        let opts = ["--mode", mode, "--type", "memory", "WriterLock", "--json"];
+        let standalone = fixture.run(&[&["search"], opts.as_slice()].concat())?;
         for _ in 0..2 {
-            let remote =
-                fixture.run(&["search", "--server", "--mode", mode, "WriterLock", "--json"])?;
+            let remote = fixture.run(&[&["search", "--server"][..], opts.as_slice()].concat())?;
             assert_eq!(remote.stdout, standalone.stdout);
             assert_eq!(
                 serde_json::from_slice::<Value>(&remote.stdout)?["results"][0]["id"],
@@ -1350,19 +1399,45 @@ fn socket_search_matches_standalone_with_real_embeddings() -> Result<()> {
             );
         }
     }
-    let search = |raw: bool| {
-        let mut args = vec!["search", "--server", "--json", "WriterLock"];
+    let search = |mode: &str, raw: bool| {
+        let mut args = vec![
+            "search",
+            "--server",
+            "--mode",
+            mode,
+            "--json",
+            "WriterLock",
+            "--source-file",
+            "docs/lock.md",
+            "--source",
+            ".nunc/entries",
+        ];
         if raw {
             args.push("--raw");
         }
         fixture.json(&args)
     };
     fixture.run(&["archive", &id])?;
-    assert_eq!(search(false)?["results"], serde_json::json!([]));
-    assert_eq!(search(true)?["results"][0]["id"], id);
+    for mode in ["semantic", "keyword", "hybrid"] {
+        let normal = search(mode, false)?;
+        assert_eq!(normal["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(normal["results"][0]["path"], "docs/lock.md");
+        let raw = search(mode, true)?;
+        assert!(
+            raw["results"]
+                .as_array()
+                .context("expected raw results")?
+                .iter()
+                .any(|hit| hit["id"] == id)
+        );
+    }
     fixture.run(&["forget", &id, "--yes"])?;
     fixture.run(&["reindex", "--full"])?;
-    assert_eq!(search(true)?["results"], serde_json::json!([]));
+    for mode in ["semantic", "keyword", "hybrid"] {
+        let raw = search(mode, true)?;
+        assert_eq!(raw["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(raw["results"][0]["path"], "docs/lock.md");
+    }
     server.stop()?;
     Ok(())
 }

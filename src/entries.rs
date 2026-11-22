@@ -1,8 +1,10 @@
-use crate::fs::{atomic_write, read_regular};
+use crate::fs::{atomic_write, bounded_read};
 use crate::repo::Repo;
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, FixedOffset, Local};
 use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -126,8 +128,20 @@ pub(crate) fn persist_record(repo: &Repo, body: &str, metadata: Metadata) -> Res
 }
 
 pub fn read(path: &Path) -> Result<Entry> {
+    read_file(path, &open(path)?)
+}
+
+pub(crate) fn open(path: &Path) -> Result<File> {
+    File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("invalid entry {}", path.display()))
+}
+
+pub(crate) fn read_file(path: &Path, file: &File) -> Result<Entry> {
     let parse = || -> Result<Entry> {
-        let raw = read_regular(path, MAX_BODY + MAX_HEADER + 9)?;
+        let raw = bounded_read(file, MAX_BODY + MAX_HEADER + 9)?;
         let text = String::from_utf8(raw).context("entry must be UTF-8")?;
         let text = text.strip_prefix("---\n").context("missing front matter")?;
         let (header, body) = text

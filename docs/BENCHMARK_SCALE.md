@@ -110,3 +110,19 @@ The directory probe searched for `staging` inside `docs/decisions` in the same 1
 A separate exact-file control still returned byte-identical JSON across all modes. Its semantic vector scan took 0.113 ms before and 0.224 ms after. Its keyword scan took 2.479 ms before and 4.471 ms after. These are individual samples of the added scope-union overhead. [Exact-file control](../benchmarks/performance/results/directory-exact-control-100000-linux-x86_64.jsonl)
 
 The profiling binary SHA-256 was `7336a6de7517ebdac91bb8cad8e576c612b42e37da52ed517233a3800d0c3c9d`.
+
+### Journal body validation
+
+The journal-only fixture contains 2,000 deterministic Markdown notes and 10,000 indexed chunks. Each binary used its own state copy and searched the same journal for `WriterLock`. Three before/after pairs per mode returned byte-identical JSON. This comparison isolates the journal stamp change from the earlier source optimizations. [Raw measurements](../benchmarks/performance/results/journal-2000-linux-x86_64.jsonl) · [Reproduction instructions](../benchmarks/performance/README.md#journal-freshness-probe)
+
+| Mode | Median freshness before / after | Median total before / after |
+| --- | ---: | ---: |
+| Semantic | 134.416 / 18.035 ms | 2.165 / 2.092 s |
+| Keyword | 146.324 / 16.751 ms | 0.213 / 0.082 s |
+| Hybrid | 137.946 / 23.669 ms | 2.238 / 2.221 s |
+
+Freshness still enumerates and checks entry metadata. The body and front matter are parsed only for new, changed or unreliable entries. Summary eligibility is checked against the publish ledger. Older indexes keep the full digest comparison until reindexing refreshes the auxiliary metadata.
+
+Both lookup paths use the existing read-only SQLite connection and repository locks. Temporal filtering and archive/forget visibility run before limiting, with the ledger authoritative for visibility. Parent and chunk retrieval use their existing indexes. The per-stage data point to snapshot work and eligible scans ahead of SQLite pragma changes.
+
+The profiling binary SHA-256 was `56b4f67b02f6f44d1cf996f3e1dc1eaf3408c3c5eb73ecc55ecf70218cd6a3d4`.

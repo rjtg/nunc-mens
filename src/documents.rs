@@ -127,19 +127,32 @@ pub(crate) struct Snapshot {
     pub digest: String,
     pub chunking: Settings,
     pub freshness: Option<String>,
-    pub source_manifest: SourceManifest,
+    pub input_manifest: InputManifest,
 }
 
 impl Snapshot {
     pub(crate) fn read(repo: &Repo) -> Result<Self> {
         let config = repo.config()?;
         let ledger = Ledger::read(repo)?;
-        let mut documents = memories(repo, &ledger)?;
-        documents.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
-        let mut fingerprint = Freshness::new(&config, &documents)?;
-        let mut source_manifest = SourceManifest {
+        let mut documents = Vec::new();
+        let mut fingerprint = Freshness::new(&config, &ledger)?;
+        let mut journal = BTreeMap::new();
+        for path in memory_paths(repo, &ledger)? {
+            let full_path = repo.root.join(&path);
+            let file = entries::open(&full_path)?;
+            let before = stamp(&file.metadata()?);
+            let (mut state, document) = read_journal(&full_path, &file, &ledger)?;
+            let stable = before == stamp(&file.metadata()?);
+            fingerprint.reliable &= stable;
+            state.file.stamp = stable.then_some(before);
+            fingerprint.record(&path, state.file.stamp.as_ref());
+            journal.insert(path, state);
+            documents.extend(document);
+        }
+        let mut input_manifest = InputManifest {
             basis: fingerprint.basis.clone(),
             files: BTreeMap::new(),
+            journal,
         };
         let mut sources = Sources::open(repo)?;
         for path in source_files(repo, &config.sources)? {
@@ -165,7 +178,7 @@ impl Snapshot {
                 }
             };
             fingerprint.record(&path, state.stamp.as_ref());
-            source_manifest.files.insert(path, state);
+            input_manifest.files.insert(path, state);
         }
         documents.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
         let mut digest = configuration_digest(&config)?;
@@ -175,7 +188,7 @@ impl Snapshot {
             digest: format!("{:x}", digest.finalize()),
             chunking: config.chunking,
             freshness: fingerprint.finish(),
-            source_manifest,
+            input_manifest,
         })
     }
 }
@@ -201,11 +214,15 @@ struct Freshness {
 }
 
 impl Freshness {
-    fn new(config: &Config, memories: &[Document]) -> Result<Self> {
+    fn new(config: &Config, ledger: &Ledger) -> Result<Self> {
         let mut digest = configuration_digest(config)?;
-        hash_documents(&mut digest, memories)?;
         let basis = format!("{:x}", digest.clone().finalize());
-        digest.update(b"nunc-source-stamps-v1");
+        digest.update(b"nunc-input-stamps-v2");
+        let mut summaries = Sha256::new();
+        for id in ledger.published_summary_ids() {
+            summaries.update(id.as_bytes());
+        }
+        digest.update(summaries.finalize());
         Ok(Self {
             basis,
             digest,
@@ -238,14 +255,15 @@ impl Freshness {
 
     fn finish(self) -> Option<String> {
         self.reliable
-            .then(|| format!("{:x}", self.digest.finalize()))
+            .then(|| format!("v2:{:x}", self.digest.finalize()))
     }
 }
 
 #[derive(Deserialize, Serialize)]
-pub(crate) struct SourceManifest {
+pub(crate) struct InputManifest {
     basis: String,
     files: BTreeMap<PathBuf, SourceState>,
+    journal: BTreeMap<PathBuf, JournalState>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -254,18 +272,67 @@ struct SourceState {
     revision: Option<String>,
 }
 
-struct SourceInputs {
+#[derive(Deserialize, Serialize)]
+struct JournalState {
+    file: SourceState,
+    summary: Option<uuid::Uuid>,
+    indexed: bool,
+}
+
+impl JournalState {
+    fn revision(&self, included: bool) -> Option<&str> {
+        if included {
+            self.file.revision.as_deref()
+        } else {
+            None
+        }
+    }
+
+    fn included_now(&self, ledger: &Ledger) -> bool {
+        self.summary.is_none_or(|id| ledger.summary_published(id))
+    }
+}
+
+fn read_journal(
+    path: &Path,
+    file: &File,
+    ledger: &Ledger,
+) -> Result<(JournalState, Option<Document>)> {
+    let entry = entries::read_file(path, file)?;
+    let indexed = !ledger.pending_summary(&entry);
+    let summary = (entry.metadata.kind == EntryKind::Consolidation).then_some(entry.metadata.id);
+    let doc = memory_document(entry);
+    let mut hash = Sha256::new();
+    hash_documents(&mut hash, std::slice::from_ref(&doc))?;
+    let state = JournalState {
+        file: SourceState {
+            stamp: None,
+            revision: Some(format!("{:x}", hash.finalize())),
+        },
+        summary,
+        indexed,
+    };
+    Ok((state, indexed.then_some(doc)))
+}
+
+struct InputObservations {
     basis: String,
     fingerprint: Option<String>,
     observed: Vec<(PathBuf, Option<SourceStamp>)>,
+    journal: Vec<(PathBuf, SourceStamp)>,
 }
 
-impl SourceInputs {
+impl InputObservations {
     fn read(repo: &Repo, ledger: &Ledger) -> Result<Self> {
         let config = repo.config()?;
-        let mut memories = memories(repo, ledger)?;
-        memories.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
-        let mut fingerprint = Freshness::new(&config, &memories)?;
+        let mut fingerprint = Freshness::new(&config, ledger)?;
+        let mut journal = Vec::new();
+        for path in memory_paths(repo, ledger)? {
+            let file = entries::open(&repo.root.join(&path))?;
+            let state = stamp(&file.metadata()?);
+            fingerprint.record(&path, Some(&state));
+            journal.push((path, state));
+        }
         let paths = source_files(repo, &config.sources)?;
         let mut sources = Sources::open(repo)?;
         let mut observed = Vec::with_capacity(paths.len());
@@ -281,17 +348,43 @@ impl SourceInputs {
             basis: fingerprint.basis.clone(),
             fingerprint: fingerprint.finish(),
             observed,
+            journal,
         })
+    }
+
+    fn journal_matches(
+        &self,
+        ledger: &Ledger,
+        mut expected: BTreeMap<PathBuf, JournalState>,
+        mut reopen: impl FnMut(&Path) -> Result<JournalState>,
+    ) -> Result<bool> {
+        let mut unchanged = true;
+        for (path, observed) in &self.journal {
+            let previous = expected.remove(path);
+            let old_revision = previous
+                .as_ref()
+                .and_then(|state| state.revision(state.indexed));
+            if observed.changed.1 != 0
+                && let Some(state) = &previous
+                && state.file.stamp.as_ref() == Some(observed)
+            {
+                unchanged &= state.revision(state.included_now(ledger)) == old_revision;
+            } else {
+                let current = reopen(path)?;
+                unchanged &= current.revision(current.indexed) == old_revision;
+            }
+        }
+        Ok(unchanged && expected.values().all(|state| !state.indexed))
     }
 
     fn matches_manifest(
         self,
-        mut manifest: SourceManifest,
+        mut files: BTreeMap<PathBuf, SourceState>,
         mut revision_for: impl FnMut(&Path) -> Result<Option<String>>,
     ) -> Result<bool> {
-        let mut unchanged = self.basis == manifest.basis;
+        let mut unchanged = true;
         for (path, observed) in self.observed {
-            let expected = manifest.files.remove(&path);
+            let expected = files.remove(&path);
             if observed.as_ref().is_some_and(|stamp| stamp.changed.1 != 0)
                 && expected
                     .as_ref()
@@ -306,7 +399,7 @@ impl SourceInputs {
             };
             unchanged &= revision == expected.and_then(|state| state.revision);
         }
-        Ok(unchanged && manifest.files.values().all(|file| file.revision.is_none()))
+        Ok(unchanged && files.values().all(|file| file.revision.is_none()))
     }
 }
 
@@ -315,10 +408,10 @@ pub(crate) fn snapshot_is_current(
     ledger: &Ledger,
     digest: &str,
     fingerprint: Option<&str>,
-    load_manifest: impl FnOnce() -> Result<Option<SourceManifest>>,
+    load_manifest: impl FnOnce() -> Result<Option<InputManifest>>,
 ) -> Result<bool> {
     let observed = fingerprint
-        .map(|_| SourceInputs::read(repo, ledger))
+        .map(|_| InputObservations::read(repo, ledger))
         .transpose()?;
     if let Some(observed) = &observed
         && fingerprint == observed.fingerprint.as_deref()
@@ -328,10 +421,15 @@ pub(crate) fn snapshot_is_current(
     if let Some(manifest) = load_manifest()? {
         let observed = match observed {
             Some(observed) => observed,
-            None => SourceInputs::read(repo, ledger)?,
+            None => InputObservations::read(repo, ledger)?,
         };
+        let journal_matches = observed.journal_matches(ledger, manifest.journal, |path| {
+            let path = repo.root.join(path);
+            read_journal(&path, &entries::open(&path)?, ledger).map(|(state, _)| state)
+        })?;
+        let unchanged = observed.basis == manifest.basis && journal_matches;
         let mut sources = Sources::open(repo)?;
-        return observed.matches_manifest(manifest, |path| {
+        let sources_match = observed.matches_manifest(manifest.files, |path| {
             // Reopen safely. A changed path can have changed again since enumeration.
             Ok(sources
                 .file(path)?
@@ -339,7 +437,8 @@ pub(crate) fn snapshot_is_current(
                 .transpose()?
                 .flatten()
                 .map(|text| hash(text.as_bytes())))
-        });
+        })?;
+        return Ok(unchanged && sources_match);
     }
     Ok(Snapshot::read(repo)?.digest == digest)
 }
@@ -374,14 +473,14 @@ fn source_document(path: &Path, text: String) -> Result<Document> {
     ))
 }
 
-pub(crate) fn memories(repo: &Repo, ledger: &Ledger) -> Result<Vec<Document>> {
+fn memory_paths(repo: &Repo, ledger: &Ledger) -> Result<BTreeSet<PathBuf>> {
     let dir = repo.entries();
     match fs::symlink_metadata(&dir) {
         Ok(_) => private_dir(&dir)?,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
         Err(err) => return Err(err).with_context(|| format!("inspect {}", dir.display())),
     }
-    let mut result = Vec::new();
+    let mut result = BTreeSet::new();
     for entry in fs::read_dir(&dir).with_context(|| format!("list {}", dir.display()))? {
         let path = entry?.path();
         if path.extension().is_none_or(|extension| extension != "md") {
@@ -395,29 +494,40 @@ pub(crate) fn memories(repo: &Repo, ledger: &Ledger) -> Result<Vec<Document>> {
         {
             continue;
         }
-        let entry = entries::read(&path)?;
-        if ledger.pending_summary(&entry) {
-            continue;
-        }
-        let id = entry.metadata.id.to_string();
-        result.push(Document::new(
-            Provenance {
-                path: format!(".nunc/entries/{id}.md"),
-                id,
-                kind: Kind::Memory,
-                timestamp: Some(entry.metadata.timestamp.to_rfc3339()),
-                line_start: None,
-                line_end: None,
-                matched_chunk: None,
-                entry_kind: Some(entry.metadata.kind),
-                git: entry.metadata.commit,
-                visibility: None,
-            },
-            entry.body,
-            true,
-        ));
+        result.insert(path.strip_prefix(&repo.root)?.to_path_buf());
     }
     Ok(result)
+}
+
+fn memory_document(entry: entries::Entry) -> Document {
+    let id = entry.metadata.id.to_string();
+    Document::new(
+        Provenance {
+            path: format!(".nunc/entries/{id}.md"),
+            id,
+            kind: Kind::Memory,
+            timestamp: Some(entry.metadata.timestamp.to_rfc3339()),
+            line_start: None,
+            line_end: None,
+            matched_chunk: None,
+            entry_kind: Some(entry.metadata.kind),
+            git: entry.metadata.commit,
+            visibility: None,
+        },
+        entry.body,
+        true,
+    )
+}
+
+pub(crate) fn memories(repo: &Repo, ledger: &Ledger) -> Result<Vec<Document>> {
+    let mut documents = Vec::new();
+    for path in memory_paths(repo, ledger)? {
+        let entry = entries::read(&repo.root.join(path))?;
+        if !ledger.pending_summary(&entry) {
+            documents.push(memory_document(entry));
+        }
+    }
+    Ok(documents)
 }
 
 fn source_files(repo: &Repo, roots: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
@@ -578,49 +688,95 @@ mod tests {
     use super::*;
 
     #[test]
+    fn journal_manifest_reuses_stamps_and_checks_summary_publication() -> Result<()> {
+        let summary = uuid::Uuid::new_v4();
+        let ledger: Ledger = serde_json::from_value(serde_json::json!({
+            "summaries": { summary.to_string(): {"sources": [], "undone": false} }
+        }))?;
+        let stable = || SourceStamp {
+            fields: [0; 6],
+            changed: (0, 1),
+            modified: (0, 1),
+        };
+        let seen = InputObservations {
+            basis: "basis".into(),
+            fingerprint: None,
+            observed: vec![],
+            journal: vec![
+                ("regular.md".into(), stable()),
+                ("summary.md".into(), stable()),
+                ("touched.md".into(), stable()),
+            ],
+        };
+        let state = |stamp, summary, indexed| JournalState {
+            file: SourceState {
+                stamp,
+                revision: Some("revision".into()),
+            },
+            summary,
+            indexed,
+        };
+        let previous = || {
+            BTreeMap::from([
+                ("regular.md".into(), state(Some(stable()), None, true)),
+                (
+                    "summary.md".into(),
+                    state(Some(stable()), Some(summary), false),
+                ),
+                ("touched.md".into(), state(None, None, true)),
+            ])
+        };
+        let reopen = |path: &Path| {
+            assert_eq!(path, Path::new("touched.md"));
+            Ok(state(Some(stable()), None, true))
+        };
+        assert!(seen.journal_matches(&Ledger::default(), previous(), reopen)?);
+        assert!(!seen.journal_matches(&ledger, previous(), reopen)?);
+        Ok(())
+    }
+
+    #[test]
     fn source_manifest_rereads_only_changed_or_unreliable_files() -> Result<()> {
         let stable = || SourceStamp {
             fields: [0; 6],
             changed: (0, 1),
             modified: (0, 1),
         };
-        let seen = SourceInputs {
+        let seen = InputObservations {
             basis: "basis".into(),
             fingerprint: None,
+            journal: vec![],
             observed: vec![
                 ("good.md".into(), Some(stable())),
                 ("touched.md".into(), Some(stable())),
                 ("new-empty.md".into(), Some(stable())),
             ],
         };
-        let manifest = SourceManifest {
-            basis: "basis".into(),
-            files: BTreeMap::from([
-                (
-                    "good.md".into(),
-                    SourceState {
-                        stamp: Some(stable()),
-                        revision: Some("good".into()),
-                    },
-                ),
-                (
-                    "touched.md".into(),
-                    SourceState {
-                        stamp: None,
-                        revision: Some("same".into()),
-                    },
-                ),
-                (
-                    "removed-empty.md".into(),
-                    SourceState {
-                        stamp: Some(stable()),
-                        revision: None,
-                    },
-                ),
-            ]),
-        };
+        let files = BTreeMap::from([
+            (
+                "good.md".into(),
+                SourceState {
+                    stamp: Some(stable()),
+                    revision: Some("good".into()),
+                },
+            ),
+            (
+                "touched.md".into(),
+                SourceState {
+                    stamp: None,
+                    revision: Some("same".into()),
+                },
+            ),
+            (
+                "removed-empty.md".into(),
+                SourceState {
+                    stamp: Some(stable()),
+                    revision: None,
+                },
+            ),
+        ]);
         let mut opened = Vec::new();
-        assert!(seen.matches_manifest(manifest, |path| {
+        assert!(seen.matches_manifest(files, |path| {
             opened.push(path.to_path_buf());
             Ok((path == Path::new("touched.md")).then(|| "same".into()))
         })?);

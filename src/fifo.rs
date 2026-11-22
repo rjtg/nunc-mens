@@ -144,6 +144,15 @@ fn fifo_metadata(file: &File) -> Result<Metadata> {
 }
 
 pub fn serve(repo: &Repo, boundary: Option<String>, sources: &[PathBuf]) -> Result<()> {
+    serve_with_search(repo, boundary, sources, false)
+}
+
+pub(crate) fn serve_with_search(
+    repo: &Repo,
+    boundary: Option<String>,
+    sources: &[PathBuf],
+    search_socket: bool,
+) -> Result<()> {
     let boundary = Boundary::new(boundary)?;
     repo.prepare()?;
     let runtime = Runtime::new(repo);
@@ -158,6 +167,9 @@ pub fn serve(repo: &Repo, boundary: Option<String>, sources: &[PathBuf]) -> Resu
     repo.config()?;
     let stop = Arc::new(AtomicBool::new(false));
     let _signals = Signals::new(&stop)?;
+    let endpoint = search_socket
+        .then(|| crate::search_socket::Endpoint::bind(repo))
+        .transpose()?;
     create_fifo(&runtime.fifo)?;
     let _running = Running(&runtime);
     let mut pipe = File::options()
@@ -187,12 +199,21 @@ pub fn serve(repo: &Repo, boundary: Option<String>, sources: &[PathBuf]) -> Resu
             runtime.fifo.display(),
             boundary.value()
         )?;
+        if let Some(endpoint) = &endpoint {
+            writeln!(out, "Search socket {}", endpoint.path().display())?;
+        }
         out.flush()?;
         Ok(())
     };
     publish().context("print server endpoint")?;
-    watch::during_capture(repo, || {
-        read_frames(&mut pipe, &stop, &boundary, repo, &runtime)
+    let model = crate::model::SharedModel::default();
+    watch::during_capture(repo, &model, || {
+        let mut capture = || read_frames(&mut pipe, &stop, &boundary, repo, &runtime);
+        if let Some(endpoint) = &endpoint {
+            endpoint.during_capture(repo, &model, &stop, capture)
+        } else {
+            capture()
+        }
     })
 }
 

@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -1052,6 +1054,197 @@ fn keyword_index_upgrades_to_shared_semantic_chunks() -> Result<()> {
         hybrid(&["--raw"])?["results"].as_array().map(Vec::len),
         Some(1)
     );
+    Ok(())
+}
+
+#[test]
+fn socket_search_preserves_formats_visibility_and_rebuilds() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let note = fixture.log_id("WriterLock guards commit publication")?;
+    fixture.run(&["reindex", "--keyword-only"])?;
+    let unavailable = fixture
+        .nunc(&["search", "--server", "WriterLock"])
+        .output()?;
+    assert!(!unavailable.status.success());
+    assert!(String::from_utf8(unavailable.stderr)?.contains("nunc serve --search-socket"));
+    let mut server = Server::start(&fixture, &["--search-socket"])?;
+    let socket = fixture.local().join("search-runtime/search.sock");
+    assert_eq!(fs::metadata(&socket)?.permissions().mode() & 0o777, 0o600);
+    for format in [
+        &["--json", "--explain"][..],
+        &["--ids"],
+        &["--format", "markdown", "--explain"],
+        &["--context", "parent", "--max-tokens", "800"],
+    ] {
+        let mut args = vec!["search", "--mode", "keyword", "WriterLock"];
+        args.extend_from_slice(format);
+        let ordinary = fixture.run(&args)?;
+        args.push("--server");
+        let remote = fixture.run(&args)?;
+        assert_eq!(ordinary.stdout, remote.stdout);
+        assert_eq!(ordinary.stderr, remote.stderr);
+    }
+    let mut clients = Vec::new();
+    for _ in 0..4 {
+        clients.push(
+            fixture
+                .nunc(&[
+                    "search",
+                    "--server",
+                    "--mode",
+                    "keyword",
+                    "WriterLock",
+                    "--json",
+                ])
+                .stdout(Stdio::piped())
+                .spawn()?,
+        );
+    }
+    fixture.run(&["write", "WriterLock also protects the new checkpoint"])?;
+    eventually(|| Ok(fixture.entries()?.len() == 2))?;
+    fixture.run(&["reindex", "--keyword-only", "--full"])?;
+    for client in clients {
+        let output: Value = serde_json::from_slice(&checked(client.wait_with_output()?)?.stdout)?;
+        assert_eq!(output["mode_used"], "keyword");
+    }
+    fixture.run(&["archive", &note])?;
+    let search = |extra: &[&str]| {
+        let mut args = vec![
+            "search",
+            "--server",
+            "--mode",
+            "keyword",
+            "WriterLock",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        fixture.json(&args)
+    };
+    assert_eq!(search(&[])?["results"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        search(&["--raw"])?["results"].as_array().map(Vec::len),
+        Some(2)
+    );
+    fixture.run(&["forget", &note, "--yes"])?;
+    assert_eq!(
+        search(&["--raw"])?["results"].as_array().map(Vec::len),
+        Some(1)
+    );
+    server.stop()?;
+    assert!(!socket.exists());
+    Ok(())
+}
+
+#[test]
+fn socket_rejects_wrong_commands_versions_and_frames_and_recovers_after_restart() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.log_id("WriterLock guards commit publication")?;
+    fixture.run(&["reindex", "--keyword-only"])?;
+    let mut server = Server::start(&fixture, &["--search-socket"])?;
+    let socket = fixture.local().join("search-runtime/search.sock");
+    let check = |payload: Option<Value>, expected: &str| -> Result<()> {
+        let mut stream = UnixStream::connect(&socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut status = [0];
+        stream.read_exact(&mut status)?;
+        assert_eq!(status, [2]);
+        if let Some(payload) = payload {
+            let payload = serde_json::to_vec(&payload)?;
+            stream.write_all(&u32::try_from(payload.len())?.to_be_bytes())?;
+            stream.write_all(&payload)?;
+        } else {
+            stream.write_all(&u32::MAX.to_be_bytes())?;
+        }
+        stream.read_exact(&mut status)?;
+        assert_eq!(status, [1]);
+        let mut length = [0; 4];
+        stream.read_exact(&mut length)?;
+        let mut body = vec![0; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut body)?;
+        assert!(String::from_utf8(body)?.contains(expected));
+        Ok(())
+    };
+    check(None, "size limit")?;
+    check(
+        Some(serde_json::json!({"version": 2, "args": []})),
+        "protocol version",
+    )?;
+    let args = ["nunc", "log", "unexpected"].map(str::as_bytes);
+    check(
+        Some(serde_json::json!({"version": 1, "args": args})),
+        "search invocations",
+    )?;
+    assert_eq!(fixture.entries()?.len(), 1);
+    let stalled = UnixStream::connect(&socket)?;
+    server.stop()?;
+    drop(stalled);
+    let mut server = Server::start(&fixture, &["--search-socket"])?;
+    server.0.kill()?;
+    server.0.wait()?;
+    assert!(socket.exists());
+    let mut restarted = Server::start(&fixture, &["--search-socket"])?;
+    let args = [
+        "search",
+        "--server",
+        "--mode",
+        "keyword",
+        "WriterLock",
+        "--json",
+    ];
+    eventually(|| Ok(fixture.nunc(&args).output()?.status.success()))?;
+    restarted.stop()?;
+    assert!(!socket.exists());
+    fs::write(&socket, "unrelated file")?;
+    let rejected = fixture.nunc(&["serve", "--search-socket"]).output()?;
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8(rejected.stderr)?.contains("must be a Unix socket"));
+    assert_eq!(fs::read_to_string(&socket)?, "unrelated file");
+    Ok(())
+}
+
+#[test]
+fn search_socket_bounds_the_waiting_queue() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut server = Server::start(&fixture, &["--search-socket"])?;
+    let socket = fixture.local().join("search-runtime/search.sock");
+    let mut active = UnixStream::connect(&socket)?;
+    active.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut status = [0];
+    active.read_exact(&mut status)?;
+    assert_eq!(status, [2]);
+    let queued = (0..8)
+        .map(|_| UnixStream::connect(&socket))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let busy = fixture.nunc(&["search", "--server", "query"]).output()?;
+    assert!(!busy.status.success());
+    assert!(String::from_utf8(busy.stderr)?.contains("server is busy"));
+    drop(queued);
+    drop(active);
+    server.stop()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn socket_search_matches_standalone_with_real_embeddings() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let id = fixture.log_id("WriterLock serializes commit publication in SQLite.")?;
+    fixture.run(&["reindex"])?;
+    let mut server = Server::start(&fixture, &["--search-socket"])?;
+    for mode in ["semantic", "hybrid"] {
+        let standalone = fixture.run(&["search", "--mode", mode, "WriterLock", "--json"])?;
+        for _ in 0..2 {
+            let remote =
+                fixture.run(&["search", "--server", "--mode", mode, "WriterLock", "--json"])?;
+            assert_eq!(remote.stdout, standalone.stdout);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&remote.stdout)?["results"][0]["id"],
+                id
+            );
+        }
+    }
+    server.stop()?;
     Ok(())
 }
 

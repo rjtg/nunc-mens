@@ -1,5 +1,5 @@
 use crate::index::{Index, Refresh};
-use crate::model::{self, LocalModel};
+use crate::model::SharedModel;
 use crate::repo::Repo;
 use anyhow::{Context, Result, anyhow};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -8,12 +8,16 @@ use std::time::Duration;
 
 const INTERVAL: Duration = Duration::from_secs(2);
 
-pub(crate) fn during_capture(repo: &Repo, capture: impl FnOnce() -> Result<()>) -> Result<()> {
+pub(crate) fn during_capture(
+    repo: &Repo,
+    model: &SharedModel,
+    capture: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     thread::scope(|scope| {
         let (stop, receiver) = mpsc::channel::<()>();
         let worker = thread::Builder::new()
             .name("nunc-index".into())
-            .spawn_scoped(scope, move || watch(repo, receiver))
+            .spawn_scoped(scope, move || watch(repo, model, receiver))
             .context("start index watcher")?;
 
         let captured = capture();
@@ -25,11 +29,10 @@ pub(crate) fn during_capture(repo: &Repo, capture: impl FnOnce() -> Result<()>) 
     })
 }
 
-fn watch(repo: &Repo, stop: Receiver<()>) {
-    let mut model = None;
+fn watch(repo: &Repo, model: &SharedModel, stop: Receiver<()>) {
     let mut last_error = None;
     loop {
-        match refresh(repo, &mut model) {
+        match model.with(repo, |model| Index::for_repo(repo)?.refresh(model, false)) {
             Ok(Refresh {
                 documents,
                 embedded,
@@ -54,16 +57,4 @@ fn watch(repo: &Repo, stop: Receiver<()>) {
             break;
         }
     }
-}
-
-fn refresh(repo: &Repo, cached: &mut Option<LocalModel>) -> Result<Refresh> {
-    if let Err(error) = model::check_cache(repo) {
-        *cached = None;
-        return Err(error);
-    }
-    if cached.is_none() {
-        *cached = Some(LocalModel::load(repo)?);
-    }
-    let model = cached.as_mut().context("no cached ONNX session")?;
-    Index::for_repo(repo)?.refresh(model, false)
 }

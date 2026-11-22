@@ -12,6 +12,7 @@
 /.nunc/input.fifo
 /.nunc/session.json
 /.nunc/*.sock
+/.nunc/search-runtime/
 /.nunc/*.lock
 /.nunc/*.pid
 /.nunc/index*

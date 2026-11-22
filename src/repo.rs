@@ -11,8 +11,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 const OLD_IGNORE: &[u8] = b"/entries/\n/input.fifo\n/session.json\n/*.lock\n/.tmp*\n";
-const LOCAL_IGNORE: &[u8] =
+const PREVIOUS_IGNORE: &[u8] =
     b"/entries/\n/ledger.json\n/input.fifo\n/session.json\n/*.lock\n/.tmp*\n";
+const LOCAL_IGNORE: &[u8] =
+    b"/entries/\n/ledger.json\n/input.fifo\n/session.json\n/search-runtime/\n/*.lock\n/.tmp*\n";
 
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -101,8 +103,10 @@ impl Repo {
         private_dir(&self.local())?;
         let local = self.local();
         let ignore = local.join(".gitignore");
-        let old_default =
-            || read_regular(&ignore, 4096).is_ok_and(|contents| contents == OLD_IGNORE);
+        let old_default = || {
+            read_regular(&ignore, 4096)
+                .is_ok_and(|contents| contents == OLD_IGNORE || contents == PREVIOUS_IGNORE)
+        };
         if !ignore.try_exists()? || old_default() {
             let _lock = self.config_lock()?;
             if !ignore.try_exists()? {

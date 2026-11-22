@@ -37,3 +37,16 @@ The profiling feature adds no CLI arguments. Setting `NUNC_SEARCH_PROFILE=1` emi
 Measurements include the machine, platform, model revision, index cost recorded separately from search, phase, mode, filter, latency, memory, and raw timings. The small-scale retrieval comparison is documented separately. [Retrieval comparison](../../docs/BENCHMARK_QMD.md)
 
 The [recorded baseline](../../docs/BENCHMARK_SCALE.md) links to the raw 1,000–100,000 chunk measurements. Recreate all of its tables with `python3 -B -m benchmarks.performance.summarize benchmarks/performance/results/standalone-linux-x86_64.jsonl.gz`.
+
+## Resident endpoint comparison
+
+Use a fresh scale fixture whose index has already been built with the pinned model. The comparator starts its own foreground server, requires byte-identical JSON from both transports, and checks that warm vector requests do not reload ONNX.
+
+```sh
+python3 -B -m benchmarks.performance.compare_socket \
+  --repo "$scratch/fixtures/1000/repo" --state "$scratch/fixtures/1000/state" \
+  --nunc target/release/nunc --model-cache "$NUNC_MODEL_CACHE_DIR" \
+  --query "Verifying download integrity" --samples 5 --output "$scratch/socket.jsonl"
+```
+
+The output includes separate client wall times and server stages. The first socket request is marked cold. Socket publication happens before a model load necessarily finishes, so the first query includes any wait for model initialization. Later samples each start a fresh CLI client while the server stays alive. Use a fixture path short enough for the platform's Unix socket pathname limit.

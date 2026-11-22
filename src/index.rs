@@ -12,6 +12,7 @@ use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 #[path = "index_health.rs"]
 pub(crate) mod health;
@@ -92,8 +93,11 @@ pub(crate) struct Refresh {
     pub deleted: usize,
 }
 
+#[derive(Default)]
+pub(crate) struct ReadCache(Option<(PathBuf, u64, u64, Rc<Connection>)>);
+
 pub(crate) struct Reader {
-    conn: Connection,
+    conn: Rc<Connection>,
     _lock: File,
     pub digest: String,
     pub strategy: Strategy,
@@ -249,30 +253,47 @@ impl<'a> Index<'a> {
     }
 
     pub(crate) fn read(&self, model: Model) -> Result<Option<Reader>> {
-        self.read_mode(model, true, false)
+        self.read_mode(model, true, false, &mut ReadCache::default())
     }
 
+    #[cfg(test)]
     pub(crate) fn read_keyword(&self, model: Model) -> Result<Option<Reader>> {
-        self.read_mode(model, false, true)
+        self.read_mode(model, false, true, &mut ReadCache::default())
     }
 
-    pub(crate) fn read_hybrid(&self, model: Model) -> Result<Option<Reader>> {
-        self.read_mode(model, true, true)
-    }
-
-    fn read_mode(&self, model: Model, semantic: bool, keyword: bool) -> Result<Option<Reader>> {
+    pub(crate) fn read_mode(
+        &self,
+        model: Model,
+        semantic: bool,
+        keyword: bool,
+        cache: &mut ReadCache,
+    ) -> Result<Option<Reader>> {
         let path = self.path();
         if !existing_private_file(&path)? {
+            cache.0 = None;
             return Ok(None);
         }
         private_dir(&self.dir)?;
         let lock = lockfile(&self.dir.join("index.lock"))?;
         lock.lock_shared().context("lock index for reading")?;
         let open_reader = || -> Result<Option<Reader>> {
-            if !existing_private_file(&path)? {
+            let Some(meta) = private_file_metadata(&path)? else {
+                cache.0 = None;
                 return Ok(None);
-            }
-            let conn = open(&path, true)?;
+            };
+            let conn = match &cache.0 {
+                Some((cached_path, dev, ino, conn))
+                    if *cached_path == path && *dev == meta.dev() && *ino == meta.ino() =>
+                {
+                    Rc::clone(conn)
+                }
+                _ => {
+                    cache.0 = None;
+                    let conn = Rc::new(open(&path, true)?);
+                    cache.0 = Some((path.clone(), meta.dev(), meta.ino(), Rc::clone(&conn)));
+                    conn
+                }
+            };
             let digest = check(&conn, self.repo, model)?;
             if keyword {
                 ensure!(
@@ -365,6 +386,10 @@ impl Embedder for KeywordLayout {
 }
 
 fn existing_private_file(path: &Path) -> Result<bool> {
+    Ok(private_file_metadata(path)?.is_some())
+}
+
+fn private_file_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             ensure!(
@@ -375,9 +400,9 @@ fn existing_private_file(path: &Path) -> Result<bool> {
                 "index artifact must be a private regular file: {}",
                 path.display()
             );
-            Ok(true)
+            Ok(Some(meta))
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
     }
 }
@@ -900,6 +925,52 @@ mod tests {
             }
             Ok(passages.iter().map(|_| vec![1.0, -0.5]).collect())
         }
+    }
+
+    #[test]
+    fn retained_reader_observes_commits_and_reopens_after_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir(&root)?;
+        let repo = Repo::new(&root)?;
+        let index = Index {
+            repo: &repo,
+            dir: temp.path().join("state"),
+        };
+        let mut model = Mock::default();
+        index.refresh(&mut model, true)?;
+        let mut cache = ReadCache::default();
+        let open = |cache: &mut ReadCache| {
+            index
+                .read_mode(MODEL, true, true, cache)?
+                .context("missing test index")
+        };
+        let first = open(&mut cache)?;
+        let connection = Rc::clone(&first.conn);
+        drop(first);
+        entries::persist(&repo, "an incremental document", ContextFields::default())?;
+        index.refresh(&mut model, false)?;
+        let updated = open(&mut cache)?;
+        assert!(Rc::ptr_eq(&connection, &updated.conn));
+        assert_eq!(
+            updated
+                .conn
+                .query_row("SELECT count(*) FROM documents", [], |r| r
+                    .get::<_, usize>(0))?,
+            1
+        );
+        drop(updated);
+        index.refresh(&mut model, true)?;
+        let replaced = open(&mut cache)?;
+        assert!(!Rc::ptr_eq(&connection, &replaced.conn));
+        assert_eq!(
+            replaced
+                .conn
+                .query_row("SELECT count(*) FROM documents", [], |r| r
+                    .get::<_, usize>(0))?,
+            1
+        );
+        Ok(())
     }
 
     #[test]

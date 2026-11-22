@@ -17,6 +17,7 @@ mod profile;
 mod protocol;
 pub mod repo;
 mod search;
+mod search_socket;
 mod timeline;
 mod topics;
 mod vectors;

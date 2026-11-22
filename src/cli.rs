@@ -3,18 +3,20 @@ use crate::duplicates::{self, DEFAULT_THRESHOLD};
 use crate::entries::{self, ContextFields, MAX_BODY};
 use crate::fifo::{self, Delivery};
 use crate::git;
-use crate::index::Index;
+use crate::index::{Index, ReadCache};
 use crate::ledger::{self, Guard, Ledger};
-use crate::model::{self, LocalModel, MODEL};
+use crate::model::{self, LocalModel, MODEL, SharedModel};
 use crate::profile::{self, Stage};
 use crate::repo::Repo;
 use crate::search::{self, ContextMode, Sort};
+use crate::search_socket;
 use crate::timeline::{self, Anchor, DatedEvent, Event, EventKind, NeighborReport, TimeFilter};
 use crate::topics;
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -49,6 +51,9 @@ enum Action {
         boundary: Option<String>,
         #[arg(long)]
         source: Vec<PathBuf>,
+        /// Also serve searches over a private Unix socket.
+        #[arg(long)]
+        search_socket: bool,
     },
     /// Capture through the FIFO when available, or save directly.
     Write {
@@ -90,54 +95,7 @@ enum Action {
         keyword_only: bool,
     },
     /// Search by semantic similarity or list recorded activities by date.
-    Search {
-        #[arg(required_unless_present_any = ["similar_to", "yesterday", "date", "since", "from", "to"], num_args = 1..)]
-        query: Vec<String>,
-        /// Rank other documents using this memory UUID or registered file.
-        #[arg(long, conflicts_with = "query", value_name = "ID_OR_FILE")]
-        similar_to: Option<String>,
-        /// Select semantic or keyword retrieval.
-        #[arg(long, value_enum, default_value = "semantic")]
-        mode: search::Mode,
-        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=1000))]
-        limit: u32,
-        #[arg(long)]
-        json: bool,
-        /// Print ranked parent IDs, one per line.
-        #[arg(long, conflicts_with_all = ["json", "explain"])]
-        ids: bool,
-        /// Render one source-attributed Markdown document.
-        #[arg(long, value_enum, conflicts_with_all = ["json", "ids"])]
-        format: Option<SearchFormat>,
-        /// Cap estimated context tokens, including per-result provenance.
-        #[arg(long, conflicts_with = "ids", value_parser = clap::value_parser!(u32).range(1..))]
-        max_tokens: Option<u32>,
-        #[arg(long = "type")]
-        kind: Option<Kind>,
-        #[arg(long)]
-        source: Vec<PathBuf>,
-        /// Restrict results to this exact registered source file. Repeat to add files.
-        #[arg(long)]
-        source_file: Vec<PathBuf>,
-        #[arg(long, value_enum, default_value = "chunk")]
-        context: ContextMode,
-        #[arg(long, value_enum, default_value = "semantic")]
-        sort: Sort,
-        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "0.05")]
-        recency_boost: Option<f64>,
-        #[arg(long)]
-        explain: bool,
-        #[arg(long)]
-        raw: bool,
-        #[command(flatten)]
-        dates: DateArgs,
-        /// Find recorded activities around the semantic matches.
-        #[arg(long, value_enum, requires = "query", conflicts_with_all = ["ids", "format", "max_tokens"])]
-        related_by: Option<RelatedBy>,
-        /// Radius around each match, such as 2h.
-        #[arg(long, requires = "related_by")]
-        window: Option<String>,
-    },
+    Search(SearchArgs),
     /// List recorded memory and Git events in chronological order.
     Timeline {
         #[command(flatten)]
@@ -376,6 +334,59 @@ fn input_stdin() -> Result<String> {
     String::from_utf8(bytes).context("input must be UTF-8")
 }
 
+#[derive(Args)]
+struct SearchArgs {
+    /// Use the running repository search socket.
+    #[arg(long)]
+    server: bool,
+    #[arg(required_unless_present_any = ["similar_to", "yesterday", "date", "since", "from", "to"], num_args = 1..)]
+    query: Vec<String>,
+    /// Rank other documents using this memory UUID or registered file.
+    #[arg(long, conflicts_with = "query", value_name = "ID_OR_FILE")]
+    similar_to: Option<String>,
+    /// Select semantic or keyword retrieval.
+    #[arg(long, value_enum, default_value = "semantic")]
+    mode: search::Mode,
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    limit: u32,
+    #[arg(long)]
+    json: bool,
+    /// Print ranked parent IDs, one per line.
+    #[arg(long, conflicts_with_all = ["json", "explain"])]
+    ids: bool,
+    /// Render one source-attributed Markdown document.
+    #[arg(long, value_enum, conflicts_with_all = ["json", "ids"])]
+    format: Option<SearchFormat>,
+    /// Cap estimated context tokens, including per-result provenance.
+    #[arg(long, conflicts_with = "ids", value_parser = clap::value_parser!(u32).range(1..))]
+    max_tokens: Option<u32>,
+    #[arg(long = "type")]
+    kind: Option<Kind>,
+    #[arg(long)]
+    source: Vec<PathBuf>,
+    /// Restrict results to this exact registered source file. Repeat to add files.
+    #[arg(long)]
+    source_file: Vec<PathBuf>,
+    #[arg(long, value_enum, default_value = "chunk")]
+    context: ContextMode,
+    #[arg(long, value_enum, default_value = "semantic")]
+    sort: Sort,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "0.05")]
+    recency_boost: Option<f64>,
+    #[arg(long)]
+    explain: bool,
+    #[arg(long)]
+    raw: bool,
+    #[command(flatten)]
+    dates: DateArgs,
+    /// Find recorded activities around the semantic matches.
+    #[arg(long, value_enum, requires = "query", conflicts_with_all = ["ids", "format", "max_tokens"])]
+    related_by: Option<RelatedBy>,
+    /// Radius around each match, such as 2h.
+    #[arg(long, requires = "related_by")]
+    window: Option<String>,
+}
+
 pub fn run() -> ExitCode {
     let mut args: Vec<_> = std::env::args_os().collect();
     if let Some(first) = args.get(1).and_then(|arg| arg.to_str())
@@ -385,14 +396,14 @@ pub fn run() -> ExitCode {
     {
         args.insert(1, "log".into());
     }
-    let cli = Cli::parse_from(args);
+    let cli = Cli::parse_from(&args);
     let error_status = if matches!(cli.command, Action::Diff { .. }) {
         ExitCode::from(2)
     } else {
         ExitCode::FAILURE
     };
-    let _session = matches!(cli.command, Action::Search { .. }).then(profile::begin);
-    match execute(cli.command) {
+    let _session = matches!(cli.command, Action::Search(_)).then(profile::begin);
+    match execute(cli.command, &args) {
         Ok(status) => status,
         Err(error) => {
             eprintln!("nunc: {error:#}");
@@ -401,7 +412,7 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn execute(action: Action) -> Result<ExitCode> {
+fn execute(action: Action, argv: &[OsString]) -> Result<ExitCode> {
     let repo = profile::measure(Stage::Repository, Repo::discover)?;
     match action {
         Action::Init { source } => {
@@ -422,7 +433,11 @@ fn execute(action: Action) -> Result<ExitCode> {
                 },
             )?);
         }
-        Action::Serve { boundary, source } => fifo::serve(&repo, boundary, &source)?,
+        Action::Serve {
+            boundary,
+            source,
+            search_socket,
+        } => fifo::serve_with_search(&repo, boundary, &source, search_socket)?,
         Action::Write {
             input,
             check_duplicates,
@@ -492,173 +507,21 @@ fn execute(action: Action) -> Result<ExitCode> {
             let different = crate::diff::compare(&repo, old, new, &mut io::stdout().lock())?;
             return Ok(ExitCode::from(u8::from(different)));
         }
-        Action::Search {
-            query,
-            similar_to,
-            mode,
-            limit,
-            json,
-            ids,
-            format,
-            max_tokens,
-            kind,
-            source,
-            source_file,
-            context,
-            sort,
-            recency_boost,
-            explain,
-            raw,
-            dates,
-            related_by,
-            window,
-        } => {
-            let markdown = matches!(format, Some(SearchFormat::Markdown));
-            let options = search::Options {
-                mode,
-                limit: limit as usize,
-                kind,
-                sources: &source,
-                source_files: &source_file,
-                context: if ids { ContextMode::Chunk } else { context },
-                sort,
-                recency_boost,
-                explain,
-                raw,
-                one_per_parent: ids || markdown,
-                max_tokens: max_tokens.map(|value| value as usize),
-                budget_encoding: if markdown {
-                    search::BudgetEncoding::Markdown
-                } else {
-                    search::BudgetEncoding::Json
-                },
-                time: dates.filter(Utc::now())?,
-                neighbor_window: related_by
-                    .map(|_| timeline::duration(window.as_deref().unwrap_or("2h")))
-                    .transpose()?,
-            };
+        Action::Search(args) => {
             let mut out = io::stdout().lock();
-            if query.is_empty() && similar_to.is_none() {
-                ensure!(
-                    options.time.restricted(),
-                    "provide a query, an example or a date filter"
-                );
-                ensure!(
-                    mode == search::Mode::Semantic
-                        && !markdown
-                        && !explain
-                        && max_tokens.is_none()
-                        && recency_boost.is_none()
-                        && !matches!(sort, Sort::Recent)
-                        && matches!(context, ContextMode::Chunk),
-                    "context, formatting, score and budget options require a semantic query"
-                );
-                let events = search::dated(&repo, &options)?;
-                print_events(events, limit as usize, json, ids, false, &mut out)?;
-                return Ok(ExitCode::SUCCESS);
-            }
-            let text = query.join(" ");
-            let query = similar_to
-                .as_deref()
-                .map_or(search::Query::Text(&text), search::Query::Example);
-            let found = search::search(&repo, query, options)?;
-            let _format = profile::span(Stage::Format);
-            if json {
-                serde_json::to_writer(&mut out, &found)?;
-                writeln!(out)?;
+            let mut err = io::stderr().lock();
+            if args.server {
+                search_socket::request(&repo, argv, &mut out, &mut err)?;
             } else {
-                for warning in found.warnings {
-                    eprintln!("nunc: {warning}");
-                }
-                if let Some(pipeline) = &found.pipeline {
-                    pipeline.write(&mut io::stderr().lock())?;
-                }
-                if markdown {
-                    for hit in &found.results {
-                        search::markdown::write_hit(&mut out, hit)?;
-                    }
-                    print_context_usage(found.budget.as_ref());
-                    return Ok(ExitCode::SUCCESS);
-                }
-                if ids {
-                    for hit in found.results {
-                        let id = hit
-                            .source
-                            .matched_chunk
-                            .as_ref()
-                            .map_or(hit.source.id.as_str(), |chunk| chunk.parent_id.as_str());
-                        writeln!(out, "{id}")?;
-                    }
-                    return Ok(ExitCode::SUCCESS);
-                }
-                if found.results.is_empty() {
-                    writeln!(out, "No results")?;
-                }
-                for hit in found.results {
-                    let p = hit.source;
-                    write!(
-                        out,
-                        "{}. {:.4} {} {}",
-                        hit.rank,
-                        hit.score,
-                        p.kind.as_str(),
-                        p.path
-                    )?;
-                    let (first, last) = hit
-                        .context_window
-                        .as_ref()
-                        .map_or((p.line_start, p.line_end), |window| {
-                            (Some(window.line_start), Some(window.line_end))
-                        });
-                    if let (Some(first), Some(last)) = (first, last) {
-                        write!(out, ":{first}-{last}")?;
-                    }
-                    if let Some(visibility) = p.visibility {
-                        write!(out, " {}", visibility.status)?;
-                        if let Some(id) = visibility.archived_into {
-                            write!(out, " → {id}")?;
-                        }
-                        if explain && !visibility.sources.is_empty() {
-                            write!(out, " from {}", serde_json::to_string(&visibility.sources)?)?;
-                        }
-                    }
-                    if let Some(timestamp) = p.timestamp {
-                        write!(out, " {timestamp}")?;
-                    }
-                    if let Some(commit) = p.git {
-                        write!(out, " commit {}", commit.sha)?;
-                    }
-                    writeln!(out, " [{}]\n{}\n", p.id, hit.text)?;
-                    if hit.context_window.is_some_and(|window| window.truncated) {
-                        writeln!(out, "   Context shortened to fit the budget.")?;
-                    }
-                    if let Some(explanation) = hit.explanation {
-                        write!(out, "   {}", explanation.score_summary())?;
-                        if let Some(model) = explanation.model {
-                            write!(out, "; model {} @ {}", model.id, model.revision)?;
-                        }
-                        writeln!(
-                            out,
-                            "; {:?} chunks, {:?} order, {:?} context",
-                            explanation.chunking, explanation.sort, explanation.context
-                        )?;
-                        if let Some(chunk) = p.matched_chunk {
-                            writeln!(
-                                out,
-                                "   matched {} in {} at lines {}–{} {}",
-                                chunk.id,
-                                chunk.parent_id,
-                                chunk.line_start,
-                                chunk.line_end,
-                                chunk.heading_path.join(" / ")
-                            )?;
-                        }
-                    }
-                }
-                print_context_usage(found.budget.as_ref());
-                if let Some(report) = &found.temporal_context {
-                    print_neighbors(report, &mut out)?;
-                }
+                render_search(
+                    &repo,
+                    args,
+                    None,
+                    &mut ReadCache::default(),
+                    &mut out,
+                    &mut err,
+                    &|| Ok(()),
+                )?;
             }
         }
         Action::Timeline { activity, group_by } => print_activity(&repo, activity, group_by)?,
@@ -692,16 +555,228 @@ fn execute(action: Action) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn print_context_usage(budget: Option<&search::BudgetUsage>) {
+pub(crate) fn serve_search(
+    repo: &Repo,
+    argv: Vec<OsString>,
+    model: &SharedModel,
+    cache: &mut ReadCache,
+    output: &mut impl Write,
+    diagnostics: &mut impl Write,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    let parsed = Cli::try_parse_from(argv)?;
+    let Action::Search(args) = parsed.command else {
+        anyhow::bail!("socket requests must be search invocations");
+    };
+    let _session = profile::begin();
+    render_search(
+        repo,
+        args,
+        Some(model),
+        cache,
+        output,
+        diagnostics,
+        checkpoint,
+    )
+}
+
+fn render_search(
+    repo: &Repo,
+    args: SearchArgs,
+    model: Option<&SharedModel>,
+    cache: &mut ReadCache,
+    out: &mut impl Write,
+    err: &mut impl Write,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    let SearchArgs {
+        server: _,
+        query,
+        similar_to,
+        mode,
+        limit,
+        json,
+        ids,
+        format,
+        max_tokens,
+        kind,
+        source,
+        source_file,
+        context,
+        sort,
+        recency_boost,
+        explain,
+        raw,
+        dates,
+        related_by,
+        window,
+    } = args;
+    let markdown = matches!(format, Some(SearchFormat::Markdown));
+    let options = search::Options {
+        mode,
+        limit: limit as usize,
+        kind,
+        sources: &source,
+        source_files: &source_file,
+        context: if ids { ContextMode::Chunk } else { context },
+        sort,
+        recency_boost,
+        explain,
+        raw,
+        one_per_parent: ids || markdown,
+        max_tokens: max_tokens.map(|value| value as usize),
+        budget_encoding: if markdown {
+            search::BudgetEncoding::Markdown
+        } else {
+            search::BudgetEncoding::Json
+        },
+        time: dates.filter(Utc::now())?,
+        neighbor_window: related_by
+            .map(|_| timeline::duration(window.as_deref().unwrap_or("2h")))
+            .transpose()?,
+    };
+    checkpoint()?;
+    if query.is_empty() && similar_to.is_none() {
+        ensure!(
+            options.time.restricted(),
+            "provide a query, an example or a date filter"
+        );
+        ensure!(
+            mode == search::Mode::Semantic
+                && !markdown
+                && !explain
+                && max_tokens.is_none()
+                && recency_boost.is_none()
+                && !matches!(sort, Sort::Recent)
+                && matches!(context, ContextMode::Chunk),
+            "context, formatting, score and budget options require a semantic query"
+        );
+        let events = search::dated(repo, &options)?;
+        print_events(events, limit as usize, json, ids, false, out)?;
+        return Ok(());
+    }
+    let text = query.join(" ");
+    let query = similar_to
+        .as_deref()
+        .map_or(search::Query::Text(&text), search::Query::Example);
+    let found = search::search_with(repo, query, options, model, cache, checkpoint)?;
+    checkpoint()?;
+    let _format = profile::span(Stage::Format);
+    if json {
+        serde_json::to_writer(&mut *out, &found)?;
+        writeln!(out)?;
+    } else {
+        for warning in found.warnings {
+            writeln!(err, "nunc: {warning}")?;
+        }
+        if let Some(pipeline) = &found.pipeline {
+            pipeline.write(err)?;
+        }
+        if markdown {
+            for hit in &found.results {
+                search::markdown::write_hit(out, hit)?;
+            }
+            print_context_usage(found.budget.as_ref(), err)?;
+            return Ok(());
+        }
+        if ids {
+            for hit in found.results {
+                let id = hit
+                    .source
+                    .matched_chunk
+                    .as_ref()
+                    .map_or(hit.source.id.as_str(), |chunk| chunk.parent_id.as_str());
+                writeln!(out, "{id}")?;
+            }
+            return Ok(());
+        }
+        if found.results.is_empty() {
+            writeln!(out, "No results")?;
+        }
+        for hit in found.results {
+            let p = hit.source;
+            write!(
+                out,
+                "{}. {:.4} {} {}",
+                hit.rank,
+                hit.score,
+                p.kind.as_str(),
+                p.path
+            )?;
+            let (first, last) = hit
+                .context_window
+                .as_ref()
+                .map_or((p.line_start, p.line_end), |window| {
+                    (Some(window.line_start), Some(window.line_end))
+                });
+            if let (Some(first), Some(last)) = (first, last) {
+                write!(out, ":{first}-{last}")?;
+            }
+            if let Some(visibility) = p.visibility {
+                write!(out, " {}", visibility.status)?;
+                if let Some(id) = visibility.archived_into {
+                    write!(out, " → {id}")?;
+                }
+                if explain && !visibility.sources.is_empty() {
+                    write!(out, " from {}", serde_json::to_string(&visibility.sources)?)?;
+                }
+            }
+            if let Some(timestamp) = p.timestamp {
+                write!(out, " {timestamp}")?;
+            }
+            if let Some(commit) = p.git {
+                write!(out, " commit {}", commit.sha)?;
+            }
+            writeln!(out, " [{}]\n{}\n", p.id, hit.text)?;
+            if hit.context_window.is_some_and(|window| window.truncated) {
+                writeln!(out, "   Context shortened to fit the budget.")?;
+            }
+            if let Some(explanation) = hit.explanation {
+                write!(out, "   {}", explanation.score_summary())?;
+                if let Some(model) = explanation.model {
+                    write!(out, "; model {} @ {}", model.id, model.revision)?;
+                }
+                writeln!(
+                    out,
+                    "; {:?} chunks, {:?} order, {:?} context",
+                    explanation.chunking, explanation.sort, explanation.context
+                )?;
+                if let Some(chunk) = p.matched_chunk {
+                    writeln!(
+                        out,
+                        "   matched {} in {} at lines {}–{} {}",
+                        chunk.id,
+                        chunk.parent_id,
+                        chunk.line_start,
+                        chunk.line_end,
+                        chunk.heading_path.join(" / ")
+                    )?;
+                }
+            }
+        }
+        print_context_usage(found.budget.as_ref(), err)?;
+        if let Some(report) = &found.temporal_context {
+            print_neighbors(report, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_context_usage(
+    budget: Option<&search::BudgetUsage>,
+    err: &mut impl Write,
+) -> io::Result<()> {
     if let Some(budget) = budget {
-        eprintln!(
+        writeln!(
+            err,
             "nunc: context budget used {}/{} estimated tokens ({} shortened, {} omitted)",
             budget.estimated_tokens,
             budget.max_tokens,
             budget.truncated_results,
             budget.omitted_candidates,
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn print_activity(repo: &Repo, args: ActivityArgs, group: Option<TimelineGroup>) -> Result<()> {

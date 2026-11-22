@@ -1,8 +1,8 @@
 use crate::chunk::Strategy;
 use crate::documents::{Kind, Provenance, Snapshot};
-use crate::index::{Index, IndexedRow, Reader};
+use crate::index::{Index, IndexedRow, ReadCache, Reader};
 use crate::ledger::Guard;
-use crate::model::{LocalModel, MODEL};
+use crate::model::{LocalModel, MODEL, SharedModel};
 use crate::profile::{self, Stage};
 use crate::repo::{Repo, SourceLocation, source_path};
 use crate::timeline::{self, DatedEvent, NeighborReport, TimeFilter, parse_timestamp};
@@ -425,6 +425,25 @@ pub(crate) fn dated(repo: &Repo, options: &Options<'_>) -> Result<Vec<DatedEvent
 }
 
 pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Result<Results> {
+    search_with(
+        repo,
+        query,
+        options,
+        None,
+        &mut ReadCache::default(),
+        &|| Ok(()),
+    )
+}
+
+pub(crate) fn search_with(
+    repo: &Repo,
+    query: Query<'_>,
+    options: Options<'_>,
+    shared_model: Option<&SharedModel>,
+    read_cache: &mut ReadCache,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<Results> {
+    checkpoint()?;
     let setup = profile::span(Stage::SearchSetup);
     let config = repo.config()?;
     let filter = Filter::new(repo, &config.sources, &options)?;
@@ -443,14 +462,23 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         Query::Text(text) => {
             ensure!(!text.trim().is_empty(), "search query must be nonblank");
             if options.mode != Mode::Keyword {
-                let mut model = profile::measure(Stage::ModelLoad, || LocalModel::load(repo))?;
-                Some(profile::measure(Stage::EmbedQuery, || model.query(text))?)
+                let embed = |model: &mut LocalModel| {
+                    profile::measure(Stage::EmbedQuery, || model.query(text))
+                };
+                Some(if let Some(shared) = shared_model {
+                    shared.with(repo, embed)?
+                } else {
+                    embed(&mut profile::measure(Stage::ModelLoad, || {
+                        LocalModel::load(repo)
+                    })?)?
+                })
             } else {
                 None
             }
         }
         Query::Example(_) => None,
     };
+    checkpoint()?;
     let index_read = profile::span(Stage::IndexRead);
     let guard = Guard::acquire(repo, false)?;
     let archives = guard.ledger.archives()?;
@@ -466,17 +494,20 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         )?),
     };
     let index = Index::for_repo(repo)?;
-    let reader = match options.mode {
-        Mode::Semantic => index
-            .read(MODEL)?
-            .context("index is absent; run nunc reindex")?,
-        Mode::Hybrid => index
-            .read_hybrid(MODEL)?
-            .context("index is absent; run nunc reindex")?,
-        Mode::Keyword => index
-            .read_keyword(MODEL)?
-            .context("index is absent; run nunc reindex --keyword-only")?,
-    };
+    let reader = index
+        .read_mode(
+            MODEL,
+            options.mode != Mode::Keyword,
+            options.mode != Mode::Semantic,
+            read_cache,
+        )?
+        .with_context(|| {
+            if options.mode == Mode::Keyword {
+                "index is absent; run nunc reindex --keyword-only"
+            } else {
+                "index is absent; run nunc reindex"
+            }
+        })?;
     filter.validate_missing(&reader)?;
     let (vector, reference, snapshot_digest) = match example {
         Some(example) => {
@@ -516,7 +547,12 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         }
         included
     };
+    let mut visited = 0;
     let mut visit = |row: IndexedRow<'_, '_>, evidence: Evidence<'_>| -> Result<()> {
+        if visited == 0 {
+            checkpoint()?;
+        }
+        visited = (visited + 1) % 256;
         let filter_span = profile::span(Stage::VisibilityFilter);
         let keyword_branch = matches!(evidence, Evidence::Keyword { .. });
         let counts = if hybrid && keyword_branch {
@@ -653,6 +689,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
             |row, bm25, exact| visit(row, Evidence::Keyword { bm25, exact }),
         )?;
     }
+    checkpoint()?;
     let mut fusion_counts = None;
     let candidates = if hybrid {
         let _fusion = profile::span(Stage::Fusion);
@@ -711,6 +748,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
     drop(context);
     let digest = reader.digest.clone();
     drop(reader);
+    checkpoint()?;
     let current = match snapshot_digest {
         Some(digest) => Ok(digest),
         None => profile::measure(Stage::Freshness, || {
@@ -735,6 +773,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
             Some(format!("Cannot verify index freshness: {error:#}")),
         ),
     };
+    checkpoint()?;
     let temporal_context = if let Some(window) = options.neighbor_window {
         let anchors: Vec<_> = results
             .iter()

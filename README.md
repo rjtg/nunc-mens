@@ -29,6 +29,8 @@ nunc search "token rotation" --related-by time --window 2h --json
 
 Capture works as soon as the binary is installed. `nunc log` (or `nunc "a note"`) saves a durable Markdown file and returns its ID and path. `nunc serve` optionally accepts multiline messages from a repository FIFO and keeps the index current. In another shell, use `nunc write --stdin` to send a message or `nunc write "a note"` for a one-liner.
 
+For repeated searches from the same checkout, run `nunc serve --search-socket` and add `--server` to search requests. The endpoint shares the loaded model with indexing and uses the same search filters and formats. [Persistent search](docs/CLI.md#persistent-search)
+
 Semantic search is the default. For exact terms such as error codes, paths and flags, try `nunc search --mode keyword SQLITE_BUSY`. Use `nunc reindex --keyword-only` to prepare a searchable keyword index without the model. `nunc search --mode hybrid` combines keyword and semantic ranks with the cached model.
 
 ```sh

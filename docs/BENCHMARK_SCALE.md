@@ -32,3 +32,17 @@ The table shows median stage times in seconds on the repeated pass. Scan timers 
 The snapshot check revisits registered sources even when result eligibility is limited to one file. An exact-ticket keyword query restricted to one file at 10,000 chunks returned one match and spent 809 ms in freshness validation and 63 ms in the lexical scan. At the larger sizes snapshot validation dominates all three modes on this corpus. Model initialization also remains a substantial cost in standalone semantic and hybrid search. The measurements give [#30](https://github.com/rjtg/nunc-mens/issues/30) a baseline for model reuse and [#32](https://github.com/rjtg/nunc-mens/issues/32) a baseline for reducing snapshot work. They do not establish a workload that needs ANN.
 
 The repeated pass warms filesystem caches across independent invocations. Persistent-process latency and application cache hits and misses remain unmeasured until those paths exist. [Performance issue](https://github.com/rjtg/nunc-mens/issues/29)
+
+## Resident semantic search at 1,000 chunks
+
+A profiling-enabled release binary ran the unfiltered query “Verifying download integrity” against the same 1,000-chunk fixture on Linux x86-64. Five standalone invocations used independent processes. The socket series started a fresh `nunc serve --search-socket`, sent its first request, then sent five more requests from fresh CLI clients. Each response matched the standalone JSON byte for byte. [Raw measurements](../benchmarks/performance/results/socket-1000-linux-x86_64.jsonl) · [Reproduction instructions](../benchmarks/performance/README.md#resident-endpoint-comparison)
+
+| Transport | Samples | Median wall time |
+| --- | ---: | ---: |
+| Standalone | 5 | 2.016 s |
+| First socket request | 1 | 1.968 s |
+| Warm socket requests | 5 | 0.050 s |
+
+Socket publication took 21 ms. The first request waited for the watcher to initialize the shared model. Standalone model load took 1.803 s at the median. The warm server traces have no model-load stage, and they still record query embedding and freshness checks. The same process retained its SQLite connection across requests. These timings cover one query at one size, with warmed operating-system caches. The client peak RSS in the socket records excludes the resident server.
+
+The profiling binary SHA-256 was `cd973ad777bbb1a307491ffade103e1022ef75f626bec7ea24f03cd855635e4d`.

@@ -1,4 +1,5 @@
 use crate::fs::{lockfile, private_dir, read_regular, sync_dir};
+use crate::profile::{self, Stage};
 use crate::repo::Repo;
 use crate::vectors::{self, Embedder, Model};
 use anyhow::{Context, Result, ensure};
@@ -8,7 +9,9 @@ use fastembed::{
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
@@ -60,6 +63,52 @@ const TOK_CONFIG: Artifact = Artifact {
 const ARTIFACTS: &[Artifact] = &[WEIGHTS, TOKENIZER, CONFIG, SPECIAL, TOK_CONFIG];
 
 pub(crate) struct LocalModel(TextEmbedding, tokenizers::Tokenizer);
+
+#[derive(Default)]
+pub(crate) struct SharedModel(Mutex<Option<(ModelFiles, LocalModel)>>);
+
+#[derive(PartialEq, Eq)]
+struct ModelFiles {
+    dir: PathBuf,
+    artifacts: Vec<ArtifactStamp>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ArtifactStamp {
+    dev: u64,
+    ino: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl SharedModel {
+    pub(crate) fn with<T>(
+        &self,
+        repo: &Repo,
+        use_model: impl FnOnce(&mut LocalModel) -> Result<T>,
+    ) -> Result<T> {
+        let mut cached = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model session lock poisoned"))?;
+        let dir = model_dir(repo)?;
+        let artifacts = match ready(&dir) {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                *cached = None;
+                return Err(error);
+            }
+        };
+        let files = ModelFiles { dir, artifacts };
+        if cached.as_ref().is_none_or(|(known, _)| known != &files) {
+            *cached = None;
+            let model = profile::measure(Stage::ModelLoad, || LocalModel::from_dir(&files.dir))?;
+            *cached = Some((files, model));
+        }
+        let (_, model) = cached.as_mut().context("no cached ONNX session")?;
+        use_model(model)
+    }
+}
 
 impl LocalModel {
     pub(crate) fn load(repo: &Repo) -> Result<Self> {
@@ -136,15 +185,16 @@ fn model_dir(repo: &Repo) -> Result<PathBuf> {
 }
 
 pub(crate) fn check_cache(repo: &Repo) -> Result<()> {
-    ready(&model_dir(repo)?)
+    ready(&model_dir(repo)?).map(drop)
 }
 
-fn ready(dir: &Path) -> Result<()> {
-    let check = || -> Result<()> {
+fn ready(dir: &Path) -> Result<Vec<ArtifactStamp>> {
+    let check = || -> Result<Vec<ArtifactStamp>> {
         ensure!(
             fs::symlink_metadata(dir)?.is_dir(),
             "expected a model directory"
         );
+        let mut stamps = Vec::with_capacity(ARTIFACTS.len());
         for artifact in ARTIFACTS {
             let meta = fs::symlink_metadata(dir.join(artifact.name))
                 .with_context(|| format!("inspect {}", artifact.name))?;
@@ -153,8 +203,14 @@ fn ready(dir: &Path) -> Result<()> {
                 "invalid {}",
                 artifact.name
             );
+            stamps.push(ArtifactStamp {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                modified: (meta.mtime(), meta.mtime_nsec()),
+                changed: (meta.ctime(), meta.ctime_nsec()),
+            });
         }
-        Ok(())
+        Ok(stamps)
     };
     check().with_context(|| format!("model unavailable at {}; run nunc models download (move an incomplete cache aside first)", dir.display()))
 }

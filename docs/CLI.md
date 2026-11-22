@@ -7,7 +7,7 @@
 | `nunc log [--tag TAG]... [--repo LABEL] --stdin` | Reads a note from redirected stdin through EOF and saves it directly. |
 | `nunc TEXT...` | Shorthand for `log` when the first argument is ordinary text and does not name a command. |
 | `nunc write TEXT...` or `nunc write --stdin` | Queues capture via a live FIFO or saves directly when the server is unavailable. |
-| `nunc serve [--boundary TOKEN] [--source PATH]...` | Runs the foreground FIFO and refreshes the index from local files. |
+| `nunc serve [--boundary TOKEN] [--search-socket] [--source PATH]...` | Runs the foreground FIFO and refreshes the index from local files. |
 | `nunc duplicates [ID] [--threshold N] [--limit N] [--exact] [--raw] [--json\|--forget-ids]` | Reviews duplicate groups or emits verified cleanup candidates. |
 | `nunc diff OLD NEW` | Compares the original Markdown bodies of two selected memories. |
 | `nunc git ingest\|import\|sync\|hook` | Captures selected commit history or manages the post-commit hook. |
@@ -16,7 +16,7 @@
 | `nunc unarchive ID... [--dry-run] [--json]` | Restores manually archived memories. |
 | `nunc forget ID... [--dry-run\|--yes] [--json]` | Deletes only the specified entries after warning about dependencies. |
 | `nunc reindex [--full] [--keyword-only] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
-| `nunc search [QUERY...\|--similar-to ID_OR_FILE] [--mode semantic\|keyword\|hybrid] [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Searches by text or example, or lists original events for a time filter. |
+| `nunc search [QUERY...\|--similar-to ID_OR_FILE] [--server] [--mode semantic\|keyword\|hybrid] [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Searches by text or example, or lists original events for a time filter. |
 | `nunc timeline [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--group-by day\|topic] [--entry-kind KIND] [--around ID --window DURATION] [--json\|--ids] [--raw]` | Lists recorded activity or finds neighboring records around a known ID. |
 | `nunc topics [--yesterday\|--since DURATION\|--around ID --window DURATION] [--threshold N] [--json\|--ids] [--raw]` | Groups recorded activity using existing indexed embeddings. |
 | `nunc models download` | Explicitly downloads and validates the pinned model and tokenizer. |
@@ -45,6 +45,20 @@ Use absolute overrides outside the worktree. The index is `<state>/<repo-id>/ind
 ## Search output
 
 Default limit is 5, with a range of 1–1000. `--type` selects memories or sources. An empty result set is successful.
+
+### Persistent search
+
+```sh
+nunc serve --search-socket
+# From another terminal in the same worktree:
+nunc search --server 'SQLite writer lock' --mode hybrid --json
+```
+
+The existing foreground server publishes `.nunc/search-runtime/search.sock` when explicitly requested. Use `search --server` for that checkout's endpoint. The request uses the server's index and model-cache settings. Standalone search remains the default. When an explicit server request fails to connect, nunc reports the endpoint and startup command. Invoke search without `--server` to use a standalone process. Keyword search and search by example retain their usual model requirements.
+
+The client and server share search options and rendering for text, JSON, Markdown, IDs, and timelines. The socket keeps at most eight waiting clients and one active search. Busy requests return a retryable error. The client allows up to 60 seconds for admission and results. Request input and response output each have a two-second I/O deadline. Use `--limit` or `--max-tokens` when a result exceeds the 8 MiB socket response limit.
+
+Closing the connection cancels queued work and stops active work at search checkpoints. An ONNX operation, SQLite operation, or snapshot read in progress may finish before the next checkpoint. The endpoint shares the [read-after-write contract](#read-after-write-across-processes). Use a successful reindex when a caller needs the next query to consider a durable write.
 
 ### Keyword search
 

@@ -195,3 +195,11 @@ In the isolated development journal, the executable logged the decision to time 
 On the generated 1,000-chunk fixture, a profiled model-free keyword query returned ordinary search JSON on stdout and a tagged timing record on stderr. The trace measured about 4.6 ms in the keyword scan and 33 ms in the snapshot freshness check. The fixture and timing process run independently of the development journal.
 
 Formatting, Clippy with both feature settings, all 59 default Rust tests, the targeted profiling executable test with the feature enabled, and six Python benchmark tests passed. The profiling test compares stdout byte for byte with opt-in disabled and confirms that the default build leaves stderr quiet. Cargo checked files where Rust LSP timed out. The Python language server was unavailable, and the Python tests exercised the changed scripts.
+
+## Persistent search
+
+The development journal captured the decision to share the watcher’s ONNX session and reopen the read connection after atomic index replacement. An isolated offline reindex processed seven chunks with zero embeddings. Keyword search for “persistent ONNX SQLite readers” recovered the decision first.
+
+The local benchmark used a profiling-enabled release build and compared the same real semantic query across five standalone invocations, one cold socket request, and five warm socket requests. All returned byte-identical JSON. Warm requests had a median of 50 ms and each trace embedded the query without loading the model again. [Resident benchmark](BENCHMARK_SCALE.md#resident-semantic-search-at-1000-chunks)
+
+Formatting, Clippy in both feature configurations, all 63 default Rust tests, the opt-in real-ONNX socket parity test, and six Python benchmark tests passed. Socket integration covered concurrent clients and FIFO writes, index replacement, archive and forget, framing errors, queue bounds, and stale socket recovery. The sandbox restricted socket binding. The executable tests and benchmark ran with local socket access outside that sandbox. Cargo checked the Rust files where LSP diagnostics were stale. The Python language server was unavailable.

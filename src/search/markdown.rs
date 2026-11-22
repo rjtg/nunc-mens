@@ -42,13 +42,11 @@ pub(crate) fn write_hit(out: &mut impl Write, hit: &Match) -> io::Result<()> {
         }
     }
     if let Some(explanation) = &hit.explanation {
-        writeln!(
-            out,
-            "- Score {:.4} (similarity {:.4}, recency {:.4})",
-            explanation.final_score, explanation.similarity, explanation.recency_contribution
-        )?;
-        field(out, "Model", explanation.model.id)?;
-        field(out, "Model revision", explanation.model.revision)?;
+        writeln!(out, "- Score {}", explanation.score_summary())?;
+        if let Some(model) = explanation.model {
+            field(out, "Model", model.id)?;
+            field(out, "Model revision", model.revision)?;
+        }
     }
 
     // Treat each original excerpt as literal text. A longer outer fence

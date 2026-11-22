@@ -55,9 +55,15 @@ impl Fixture {
     }
 
     fn entries(&self) -> Result<Vec<String>> {
-        fs::read_dir(self.local().join("entries"))?
-            .map(|item| Ok(fs::read_to_string(item?.path())?))
-            .collect()
+        let mut entries = Vec::new();
+        for item in fs::read_dir(self.local().join("entries"))? {
+            let path = item?.path();
+            // The FIFO server can still be staging a note in this directory.
+            if path.extension().is_some_and(|ext| ext == "md") {
+                entries.push(fs::read_to_string(path)?);
+            }
+        }
+        Ok(entries)
     }
 }
 
@@ -840,6 +846,135 @@ fn topic_listing_handles_unindexed_events_and_ledger_visibility() -> Result<()> 
             .as_array()
             .map(Vec::len),
         Some(1)
+    );
+    Ok(())
+}
+
+#[test]
+fn keyword_search_builds_and_updates_without_a_model() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let note = fixture.log_id("# SQLite writer\n\nWriterLock reports SQLITE_BUSY. Pass --summary-stdin.\n\n## Cleanup\n\nRetain a backup.")?;
+    let other = fixture.log_id("The summary stdin option reads from a pipe.")?;
+    fs::create_dir_all(fixture.repo.join("docs/design"))?;
+    fs::write(
+        fixture.repo.join("docs/design/sqlite.md"),
+        "Atomic database publication.",
+    )?;
+    let commit = fixture.commit("state updated", "SQLite transaction checkpoint")?;
+    fixture.run(&["git", "ingest", "HEAD"])?;
+    fixture.run(&["reindex", "--keyword-only", "--source", "docs"])?;
+    let search = |query: &str| {
+        fixture.json(&[
+            "search",
+            "--mode",
+            "keyword",
+            "--explain",
+            "--json",
+            "--",
+            query,
+        ])
+    };
+    for query in ["WriterLock", "SQLITE_BUSY", "--summary-stdin", &note] {
+        let result = search(query)?;
+        assert_eq!(result["mode_used"], "keyword");
+        assert_eq!(result["pipeline"]["keyword"], "applied");
+        assert_eq!(result["pipeline"]["semantic"], "skipped");
+        assert!(
+            result["pipeline"]["scored_chunks"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        assert_eq!(result["results"][0]["id"], note);
+        assert_eq!(result["results"][0]["explanation"]["exact_match"], true);
+        assert!(
+            result["results"][0]["explanation"]
+                .get("similarity")
+                .is_none()
+        );
+    }
+    assert!(
+        search("WriterLock")?["results"][0]["explanation"]["bm25"]
+            .as_f64()
+            .is_some_and(|bm25| bm25 < 0.0)
+    );
+    assert_eq!(
+        search("docs/design/sqlite.md")?["results"][0]["path"],
+        "docs/design/sqlite.md"
+    );
+    for query in [&commit[..12], &commit] {
+        assert_eq!(search(query)?["results"][0]["git"]["sha"], commit);
+    }
+    assert_eq!(search("\"\" \"\"")?["results"], serde_json::json!([]));
+    search("WriterLock\" OR (source:**)")?;
+    let format = fixture.run(&[
+        "search",
+        "--mode",
+        "keyword",
+        "SQLITE_BUSY",
+        "--format",
+        "markdown",
+        "--max-tokens",
+        "200",
+    ])?;
+    assert!(String::from_utf8(format.stdout)?.contains("SQLITE_BUSY"));
+    fixture.run(&["archive", &note])?;
+    assert_eq!(search("SQLITE_BUSY")?["results"], serde_json::json!([]));
+    let raw = fixture.json(&[
+        "search",
+        "--mode",
+        "keyword",
+        "SQLITE_BUSY",
+        "--raw",
+        "--json",
+    ])?;
+    assert_eq!(raw["results"][0]["id"], note);
+    fixture.run(&["unarchive", &note])?;
+    assert_eq!(search("SQLITE_BUSY")?["results"][0]["id"], note);
+    fixture.run(&["forget", &note, "--yes"])?;
+    assert_eq!(search("SQLITE_BUSY")?["results"], serde_json::json!([]));
+    let surviving = search("summary stdin")?;
+    assert_eq!(surviving["results"][0]["id"], other);
+    fs::remove_file(fixture.repo.join("docs/design/sqlite.md"))?;
+    fixture.run(&["reindex", "--keyword-only"])?;
+    assert_eq!(
+        search("database publication")?["results"],
+        serde_json::json!([])
+    );
+    let doctor = fixture.json(&["doctor", "--deep", "--json"])?;
+    assert!(doctor["findings"].get("EMBEDDINGS_PENDING").is_some());
+    assert!(doctor["findings"].get("INVALID_EMBEDDING").is_none());
+    assert!(!fixture.cache.exists());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn keyword_index_upgrades_to_shared_semantic_chunks() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let note = fixture.log_id("# Transactions\n\nWriterLock guards SQLite commit publication.")?;
+    fixture.run(&["reindex", "--keyword-only"])?;
+    let cache = real_model_cache()?;
+    let run = |args: &[&str]| {
+        fixture
+            .nunc(args)
+            .env("NUNC_MODEL_CACHE_DIR", &cache)
+            .output()
+    };
+    let pending = run(&["search", "WriterLock"])?;
+    assert!(!pending.status.success());
+    assert!(String::from_utf8(pending.stderr)?.contains("nunc reindex"));
+    checked(run(&["reindex"])?)?;
+    fixture.run(&["reindex", "--keyword-only"])?;
+    let lexical = fixture.json(&["search", "--mode", "keyword", "WriterLock", "--json"])?;
+    let semantic: Value = serde_json::from_slice(
+        &checked(run(&["search", "serializing database commits", "--json"])?)?.stdout,
+    )?;
+    assert_eq!(lexical["results"][0]["id"], note);
+    assert_eq!(semantic["results"][0]["id"], note);
+    assert!(lexical["results"][0]["matched_chunk"]["id"].is_string());
+    assert_eq!(
+        lexical["results"][0]["matched_chunk"]["id"],
+        semantic["results"][0]["matched_chunk"]["id"]
     );
     Ok(())
 }

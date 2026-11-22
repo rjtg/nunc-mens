@@ -15,8 +15,8 @@
 | `nunc archive ID... [--dry-run] [--json]` | Hides selected memories and keeps their Markdown. |
 | `nunc unarchive ID... [--dry-run] [--json]` | Restores manually archived memories. |
 | `nunc forget ID... [--dry-run\|--yes] [--json]` | Deletes only the specified entries after warning about dependencies. |
-| `nunc reindex [--full] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
-| `nunc search [QUERY...\|--similar-to ID_OR_FILE] [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Searches by text or example, or lists original events for a time filter. |
+| `nunc reindex [--full] [--keyword-only] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
+| `nunc search [QUERY...\|--similar-to ID_OR_FILE] [--mode semantic\|keyword] [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Searches by text or example, or lists original events for a time filter. |
 | `nunc timeline [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--group-by day\|topic] [--entry-kind KIND] [--around ID --window DURATION] [--json\|--ids] [--raw]` | Lists recorded activity or finds neighboring records around a known ID. |
 | `nunc topics [--yesterday\|--since DURATION\|--around ID --window DURATION] [--threshold N] [--json\|--ids] [--raw]` | Groups recorded activity using existing indexed embeddings. |
 | `nunc models download` | Explicitly downloads and validates the pinned model and tokenizer. |
@@ -40,11 +40,23 @@ sources = ["docs", "src", "AGENTS.md"]
 | `NUNC_STATE_DIR` | `$XDG_STATE_HOME/nunc-mens` or `~/.local/state/nunc-mens` |
 | `NUNC_MODEL_CACHE_DIR` | `$XDG_CACHE_HOME/nunc-mens/models` or `~/.cache/nunc-mens/models` |
 
-Use absolute overrides outside the worktree. The index is `<state>/<repo-id>/index.sqlite3`. A clone, linked worktree, or moved worktree uses its own index. The model cache is shared across worktrees using the same cache root. Only the download command fetches model artifacts. A missing model leaves capture usable and makes search or reindex return an actionable error. After model setup, run `nunc reindex` or start the watcher with `nunc serve`.
+Use absolute overrides outside the worktree. The index is `<state>/<repo-id>/index.sqlite3`. A clone, linked worktree, or moved worktree uses its own index. The model cache is shared across worktrees using the same cache root. Only the download command fetches model artifacts. A missing model leaves capture and keyword retrieval usable. After model setup, run `nunc reindex` or start the watcher with `nunc serve` to prepare semantic retrieval.
 
 ## Search output
 
 Default limit is 5, with a range of 1–1000. `--type` selects memories or sources. An empty result set is successful.
+
+### Keyword search
+
+```sh
+nunc reindex --keyword-only --source docs
+nunc search --mode keyword SQLITE_BUSY --explain --json
+nunc search --mode keyword -- --summary-stdin
+```
+
+Semantic search remains the default. Keyword search uses SQLite FTS5 and needs a text query. Run either kind of reindex once to prepare keyword search for an older database. `--keyword-only` uses existing compatible layouts and vectors when available. For new or edited documents it uses structural chunking with an approximate UTF-8 byte budget and can leave semantic indexing pending. A regular reindex restores the configured model-based layout and fills missing vectors. Chunk IDs are preserved wherever the actual chunk text stays identical.
+
+Keyword queries treat input as literal text. Multiword queries match any indexed term. A single path-like or flag-like argument searches the sequence of its terms and promotes literal matches when present. A single indexed relative path, memory UUID, or Git SHA (including prefixes of at least seven hex digits) can match provenance directly. Exact matches score one point plus the normalized BM25 contribution. The contribution is `-bm25 / (1 - bm25)` for SQLite's negative BM25 and zero without a lexical match. Recency contributes separately when requested. Keyword explanations report `exact_match`, `bm25` when scored by FTS5, and the final score.
 
 ### Ranked IDs for shell pipelines
 
@@ -86,7 +98,7 @@ nunc search "SQLite lock" --since 7d --limit 10 --max-tokens 1000 --explain --js
 
 With `--explain`, console and Markdown pipeline diagnostics go to stderr. JSON adds a `pipeline` object with the retrieval mode, stage availability, index freshness and exact counts from the current scan. Counts start with indexed chunks in the selected type scope. The source filter runs first, followed by reference exclusion, ledger visibility and time filtering. After scoring, the report identifies the ranking unit, the count removed by parent deduplication, the count beyond the top-K limit, and budget omissions. Stage exclusions count chunks. Limit and budget counts use the named ranking unit.
 
-Compare the type-scope and source-filter counts to diagnose path scope. Compare the scored, ranked, and returned counts to distinguish limits from budget omissions. A stale index can omit durable entries that the scan never saw. Use `nunc doctor --deep` or `nunc reindex` to check freshness. Diagnostics report aggregate counts for examined rows and never expose forgotten text or IDs. Keyword, fusion and reranking stages report unavailable in the current semantic pipeline.
+Compare the type-scope and source-filter counts to diagnose path scope. In keyword mode, the type-scope count starts at FTS5 and literal provenance matches in that type. Compare the scored, ranked, and returned counts to distinguish limits from budget omissions. A stale index can omit durable entries that the scan never saw. Use `nunc doctor --deep` or `nunc reindex` to check freshness. Diagnostics report aggregate counts for examined rows and never expose forgotten text or IDs. The report identifies the keyword or embedding stage used and the inactive stages.
 
 ### Context budget
 
@@ -270,7 +282,7 @@ Deep diagnostics and repair dry runs open the index read-only and do not downloa
 
 Repair rebuilds the disposable SQLite index atomically when the cached model is available. When inference is unavailable, it can remove demonstrably stale, orphaned, invalid, or forgotten rows from a compatible index. Run `nunc models download` if needed, then retry repair to restore missing vectors. A malformed ledger or a missing consolidation target requires manual restoration or correction. The index uses rollback journaling. Unexpected WAL or shared-memory files require inspection before repair will replace the index. Repair does not edit or delete memory Markdown, including files left by interrupted forget. Retry the explicit forget operation to finish its durable file cleanup.
 
-The audit detects wrong model metadata, mismatches between indexed text and its durable source, and invalid vector sizes or values. A finite vector with the correct size and matching provenance cannot be authenticated by this audit. No keyword index is present in the current schema.
+The audit detects wrong model metadata, mismatches between indexed text and its durable source, and invalid vector sizes or values. A finite vector with the correct size and matching provenance cannot be authenticated by this audit. Keyword-only snapshots may report `EMBEDDINGS_PENDING` until a regular reindex.
 
 ## Read-after-write across processes
 

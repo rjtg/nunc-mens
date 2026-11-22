@@ -84,6 +84,9 @@ enum Action {
         full: bool,
         #[arg(long)]
         source: Vec<PathBuf>,
+        /// Refresh keyword search using structural layout and cached vectors only.
+        #[arg(long)]
+        keyword_only: bool,
     },
     /// Search by semantic similarity or list recorded activities by date.
     Search {
@@ -92,6 +95,9 @@ enum Action {
         /// Rank other documents using this memory UUID or registered file.
         #[arg(long, conflicts_with = "query", value_name = "ID_OR_FILE")]
         similar_to: Option<String>,
+        /// Select semantic or keyword retrieval.
+        #[arg(long, value_enum, default_value = "semantic")]
+        mode: search::Mode,
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=1000))]
         limit: u32,
         #[arg(long)]
@@ -463,10 +469,18 @@ fn execute(action: Action) -> Result<ExitCode> {
                 print_duplicate_groups(report, &mut out)?;
             }
         }
-        Action::Reindex { full, source } => {
+        Action::Reindex {
+            full,
+            source,
+            keyword_only,
+        } => {
             repo.configure(&source, false)?;
-            let mut model = LocalModel::load(&repo)?;
-            let report = Index::for_repo(&repo)?.refresh(&mut model, full)?;
+            let index = Index::for_repo(&repo)?;
+            let report = if keyword_only {
+                index.refresh_keyword(full)?
+            } else {
+                index.refresh(&mut LocalModel::load(&repo)?, full)?
+            };
             println!(
                 "Indexed {} chunks ({} embedded, {} deleted)",
                 report.documents, report.embedded, report.deleted
@@ -479,6 +493,7 @@ fn execute(action: Action) -> Result<ExitCode> {
         Action::Search {
             query,
             similar_to,
+            mode,
             limit,
             json,
             ids,
@@ -498,6 +513,7 @@ fn execute(action: Action) -> Result<ExitCode> {
         } => {
             let markdown = matches!(format, Some(SearchFormat::Markdown));
             let options = search::Options {
+                mode,
                 limit: limit as usize,
                 kind,
                 sources: &source,
@@ -526,7 +542,8 @@ fn execute(action: Action) -> Result<ExitCode> {
                     "provide a query, an example or a date filter"
                 );
                 ensure!(
-                    !markdown
+                    mode == search::Mode::Semantic
+                        && !markdown
                         && !explain
                         && max_tokens.is_none()
                         && recency_boost.is_none()
@@ -613,17 +630,14 @@ fn execute(action: Action) -> Result<ExitCode> {
                         writeln!(out, "   Context shortened to fit the budget.")?;
                     }
                     if let Some(explanation) = hit.explanation {
+                        write!(out, "   {}", explanation.score_summary())?;
+                        if let Some(model) = explanation.model {
+                            write!(out, "; model {} @ {}", model.id, model.revision)?;
+                        }
                         writeln!(
                             out,
-                            "   cosine {:.4} + recency {:.4} = {:.4}; model {} @ {}; {:?} chunks, {:?} order, {:?} context",
-                            explanation.similarity,
-                            explanation.recency_contribution,
-                            explanation.final_score,
-                            explanation.model.id,
-                            explanation.model.revision,
-                            explanation.chunking,
-                            explanation.sort,
-                            explanation.context
+                            "; {:?} chunks, {:?} order, {:?} context",
+                            explanation.chunking, explanation.sort, explanation.context
                         )?;
                         if let Some(chunk) = p.matched_chunk {
                             writeln!(
@@ -1046,6 +1060,7 @@ fn consolidate(repo: &Repo, command: Consolidation) -> Result<()> {
                 repo,
                 search::Query::Text(&query.join(" ")),
                 search::Options {
+                    mode: search::Mode::Semantic,
                     limit: limit as usize,
                     kind: Some(Kind::Memory),
                     sources: &[],

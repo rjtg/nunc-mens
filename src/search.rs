@@ -1,6 +1,6 @@
 use crate::chunk::Strategy;
 use crate::documents::{Kind, Provenance, Snapshot};
-use crate::index::{Index, Reader};
+use crate::index::{Index, IndexedRow, Reader};
 use crate::ledger::Guard;
 use crate::model::{LocalModel, MODEL};
 use crate::repo::{Repo, SourceLocation, source_path};
@@ -40,6 +40,26 @@ pub(crate) struct Results {
 pub(crate) enum Query<'a> {
     Text(&'a str),
     Example(&'a str),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Mode {
+    Semantic,
+    Keyword,
+}
+
+impl Mode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Keyword => "keyword",
+        }
+    }
+}
+
+enum Evidence<'a> {
+    Vector(&'a [f32]),
+    Keyword { bm25: Option<f64>, exact: bool },
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
@@ -90,6 +110,7 @@ impl Settings {
 }
 
 pub(crate) struct Options<'a> {
+    pub mode: Mode,
     pub limit: usize,
     pub kind: Option<Kind>,
     pub sources: &'a [PathBuf],
@@ -108,14 +129,38 @@ pub(crate) struct Options<'a> {
 
 #[derive(Serialize)]
 pub(crate) struct Explanation {
-    pub similarity: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bm25: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact_match: Option<bool>,
     pub recency_contribution: f64,
     pub final_score: f64,
-    pub model: vectors::Model,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<vectors::Model>,
     pub chunking: Strategy,
     pub sort: Sort,
     pub context: ContextMode,
     pub matched_text: String,
+}
+
+impl Explanation {
+    pub fn score_summary(&self) -> String {
+        let evidence = if let Some(similarity) = self.similarity {
+            format!("cosine {similarity:.4}")
+        } else {
+            let lexical = self.bm25.map_or_else(
+                || "metadata match".into(),
+                |score| format!("BM25 {score:.4}"),
+            );
+            format!("{lexical}, exact {}", self.exact_match.unwrap_or(false))
+        };
+        format!(
+            "{evidence}; recency {:.4}; final {:.4}",
+            self.recency_contribution, self.final_score
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -261,10 +306,18 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
     }
     settings.validate()?;
     let now = Utc::now();
+    ensure!(
+        options.mode == Mode::Semantic || matches!(query, Query::Text(_)),
+        "--similar-to requires semantic mode"
+    );
     let text_vector = match query {
         Query::Text(text) => {
             ensure!(!text.trim().is_empty(), "search query must be nonblank");
-            Some(LocalModel::load(repo)?.query(text)?)
+            if options.mode == Mode::Semantic {
+                Some(LocalModel::load(repo)?.query(text)?)
+            } else {
+                None
+            }
         }
         Query::Example(_) => None,
     };
@@ -281,18 +334,27 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
             options.raw,
         )?),
     };
-    let reader = Index::for_repo(repo)?
-        .read(MODEL)?
-        .context("index is absent; run nunc reindex")?;
+    let index = Index::for_repo(repo)?;
+    let reader = match options.mode {
+        Mode::Semantic => index
+            .read(MODEL)?
+            .context("index is absent; run nunc reindex")?,
+        Mode::Keyword => index
+            .read_keyword(MODEL)?
+            .context("index is absent; run nunc reindex --keyword-only")?,
+    };
     filter.validate_missing(&reader)?;
-    let (query, reference, snapshot_digest) = match example {
+    let (vector, reference, snapshot_digest) = match example {
         Some(example) => {
             let (vector, reference, digest) = example.embed(&reader)?;
-            (vector, Some(reference), digest)
+            (Some(vector), Some(reference), digest)
         }
-        None => (text_vector.context("missing query embedding")?, None, None),
+        None => (text_vector, None, None),
     };
-    let query_norm = vectors::norm(&query, MODEL.dimensions)?;
+    let query_norm = vector
+        .as_ref()
+        .map(|vector| vectors::norm(vector, MODEL.dimensions))
+        .transpose()?;
     let one_per_parent = options.one_per_parent
         || options.max_tokens.is_some()
         || options.neighbor_window.is_some()
@@ -302,130 +364,155 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         .explain
         .then(|| pipeline::RankingCounts::new(one_per_parent));
     let mut best: Vec<Ranked> = Vec::with_capacity(options.limit);
-    reader.scan(
-        filter.kind,
-        |path| {
-            let included = filter.includes(path);
-            if let Some(counts) = &source_counts {
-                counts.check(included);
+    let include = |path: &str| {
+        let included = filter.includes(path);
+        if let Some(counts) = &source_counts {
+            counts.check(included);
+        }
+        included
+    };
+    let mut visit = |row: IndexedRow<'_, '_>, evidence: Evidence<'_>| -> Result<()> {
+        let parent = row.parent_id()?;
+        if reference.as_ref().is_some_and(|source| source.id == parent) {
+            if let Some(counts) = &mut counts {
+                counts.reference += 1;
             }
-            included
-        },
-        |row, vector| {
-            let parent = row.parent_id()?;
-            if reference.as_ref().is_some_and(|source| source.id == parent) {
+            return Ok(());
+        }
+        let entry = uuid::Uuid::parse_str(parent).ok();
+        let visibility = if let Some(id) = entry {
+            if guard.ledger.forgotten(id) {
                 if let Some(counts) = &mut counts {
-                    counts.reference += 1;
+                    counts.forgotten += 1;
                 }
                 return Ok(());
             }
-            let entry = uuid::Uuid::parse_str(parent).ok();
-            let visibility = if let Some(id) = entry {
-                if guard.ledger.forgotten(id) {
-                    if let Some(counts) = &mut counts {
-                        counts.forgotten += 1;
-                    }
-                    return Ok(());
+            if !options.raw && guard.ledger.hidden(&archives, id) {
+                if let Some(counts) = &mut counts {
+                    counts.archived += 1;
                 }
-                if !options.raw && guard.ledger.hidden(&archives, id) {
-                    if let Some(counts) = &mut counts {
-                        counts.archived += 1;
-                    }
-                    return Ok(());
-                }
-                Some(guard.ledger.visibility(&archives, id))
+                return Ok(());
+            }
+            Some(guard.ledger.visibility(&archives, id))
+        } else {
+            None
+        };
+        let id = row.id()?;
+        let timestamp = row.timestamp()?.and_then(parse_timestamp);
+        if !options.time.includes(timestamp)
+            || (options.neighbor_window.is_some() && timestamp.is_none())
+        {
+            if let Some(counts) = &mut counts {
+                counts.temporal += 1;
+            }
+            return Ok(());
+        }
+        let (base, similarity, bm25, exact_match) = match evidence {
+            Evidence::Vector(candidate) => {
+                let similarity = cosine(
+                    vector.as_deref().context("missing query vector")?,
+                    query_norm.context("missing query norm")?,
+                    candidate,
+                )?;
+                (similarity, Some(similarity), None, None)
+            }
+            Evidence::Keyword { bm25, exact } => {
+                // FTS5's native BM25 is negative with stronger matches.
+                let strength = bm25.map_or(0.0, |rank| (-rank).max(0.0));
+                let base = if exact { 1.0 } else { 0.0 } + strength / (1.0 + strength);
+                (base, None, bm25, Some(exact))
+            }
+        };
+        if let Some(counts) = &mut counts {
+            counts.scored(parent);
+        }
+        let boost = recency(timestamp, now, &settings);
+        let score = base + boost;
+        let order = |item: &Ranked| {
+            recent_order(options.sort, item.timestamp, timestamp)
+                .then_with(|| compare(item.hit.score, &item.chunk, score, id))
+        };
+        if one_per_parent && let Some(existing) = best.iter().position(|hit| hit.parent == parent) {
+            if order(&best[existing]).is_le() {
+                return Ok(());
+            }
+            best.remove(existing);
+        }
+        let offset = best.partition_point(|item| order(item).is_lt());
+        if offset < options.limit {
+            let (mut source, mut text) = row.document()?;
+            if entry.is_some() {
+                (source.entry_kind, source.git) = reader.origin(parent)?;
+            }
+            source.visibility = visibility;
+            let matched_text = if options.explain && options.max_tokens.is_none() {
+                text.clone()
+            } else {
+                String::new()
+            };
+            let section = if options.max_tokens.is_some() {
+                text.clear();
+                Some(row.section()?)
             } else {
                 None
             };
-            let id = row.id()?;
-            let timestamp = row.timestamp()?.and_then(parse_timestamp);
-            if !options.time.includes(timestamp)
-                || (options.neighbor_window.is_some() && timestamp.is_none())
-            {
-                if let Some(counts) = &mut counts {
-                    counts.temporal += 1;
-                }
-                return Ok(());
-            }
-            let similarity = cosine(&query, query_norm, vector)?;
-            if let Some(counts) = &mut counts {
-                counts.scored(parent);
-            }
-            let boost = recency(timestamp, now, &settings);
-            let score = similarity + boost;
-            let order = |item: &Ranked| {
-                recent_order(options.sort, item.timestamp, timestamp)
-                    .then_with(|| compare(item.hit.score, &item.chunk, score, id))
-            };
-            if one_per_parent
-                && let Some(existing) = best.iter().position(|hit| hit.parent == parent)
-            {
-                if order(&best[existing]).is_le() {
-                    return Ok(());
-                }
-                best.remove(existing);
-            }
-            let offset = best.partition_point(|item| order(item).is_lt());
-            if offset < options.limit {
-                let (mut source, mut text) = row.document()?;
-                if entry.is_some() {
-                    (source.entry_kind, source.git) = reader.origin(parent)?;
-                }
-                source.visibility = visibility;
-                let matched_text = if options.explain && options.max_tokens.is_none() {
-                    text.clone()
-                } else {
-                    String::new()
+            if options.max_tokens.is_none() && !matches!(options.context, ContextMode::Chunk) {
+                let original = reader.parent(parent)?;
+                text = match options.context {
+                    ContextMode::Section => original
+                        .get(row.section()?)
+                        .context("invalid indexed section")?
+                        .to_owned(),
+                    _ => original,
                 };
-                let section = if options.max_tokens.is_some() {
-                    text.clear();
-                    Some(row.section()?)
-                } else {
-                    None
-                };
-                if options.max_tokens.is_none() && !matches!(options.context, ContextMode::Chunk) {
-                    let original = reader.parent(parent)?;
-                    text = match options.context {
-                        ContextMode::Section => original
-                            .get(row.section()?)
-                            .context("invalid indexed section")?
-                            .to_owned(),
-                        _ => original,
-                    };
-                }
-                best.insert(
-                    offset,
-                    Ranked {
-                        parent: parent.to_owned(),
-                        chunk: id.to_owned(),
-                        timestamp,
-                        section,
-                        hit: Match {
-                            source,
-                            text,
-                            score,
-                            rank: 0,
-                            context_window: None,
-                            explanation: options.explain.then_some(Explanation {
-                                similarity,
-                                recency_contribution: boost,
-                                final_score: score,
-                                model: MODEL,
-                                chunking: reader.strategy,
-                                sort: options.sort,
-                                context: options.context,
-                                matched_text,
-                            }),
-                        },
+            }
+            best.insert(
+                offset,
+                Ranked {
+                    parent: parent.to_owned(),
+                    chunk: id.to_owned(),
+                    timestamp,
+                    section,
+                    hit: Match {
+                        source,
+                        text,
+                        score,
+                        rank: 0,
+                        context_window: None,
+                        explanation: options.explain.then_some(Explanation {
+                            similarity,
+                            bm25,
+                            exact_match,
+                            recency_contribution: boost,
+                            final_score: score,
+                            model: similarity.map(|_| MODEL),
+                            chunking: reader.strategy,
+                            sort: options.sort,
+                            context: options.context,
+                            matched_text,
+                        }),
                     },
-                );
-                if best.len() > options.limit {
-                    best.pop();
-                }
+                },
+            );
+            if best.len() > options.limit {
+                best.pop();
             }
-            Ok(())
-        },
-    )?;
+        }
+        Ok(())
+    };
+    match options.mode {
+        Mode::Semantic => reader.scan(filter.kind, include, |row, vector| {
+            visit(row, Evidence::Vector(vector))
+        })?,
+        Mode::Keyword => {
+            let Query::Text(text) = query else {
+                anyhow::bail!("keyword mode requires a text query")
+            };
+            reader.scan_keyword(filter.kind, text, include, |row, bm25, exact| {
+                visit(row, Evidence::Keyword { bm25, exact })
+            })?;
+        }
+    }
     for (offset, item) in best.iter_mut().enumerate() {
         item.hit.rank = offset + 1;
     }
@@ -486,6 +573,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
     let pipeline = counts.zip(source_counts).map(|(counts, source)| {
         counts.finish(
             source,
+            options.mode,
             freshness,
             options.limit,
             before_budget,
@@ -493,7 +581,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         )
     });
     Ok(Results {
-        mode_used: "semantic",
+        mode_used: options.mode.name(),
         repo_id: repo.id.clone(),
         warnings: warning.into_iter().collect(),
         results,
@@ -571,6 +659,7 @@ mod tests {
         std::fs::write(dir.path().join("other/file"), "decision")?;
         let roots = ["docs".into(), "other/file".into()];
         let options = Options {
+            mode: Mode::Semantic,
             limit: 1,
             kind: None,
             sources: &["./docs/design/".into(), "./.nunc/entries/".into()],

@@ -1,4 +1,7 @@
-use super::{INDEX_NAME, Index, VERSION, check, chunk_rows, existing_private_file, open};
+use super::{
+    INDEX_NAME, Index, VERSION, check, chunk_rows, existing_private_file, offline_layout_key, open,
+    semantic_ready,
+};
 use crate::chunk::Chunk;
 use crate::documents::{Document, MatchedChunk, Snapshot};
 use crate::entries::{self, EntryKind};
@@ -131,7 +134,13 @@ pub(crate) fn run(repo: &Repo, repair: bool, dry_run: bool) -> Result<Report> {
         let snapshot = audit.snapshot.take().context("missing durable snapshot")?;
         match LocalModel::load(repo) {
             Ok(mut model) => {
-                index.rebuild(&path, snapshot, &mut model, existing_private_file(&path)?)?;
+                index.rebuild(
+                    &path,
+                    snapshot,
+                    &mut model,
+                    existing_private_file(&path)?,
+                    false,
+                )?;
                 audit = inspect(repo, &path, true, true)?;
                 audit.report.action = "rebuilt_index";
             }
@@ -331,6 +340,15 @@ fn audit_rows(
         report.action = "rebuild_index";
     }
     let layout_key = hash(&serde_json::to_vec(&snapshot.chunking)?);
+    let offline_key = offline_layout_key(&snapshot.chunking)?;
+    let ready = semantic_ready(conn)?;
+    if !ready {
+        report.issue(
+            "EMBEDDINGS_PENDING",
+            "warning",
+            "keyword index is available; run nunc reindex with the model for semantic search",
+        );
+    }
     let mut layouts = BTreeMap::new();
     let mut parent_query =
         conn.prepare("SELECT id,text,revision,layout_key,layout,origin FROM parents")?;
@@ -350,9 +368,10 @@ fn audit_rows(
         let origin =
             serde_json::to_string(&(&parent.provenance.entry_kind, &parent.provenance.git))?;
         let layout = serde_json::from_str::<Vec<Chunk>>(row.get_ref(4)?.as_str()?);
+        let stored_key = row.get_ref(3)?.as_str()?;
         if row.get_ref(1)?.as_str()? != parent.text
             || row.get_ref(2)?.as_str()? != parent.hash
-            || row.get_ref(3)?.as_str()? != layout_key
+            || (stored_key != layout_key && (ready || stored_key != offline_key))
             || row.get_ref(5)?.as_str()? != origin
             || layout.as_ref().is_err()
             || !valid_layout(&parent.text, layout.as_deref().unwrap_or_default())
@@ -408,9 +427,11 @@ fn audit_rows(
             report.issue("STALE_CHUNK", "error", id.clone());
             drift.chunks.insert(id.clone());
         }
-        if vectors::decode(row.get_ref(9)?.as_blob()?, MODEL.dimensions)
-            .and_then(|v| vectors::norm(&v, MODEL.dimensions))
-            .is_err()
+        let blob = row.get_ref(9)?.as_blob()?;
+        if (ready || !blob.is_empty())
+            && vectors::decode(blob, MODEL.dimensions)
+                .and_then(|v| vectors::norm(&v, MODEL.dimensions))
+                .is_err()
         {
             report.issue("INVALID_EMBEDDING", "error", id.clone());
             drift.chunks.insert(id);

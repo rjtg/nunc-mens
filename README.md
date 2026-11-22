@@ -29,6 +29,8 @@ nunc search "token rotation" --related-by time --window 2h --json
 
 Capture works as soon as the binary is installed. `nunc log` (or `nunc "a note"`) saves a durable Markdown file and returns its ID and path. `nunc serve` optionally accepts multiline messages from a repository FIFO and keeps the index current. In another shell, use `nunc write --stdin` to send a message or `nunc write "a note"` for a one-liner.
 
+Semantic search is the default. For exact terms such as error codes, paths and flags, try `nunc search --mode keyword SQLITE_BUSY`. Use `nunc reindex --keyword-only` to prepare a searchable keyword index without the model.
+
 ```sh
 nunc serve --source docs --source src
 # In another shell in the same worktree:

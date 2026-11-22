@@ -1,3 +1,4 @@
+use super::Mode;
 use serde::Serialize;
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -49,6 +50,7 @@ impl RankingCounts {
     pub fn finish(
         self,
         source: SourceCounts,
+        mode: Mode,
         index_freshness: &'static str,
         limit: usize,
         before_budget: usize,
@@ -56,9 +58,17 @@ impl RankingCounts {
     ) -> Diagnostics {
         let ranked = self.parents.as_ref().map_or(self.scored, HashSet::len);
         Diagnostics {
-            mode: "semantic",
-            semantic: "applied",
-            keyword: "unavailable",
+            mode: mode.name(),
+            semantic: if mode == Mode::Semantic {
+                "applied"
+            } else {
+                "skipped"
+            },
+            keyword: if mode == Mode::Keyword {
+                "applied"
+            } else {
+                "skipped"
+            },
             fusion: "unavailable",
             reranker: "unavailable",
             exact: true,
@@ -116,8 +126,8 @@ impl Diagnostics {
     pub fn write(&self, out: &mut impl Write) -> io::Result<()> {
         writeln!(
             out,
-            "nunc: semantic retrieval, index {}",
-            self.index_freshness
+            "nunc: {} retrieval, index {}",
+            self.mode, self.index_freshness
         )?;
         writeln!(
             out,

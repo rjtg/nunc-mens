@@ -18,6 +18,25 @@ pub(crate) mod health;
 
 const INDEX_NAME: &str = "index.sqlite3";
 const VERSION: u32 = 2;
+const KEYWORD_SCHEMA: &str = "
+    CREATE TABLE retrieval_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        semantic_ready INTEGER NOT NULL CHECK (semantic_ready IN (0, 1))
+    ) STRICT;
+    INSERT INTO retrieval_state SELECT 1, EXISTS(SELECT 1 FROM metadata);
+    CREATE VIRTUAL TABLE chunk_terms USING fts5(text, content='documents', content_rowid='rowid');
+    CREATE TRIGGER chunk_terms_insert AFTER INSERT ON documents BEGIN
+        INSERT INTO chunk_terms(rowid, text) VALUES (new.rowid, new.text);
+    END;
+    CREATE TRIGGER chunk_terms_delete AFTER DELETE ON documents BEGIN
+        INSERT INTO chunk_terms(chunk_terms, rowid, text) VALUES ('delete', old.rowid, old.text);
+    END;
+    CREATE TRIGGER chunk_terms_update AFTER UPDATE OF text ON documents WHEN new.text != old.text BEGIN
+        INSERT INTO chunk_terms(chunk_terms, rowid, text) VALUES ('delete', old.rowid, old.text);
+        INSERT INTO chunk_terms(rowid, text) VALUES (new.rowid, new.text);
+    END;
+    INSERT INTO chunk_terms(chunk_terms) VALUES ('rebuild');
+";
 const BATCH: usize = 16;
 const SCHEMA: &str = "
     CREATE TABLE metadata (
@@ -99,6 +118,19 @@ impl<'a> Index<'a> {
     }
 
     pub(crate) fn refresh(&self, embedder: &mut impl Embedder, full: bool) -> Result<Refresh> {
+        self.refresh_mode(embedder, full, false)
+    }
+
+    pub(crate) fn refresh_keyword(&self, full: bool) -> Result<Refresh> {
+        self.refresh_mode(&mut KeywordLayout, full, true)
+    }
+
+    fn refresh_mode(
+        &self,
+        embedder: &mut impl Embedder,
+        full: bool,
+        keyword_only: bool,
+    ) -> Result<Refresh> {
         let guard = Guard::acquire(self.repo, true)?;
         guard.cleanup_files()?;
         self.prepare()?;
@@ -110,17 +142,22 @@ impl<'a> Index<'a> {
         let model = embedder.model();
         let update = || -> Result<Refresh> {
             if full || !existing {
-                self.rebuild(&path, snapshot, embedder, existing)
+                self.rebuild(&path, snapshot, embedder, existing, keyword_only)
             } else {
                 let mut connection = open(&path, false)?;
                 let version: u32 =
                     connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
                 if version == 1 {
                     drop(connection);
-                    return self.rebuild(&path, snapshot, embedder, existing);
+                    return self.rebuild(&path, snapshot, embedder, existing, keyword_only);
                 }
                 let digest = check(&connection, self.repo, model)?;
-                if digest == snapshot.digest {
+                if digest == snapshot.digest && (keyword_only || semantic_ready(&connection)?) {
+                    if !has_keyword_schema(&connection)? {
+                        let tx = connection.transaction()?;
+                        ensure_keyword_schema(&tx)?;
+                        tx.commit()?;
+                    }
                     return Ok(Refresh {
                         documents: connection.query_row(
                             "SELECT count(*) FROM documents",
@@ -130,7 +167,7 @@ impl<'a> Index<'a> {
                         ..Refresh::default()
                     });
                 }
-                update_rows(&mut connection, snapshot, embedder, self.repo)
+                update_rows(&mut connection, snapshot, embedder, self.repo, keyword_only)
             }
         };
         update().with_context(|| {
@@ -148,6 +185,7 @@ impl<'a> Index<'a> {
         snapshot: Snapshot,
         embedder: &mut impl Embedder,
         existing: bool,
+        keyword_only: bool,
     ) -> Result<Refresh> {
         let temporary = tempfile::NamedTempFile::new_in(&self.dir)?;
         let report = {
@@ -156,7 +194,7 @@ impl<'a> Index<'a> {
             transaction.execute_batch(SCHEMA)?;
             transaction.pragma_update(None, "user_version", VERSION)?;
             transaction.commit()?;
-            update_rows(&mut connection, snapshot, embedder, self.repo)?
+            update_rows(&mut connection, snapshot, embedder, self.repo, keyword_only)?
         };
         temporary.as_file().sync_all()?;
         // A crashed rollback journal belongs to the old inode and must be recovered
@@ -211,6 +249,14 @@ impl<'a> Index<'a> {
     }
 
     pub(crate) fn read(&self, model: Model) -> Result<Option<Reader>> {
+        self.read_mode(model, false)
+    }
+
+    pub(crate) fn read_keyword(&self, model: Model) -> Result<Option<Reader>> {
+        self.read_mode(model, true)
+    }
+
+    fn read_mode(&self, model: Model, keyword: bool) -> Result<Option<Reader>> {
         let path = self.path();
         if !existing_private_file(&path)? {
             return Ok(None);
@@ -224,6 +270,17 @@ impl<'a> Index<'a> {
             }
             let conn = open(&path, true)?;
             let digest = check(&conn, self.repo, model)?;
+            if keyword {
+                ensure!(
+                    has_keyword_schema(&conn)?,
+                    "keyword index is absent; run nunc reindex --keyword-only"
+                );
+            } else {
+                ensure!(
+                    semantic_ready(&conn)?,
+                    "semantic embeddings are pending; run nunc reindex with the model"
+                );
+            }
             let chunking: String =
                 conn.query_row("SELECT chunking FROM metadata", [], |row| row.get(0))?;
             let strategy = serde_json::from_str(&chunking)?;
@@ -241,6 +298,64 @@ impl<'a> Index<'a> {
                 path.display()
             )
         })
+    }
+}
+
+fn has_keyword_schema(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='retrieval_state')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn ensure_keyword_schema(tx: &Transaction<'_>) -> Result<()> {
+    if !has_keyword_schema(tx)? {
+        tx.execute_batch(KEYWORD_SCHEMA)?;
+    }
+    Ok(())
+}
+
+fn semantic_ready(conn: &Connection) -> Result<bool> {
+    if has_keyword_schema(conn)? {
+        Ok(conn.query_row(
+            "SELECT semantic_ready FROM retrieval_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?)
+    } else {
+        Ok(true)
+    }
+}
+
+fn offline_layout_key(settings: &chunk::Settings) -> Result<String> {
+    Ok(hash(&serde_json::to_vec(&("keyword-byte-v1", settings))?))
+}
+
+struct KeywordLayout;
+
+impl Embedder for KeywordLayout {
+    fn model(&self) -> Model {
+        crate::model::MODEL
+    }
+
+    fn passages(&mut self, _: &[&str]) -> Result<Vec<Vec<f32>>> {
+        anyhow::bail!("keyword layout does not perform inference")
+    }
+
+    fn token_offsets(&self, text: &str) -> Result<Vec<(usize, usize)>> {
+        let mut start = 0;
+        let mut offsets = Vec::new();
+        for (at, value) in text.char_indices() {
+            if at + value.len_utf8() - start > 4 {
+                offsets.push((start, at));
+                start = at;
+            }
+        }
+        if start < text.len() {
+            offsets.push((start, text.len()));
+        }
+        Ok(offsets)
     }
 }
 
@@ -301,9 +416,12 @@ fn update_rows(
     snapshot: Snapshot,
     embedder: &mut impl Embedder,
     repo: &Repo,
+    keyword_only: bool,
 ) -> Result<Refresh> {
     let model = embedder.model();
     let transaction = conn.transaction()?;
+    ensure_keyword_schema(&transaction)?;
+    let mut complete = !keyword_only || semantic_ready(&transaction)?;
     transaction.execute_batch(
         "
         CREATE TEMP TABLE seen (id TEXT PRIMARY KEY) WITHOUT ROWID;
@@ -312,20 +430,27 @@ fn update_rows(
     )?;
     let mut report = Refresh::default();
     let layout_key = hash(&serde_json::to_vec(&snapshot.chunking)?);
+    let offline_key = offline_layout_key(&snapshot.chunking)?;
+    let acceptable_fallback = if keyword_only {
+        &offline_key
+    } else {
+        &layout_key
+    };
     for parent in &snapshot.documents {
         let id = &parent.provenance.id;
         transaction.execute("INSERT INTO seen_parents VALUES (?1)", [id])?;
         let origin =
             serde_json::to_string(&(&parent.provenance.entry_kind, &parent.provenance.git))?;
-        let known: Option<String> = transaction
+        let known: Option<(String, String)> = transaction
             .query_row(
-                "SELECT layout FROM parents WHERE id=?1 AND revision=?2 AND layout_key=?3",
-                params![id, parent.hash, layout_key],
-                |row| row.get(0),
+                "SELECT layout, layout_key FROM parents WHERE id=?1 AND revision=?2 AND layout_key IN (?3,?4)",
+                params![id, parent.hash, layout_key, acceptable_fallback],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         let layout: Vec<Chunk> = match known {
-            Some(json) => {
+            Some((json, key)) => {
+                complete &= key == layout_key;
                 transaction.execute(
                     "UPDATE parents SET origin=?2 WHERE id=?1 AND origin!=?2",
                     params![id, origin],
@@ -333,16 +458,23 @@ fn update_rows(
                 serde_json::from_str(&json)?
             }
             None => {
-                let layout =
-                    chunk::layout(&parent.text, parent.markdown, &snapshot.chunking, embedder)
-                        .with_context(|| format!("chunk {}", parent.provenance.path))?;
+                let mut settings = snapshot.chunking.clone();
+                let key = if keyword_only {
+                    complete = false;
+                    settings.strategy = Strategy::Structural;
+                    &offline_key
+                } else {
+                    &layout_key
+                };
+                let layout = chunk::layout(&parent.text, parent.markdown, &settings, embedder)
+                    .with_context(|| format!("chunk {}", parent.provenance.path))?;
                 transaction.execute(
                     "INSERT OR REPLACE INTO parents VALUES (?1,?2,?3,?4,?5,?6)",
                     params![
                         id,
                         parent.text,
                         parent.hash,
-                        layout_key,
+                        key,
                         serde_json::to_string(&layout)?,
                         origin
                     ],
@@ -356,13 +488,16 @@ fn update_rows(
             transaction.execute("INSERT INTO seen VALUES (?1)", [&data.provenance.id])?;
             let existing: Option<Vec<u8>> = transaction
                 .query_row(
-                    "SELECT vector FROM documents WHERE hash=?1 LIMIT 1",
+                    "SELECT vector FROM documents WHERE hash=?1 AND length(vector)>0 LIMIT 1",
                     [&data.provenance.content_hash],
                     |row| row.get(0),
                 )
                 .optional()?;
             if let Some(vector) = existing {
                 store(&transaction, parent, &data, &vector)?;
+            } else if keyword_only {
+                complete = false;
+                store(&transaction, parent, &data, &[])?;
             } else {
                 changed.push(data);
                 if changed.len() == BATCH {
@@ -380,6 +515,10 @@ fn update_rows(
     transaction.execute(
         "DELETE FROM parents WHERE id NOT IN (SELECT id FROM seen_parents)",
         [],
+    )?;
+    transaction.execute(
+        "UPDATE retrieval_state SET semantic_ready=?1 WHERE singleton=1",
+        [complete],
     )?;
     transaction.execute(
         "INSERT OR REPLACE INTO metadata VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
@@ -439,8 +578,8 @@ fn store(
     tx.prepare_cached(
         "INSERT INTO documents VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(id) DO UPDATE SET timestamp=excluded.timestamp, line_start=excluded.line_start,
-         line_end=excluded.line_end, chunk=excluded.chunk, section_start=excluded.section_start, section_end=excluded.section_end
-         WHERE timestamp IS NOT excluded.timestamp OR chunk != excluded.chunk OR section_start != excluded.section_start OR section_end != excluded.section_end",
+         line_end=excluded.line_end, chunk=excluded.chunk, vector=excluded.vector, section_start=excluded.section_start, section_end=excluded.section_end
+         WHERE timestamp IS NOT excluded.timestamp OR chunk != excluded.chunk OR vector != excluded.vector OR section_start != excluded.section_start OR section_end != excluded.section_end",
     )?.execute(params![c.id, p.kind.as_str(), p.path, p.timestamp, c.line_start, c.line_end,
         data.text, c.content_hash, vector, c.parent_id, serde_json::to_string(c)?, data.chunk.section.start, data.chunk.section.end])?;
     Ok(())
@@ -472,6 +611,64 @@ fn store_batch(
 }
 
 impl Reader {
+    pub(crate) fn scan_keyword(
+        &self,
+        kind: Option<Kind>,
+        query: &str,
+        include: impl Fn(&str) -> bool,
+        mut visit: impl FnMut(IndexedRow<'_, '_>, Option<f64>, bool) -> Result<()>,
+    ) -> Result<()> {
+        let Some(expression) = keyword_expression(query) else {
+            return Ok(());
+        };
+        let query = query.trim();
+        let single = !query.contains(char::is_whitespace);
+        let parent = uuid::Uuid::parse_str(query).ok().map(|id| id.to_string());
+        let path = single
+            .then(|| crate::repo::source_path(Path::new(query)).ok())
+            .flatten();
+        let sha = (single
+            && (7..=64).contains(&query.len())
+            && query.bytes().all(|ch| ch.is_ascii_hexdigit()))
+        .then(|| format!("{}*", query.to_ascii_lowercase()));
+        let literal = single.then_some(query);
+        let mut stmt = self.conn.prepare(
+            "WITH lexical AS MATERIALIZED (
+                SELECT rowid, bm25(chunk_terms) AS quality FROM chunk_terms WHERE chunk_terms MATCH ?1
+             ), exact AS MATERIALIZED (
+                SELECT d.rowid FROM documents d WHERE (?2 IS NOT NULL AND d.parent_id=?2)
+                    OR (?3 IS NOT NULL AND d.path=?3)
+                UNION
+                SELECT d.rowid FROM parents p JOIN documents d ON d.parent_id=p.id
+                    WHERE ?4 IS NOT NULL AND json_extract(p.origin,'$[1].sha') GLOB ?4
+             ), hits AS (
+                SELECT rowid FROM lexical UNION SELECT rowid FROM exact
+             )
+             SELECT d.id,d.kind,d.path,d.timestamp,d.line_start,d.line_end,d.text,d.vector,
+                    d.parent_id,d.chunk,d.section_start,d.section_end,l.quality,
+                    (e.rowid IS NOT NULL OR (?5 IS NOT NULL AND instr(lower(d.text),lower(?5)) > 0))
+             FROM hits h JOIN documents d ON d.rowid=h.rowid
+             LEFT JOIN lexical l ON l.rowid=h.rowid LEFT JOIN exact e ON e.rowid=h.rowid
+             WHERE ?6 IS NULL OR d.kind=?6",
+        )?;
+        let mut rows = stmt.query(params![
+            expression,
+            parent,
+            path.as_ref().and_then(|value| value.to_str()),
+            sha,
+            literal,
+            kind.map(Kind::as_str),
+        ])?;
+        while let Some(row) = rows.next()? {
+            let path = row.get_ref(2)?.as_str()?;
+            if include(path) {
+                visit(IndexedRow { row }, row.get(12)?, row.get(13)?)
+                    .with_context(|| format!("inspect keyword match at {path}"))?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_source_path(&self, path: &Path, recursive: bool) -> Result<bool> {
         let path = path.to_str().context("source path is not UTF-8")?;
         Ok(self.conn.query_row(
@@ -570,6 +767,28 @@ impl Reader {
     }
 }
 
+fn keyword_expression(query: &str) -> Option<String> {
+    let words: Vec<_> = query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(32)
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    if !query.trim().contains(char::is_whitespace) {
+        Some(format!("\"{}\"", words.join(" ")))
+    } else {
+        Some(
+            words
+                .into_iter()
+                .map(|word| format!("\"{word}\""))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
+    }
+}
+
 pub(crate) struct IndexedRow<'row, 'stmt> {
     row: &'row Row<'stmt>,
 }
@@ -655,6 +874,53 @@ mod tests {
             }
             Ok(passages.iter().map(|_| vec![1.0, -0.5]).collect())
         }
+    }
+
+    #[test]
+    fn keyword_migration_reuses_an_existing_vector_index() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir(&root)?;
+        let repo = Repo::new(&root)?;
+        let index = Index {
+            repo: &repo,
+            dir: temp.path().join("state"),
+        };
+        let mut model = Mock::default();
+        entries::persist(
+            &repo,
+            "WriterLock serializes publication.",
+            ContextFields::default(),
+        )?;
+        index.refresh(&mut model, false)?;
+        {
+            let conn = open(&index.path(), false)?;
+            conn.execute_batch(
+                "DROP TRIGGER chunk_terms_insert; DROP TRIGGER chunk_terms_delete;
+                 DROP TRIGGER chunk_terms_update; DROP TABLE chunk_terms; DROP TABLE retrieval_state;",
+            )?;
+        }
+        assert!(index.read(MODEL)?.is_some());
+        assert!(index.read_keyword(MODEL).is_err());
+        model.invalid = true;
+        assert_eq!(index.refresh(&mut model, false)?.embedded, 0);
+        let reader = index
+            .read_keyword(MODEL)?
+            .context("missing keyword index")?;
+        let mut matched = 0;
+        reader.scan_keyword(
+            None,
+            "WriterLock",
+            |_| true,
+            |_, bm25, exact| {
+                assert!(bm25.is_some_and(|score| score < 0.0));
+                assert!(exact);
+                matched += 1;
+                Ok(())
+            },
+        )?;
+        assert_eq!(matched, 1);
+        Ok(())
     }
 
     #[test]

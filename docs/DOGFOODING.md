@@ -173,3 +173,9 @@ Formatting, Clippy, and 55 default tests passed. The real search-by-example and 
 In the search-by-example fixture, searching with `--source-file docs/context-budget.md --limit 1 --max-tokens 1 --explain --json` counted four chunks in the source type scope and two after the path filter. It scored both and deduplicated them to one parent. That parent survived top-K and was omitted by the one-token budget. The trace matched the empty result and the index reported current.
 
 Formatting, Clippy, all 55 default tests, and the targeted ONNX CLI test passed. The CLI test restored a stale index in an isolated fixture to confirm that the pipeline counts a forgotten row without exposing its ID or text. It also checked temporal filtering, reference exclusion, archive visibility, empty scope, top-K, and Markdown diagnostics on stderr. Cargo verified files where LSP diagnostics timed out.
+
+## Offline keyword retrieval
+
+An isolated Git repository captured the decision to use FTS5 triggers over shared SQLite chunk rows. With the model path absent, `nunc reindex --keyword-only --source docs` indexed two chunks and embedded zero. `nunc search --mode keyword --explain --json -- --keyword-only` returned the development decision at rank one, line 1, with a literal match and native BM25 around −0.000000819. Searching for `docs/index.md` returned that exact registered path even though the path was absent from its body. The cache directory remained absent.
+
+Formatting, Clippy, and all 57 default tests passed. The targeted real ONNX test passed in 22.11 seconds and verified that a later normal reindex produced a shared chunk ID for keyword and semantic results. The first full test run exposed a race in the FIFO fixture, which enumerated temporary files during atomic writes. Restricting its reader to published Markdown fixed the rerun. LSP timed out for the last index and fixture edits, which Cargo verified.

@@ -147,3 +147,9 @@ In a separate Git fixture, the real executable logged the decisions about ranked
 The compiled CLI captured a development note containing a Unicode heading and a fenced Rust example. After indexing, `nunc search 'How do we preserve captured code blocks when exporting context?' --format markdown --context parent --max-tokens 600 > bundle.md` produced 1,557 bytes of attributed Markdown and included the original `render_source_excerpt();` line. Stderr reported 390 of 600 estimated tokens. No diagnostic appeared in the bundle.
 
 Formatting, Clippy, 48 default Rust tests, and the targeted ONNX integration test passed. The integration parsed the bundle with CommonMark, verified that nested source headings and fences stayed literal, and checked normal, raw, forgotten, and one-token results. The first test incorrectly expected quiet stderr after a forget operation. The corrected fixture checks the freshness warning on stderr and confirms that reindex leaves the bundle's stdout unchanged. Rust LSP diagnostics timed out on some files, and Cargo verified those sources.
+
+## Temporal search and activity timeline
+
+In an isolated Git repository, the compiled CLI recorded decisions about local calendar bounds and explicit anchor deltas. `nunc search --since 1h --ids` returned both IDs in original event order. `nunc timeline --around "$anchor" --window 1h --json` returned only the other decision and recorded its signed delta as +24 ms. The repository used empty state and model paths, and neither directory was created. The CLI suite also exercised New York's 23-hour and 25-hour days and an imported Git commit dated in 2024.
+
+Formatting, Clippy, and all 51 default Rust tests passed. The targeted real ONNX test passed in 20.19 s. It found two SQLite anchors with a date filter, reported one other activity from both overlapping windows, and preserved the ID-based timeline through a full rebuild. Cargo verified sources where Rust LSP diagnostics timed out.

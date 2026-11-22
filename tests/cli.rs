@@ -510,6 +510,21 @@ impl Fixture {
         )?)
     }
 
+    fn event_time(&self, id: &str, timestamp: &str) -> Result<()> {
+        let text = String::from_utf8(self.entry_bytes(id)?)?;
+        let (header, body) = text
+            .strip_prefix("---\n")
+            .and_then(|text| text.split_once("\n---\n"))
+            .context("missing fixture front matter")?;
+        let mut metadata: Value = serde_json::from_str(header)?;
+        metadata["timestamp"] = timestamp.into();
+        fs::write(
+            self.local().join("entries").join(format!("{id}.md")),
+            format!("---\n{metadata}\n---\n{body}"),
+        )?;
+        Ok(())
+    }
+
     fn summary(&self, ids: &str, body: &str) -> Result<String> {
         let response = self.json(&[
             "consolidate",
@@ -525,6 +540,268 @@ impl Fixture {
             .map(str::to_owned)
             .context("missing summary ID")
     }
+}
+
+#[test]
+fn timeline_and_search_use_local_calendar_days_without_a_model() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let event = |label, at| -> Result<String> {
+        let id = fixture.log_id(label)?;
+        fixture.event_time(&id, at)?;
+        Ok(id)
+    };
+    event("The prior day", "2026-03-08T04:59:59Z")?;
+    let early = event("Local midnight", "2026-03-08T05:00:00Z")?;
+    let mut ties = vec![
+        event("Identical clock time A", "2026-03-08T12:00:00Z")?,
+        event("Identical clock time B", "2026-03-08T13:00:00+01:00")?,
+    ];
+    ties.sort();
+    let late = event("Late after spring-forward", "2026-03-09T03:59:59Z")?;
+    event("Next local midnight", "2026-03-09T04:00:00Z")?;
+    let fall_first = event("First 01:30", "2026-11-01T01:30:00-04:00")?;
+    let fall_second = event("Second 01:30", "2026-11-01T01:30:00-05:00")?;
+    let fall_late = event("The 25th hour", "2026-11-02T04:30:00Z")?;
+    let local = |args: &[&str]| -> Result<Output> {
+        checked(fixture.nunc(args).env("TZ", "America/New_York").output()?)
+    };
+    let ids = |output: Output| -> Result<Vec<String>> {
+        Ok(String::from_utf8(output.stdout)?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    };
+    let mut spring = vec![early];
+    spring.extend(ties);
+    spring.push(late);
+    assert_eq!(
+        ids(local(&[
+            "search",
+            "--from",
+            "2026-03-08",
+            "--to",
+            "2026-03-08",
+            "--ids"
+        ])?)?,
+        spring
+    );
+    assert_eq!(
+        ids(local(&["timeline", "--date", "2026-11-01", "--ids"])?)?,
+        [fall_first, fall_second, fall_late]
+    );
+    let group = [
+        "timeline",
+        "--date",
+        "2026-03-08",
+        "--group-by",
+        "day",
+        "--json",
+    ];
+    let output = local(&group)?;
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, local(&group)?.stdout);
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["days"]["2026-03-08"], serde_json::json!(spring));
+    assert_eq!(report["results"][0]["title"], "Local midnight");
+    assert!(
+        report["results"][0]["path"]
+            .as_str()
+            .is_some_and(|p| p.starts_with(".nunc/entries/"))
+    );
+
+    let yesterday = chrono::Utc::now()
+        .date_naive()
+        .pred_opt()
+        .context("fixture date")?;
+    let yesterday_id = event(
+        "What I worked on yesterday",
+        &format!("{yesterday}T12:00:00Z"),
+    )?;
+    let output = checked(
+        fixture
+            .nunc(&["search", "--yesterday", "--ids"])
+            .env("TZ", "UTC")
+            .output()?,
+    )?;
+    assert!(ids(output)?.contains(&yesterday_id));
+    let fresh = fixture.log_id("A freshly recorded activity")?;
+    assert_eq!(
+        fixture.json(&["search", "--since", "10m", "--json"])?["results"][0]["id"],
+        fresh
+    );
+    fs::create_dir(fixture.repo.join("docs"))?;
+    fs::write(fixture.repo.join("docs/untimed.md"), "No event timestamp.")?;
+    fixture.run(&["init", "--source", "docs"])?;
+    assert_eq!(
+        fixture.json(&["search", "--since", "1d", "--source", "docs", "--json"])?["results"],
+        serde_json::json!([])
+    );
+    assert!(!fixture.state.exists());
+    assert!(!fixture.cache.exists());
+    Ok(())
+}
+
+#[test]
+fn timeline_respects_commit_time_neighbors_and_nested_visibility() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fs::write(fixture.repo.join("worker.txt"), "worker")?;
+    fixture.git(&["add", "worker.txt"])?;
+    checked(
+        Command::new("git")
+            .current_dir(&fixture.repo)
+            .args([
+                "-c",
+                "user.name=Agent",
+                "-c",
+                "user.email=test@example.test",
+                "commit",
+                "-qm",
+                "Historical worker change",
+            ])
+            .env("GIT_AUTHOR_DATE", "2024-07-04T01:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2024-07-04T02:00:00Z")
+            .output()?,
+    )?;
+    fixture.run(&["git", "ingest", "HEAD"])?;
+    let git_only = fixture.json(&["timeline", "--entry-kind", "git-commit", "--json"])?;
+    let git = &git_only["results"][0];
+    assert_eq!(git["timestamp"], "2024-07-04T02:00:00+00:00");
+    assert_eq!(git["entry_kind"], "git-commit");
+    assert_eq!(git["git"]["sha"].as_str().map(str::len), Some(40));
+    let nearby = fixture.log_id("Manual evidence about the same worker.")?;
+    fixture.event_time(&nearby, "2024-07-04T01:30:00Z")?;
+    let from = fixture.json(&[
+        "timeline",
+        "--around",
+        git["id"].as_str().context("missing commit ID")?,
+        "--window",
+        "30m",
+        "--json",
+    ])?;
+    assert_eq!(from["temporal_context"]["activities"][0]["id"], nearby);
+    assert_eq!(from["anchor"]["path"], git["path"]);
+    assert_eq!(from["anchor"]["git"]["sha"], git["git"]["sha"]);
+    assert_eq!(
+        from["temporal_context"]["activities"][0]["anchors"][0]["delta_millis"],
+        -1_800_000
+    );
+
+    let a = fixture.log_id("First incident evidence.")?;
+    let b = fixture.log_id("Second incident evidence.")?;
+    let c = fixture.log_id("Additional incident evidence.")?;
+    let inner = fixture.summary(&format!("{a},{b}"), "Inner incident summary.")?;
+    let outer = fixture.summary(&format!("{inner},{c}"), "Outer incident summary.")?;
+    let list = |raw: bool| -> Result<Vec<String>> {
+        let mut args = vec!["timeline", "--since", "10m", "--ids"];
+        if raw {
+            args.push("--raw");
+        }
+        Ok(String::from_utf8(fixture.run(&args)?.stdout)?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    };
+    assert_eq!(list(false)?, std::slice::from_ref(&outer));
+    assert_eq!(list(true)?.len(), 5);
+    fixture.run(&["forget", &b, "--yes"])?;
+    assert!(!list(true)?.contains(&b));
+    fixture.run(&["consolidate", "undo", &outer])?;
+    fixture.run(&["consolidate", "undo", &inner])?;
+    assert_eq!(list(false)?, [a, c]);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn real_temporal_search_separates_ranked_anchors_from_overlapping_windows() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let event = |label, at| -> Result<String> {
+        let id = fixture.log_id(label)?;
+        fixture.event_time(&id, at)?;
+        Ok(id)
+    };
+    let earlier = event(
+        "SQLite lease guards the writer transaction.",
+        "2026-02-02T12:00:00Z",
+    )?;
+    let later = event(
+        "Durable publication requires a SQLite writer lease.",
+        "2026-02-02T12:30:00Z",
+    )?;
+    let neighbor = event(
+        "Review certificate expiry with the deployment team.",
+        "2026-02-02T11:00:00Z",
+    )?;
+    let archived = event("Old incident recap.", "2026-02-02T11:05:00Z")?;
+    fixture.run(&["archive", &archived])?;
+    fs::create_dir(fixture.repo.join("docs"))?;
+    fs::write(
+        fixture.repo.join("docs/worker.md"),
+        "# SQLite writer lease and transaction",
+    )?;
+    fixture.run(&["reindex", "--source", "docs"])?;
+    let args = [
+        "search",
+        "SQLite writer locking",
+        "--from",
+        "2026-02-02T12:00:00Z",
+        "--to",
+        "2026-02-02T13:00:00Z",
+        "--related-by",
+        "time",
+        "--limit",
+        "2",
+        "--window",
+        "90m",
+        "--json",
+    ];
+    let report = fixture.json(&args)?;
+    let anchors: std::collections::BTreeSet<_> = report["results"]
+        .as_array()
+        .context("missing semantic results")?
+        .iter()
+        .filter_map(|hit| hit["id"].as_str())
+        .collect();
+    assert_eq!(anchors, [&*earlier, &*later].into_iter().collect());
+    let context = &report["temporal_context"];
+    assert_eq!(context["window_seconds"], 5400);
+    let activities = context["activities"]
+        .as_array()
+        .context("missing activities")?;
+    assert_eq!(activities.len(), 1);
+    assert_eq!(activities[0]["id"], neighbor);
+    let relations: std::collections::BTreeMap<_, _> = activities[0]["anchors"]
+        .as_array()
+        .context("missing activity relations")?
+        .iter()
+        .filter_map(|relation| {
+            Some((
+                relation["anchor_id"].as_str()?,
+                relation["delta_millis"].as_i64()?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        relations,
+        [(&*earlier, -3_600_000), (&*later, -5_400_000)]
+            .into_iter()
+            .collect()
+    );
+    let before = fixture.json(&["timeline", "--around", &earlier, "--raw", "--json"])?;
+    assert!(
+        before["temporal_context"]["activities"]
+            .as_array()
+            .context("missing raw activities")?
+            .iter()
+            .any(|activity| activity["id"] == archived && activity["status"] == "archived")
+    );
+    fixture.run(&["reindex", "--full"])?;
+    assert_eq!(
+        before,
+        fixture.json(&["timeline", "--around", &earlier, "--raw", "--json"])?
+    );
+    Ok(())
 }
 
 #[test]

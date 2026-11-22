@@ -16,5 +16,6 @@ mod model;
 mod protocol;
 pub mod repo;
 mod search;
+mod timeline;
 mod vectors;
 mod watch;

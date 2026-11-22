@@ -4,9 +4,10 @@ use crate::index::{Index, Reader};
 use crate::ledger::Guard;
 use crate::model::{LocalModel, MODEL};
 use crate::repo::{Repo, SourceLocation, source_path};
+use crate::timeline::{self, DatedEvent, NeighborReport, TimeFilter, parse_timestamp};
 use crate::vectors::{self, cosine};
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -25,6 +26,8 @@ pub(crate) struct Results {
     pub results: Vec<Match>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<budget::Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal_context: Option<NeighborReport>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
@@ -87,6 +90,8 @@ pub(crate) struct Options<'a> {
     pub one_per_parent: bool,
     pub max_tokens: Option<usize>,
     pub budget_encoding: BudgetEncoding,
+    pub time: TimeFilter,
+    pub neighbor_window: Option<TimeDelta>,
 }
 
 #[derive(Serialize)]
@@ -219,6 +224,20 @@ impl Filter {
                 path == filter.path || (filter.recursive && path.starts_with(&filter.path))
             })
     }
+
+    fn includes_activity(&self) -> bool {
+        self.kind != Some(Kind::Source) && self.includes(MEMORY_PATH)
+    }
+}
+
+pub(crate) fn dated(repo: &Repo, options: &Options<'_>) -> Result<Vec<DatedEvent>> {
+    let config = repo.config()?;
+    let filter = Filter::new(repo, &config.sources, options)?;
+    if !filter.includes_activity() {
+        return Ok(Vec::new());
+    }
+    let guard = Guard::acquire(repo, false)?;
+    timeline::events(repo, &guard.ledger, options.raw, options.time, None)
 }
 
 pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<Results> {
@@ -261,6 +280,11 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
             };
             let id = row.id()?;
             let timestamp = row.timestamp()?.and_then(parse_timestamp);
+            if !options.time.includes(timestamp)
+                || (options.neighbor_window.is_some() && timestamp.is_none())
+            {
+                return Ok(());
+            }
             let similarity = cosine(&query, query_norm, vector)?;
             let boost = recency(timestamp, now, &settings);
             let score = similarity + boost;
@@ -268,7 +292,9 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
                 recent_order(options.sort, item.timestamp, timestamp)
                     .then_with(|| compare(item.hit.score, &item.chunk, score, id))
             };
-            if (options.one_per_parent || options.max_tokens.is_some())
+            if (options.one_per_parent
+                || options.max_tokens.is_some()
+                || options.neighbor_window.is_some())
                 && let Some(existing) = best.iter().position(|hit| hit.parent == parent)
             {
                 if order(&best[existing]).is_le() {
@@ -360,19 +386,37 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
         Ok(_) => Some("Index needs refresh; run nunc reindex or wait for nunc serve".to_owned()),
         Err(error) => Some(format!("Cannot verify index freshness: {error:#}")),
     };
+    let temporal_context = if let Some(window) = options.neighbor_window {
+        let anchors: Vec<_> = results
+            .iter()
+            .filter_map(|hit| {
+                let at = parse_timestamp(hit.source.timestamp.as_deref()?)?;
+                Some((hit.source.id.clone(), at))
+            })
+            .collect();
+        let events = if anchors.is_empty() || !filter.includes_activity() {
+            Vec::new()
+        } else {
+            timeline::events(
+                repo,
+                &guard.ledger,
+                options.raw,
+                TimeFilter::default(),
+                None,
+            )?
+        };
+        Some(timeline::neighbors(events, &anchors, window, options.limit))
+    } else {
+        None
+    };
     Ok(Results {
         mode_used: "semantic",
         repo_id: repo.id.clone(),
         warnings: warning.into_iter().collect(),
         results,
         budget,
+        temporal_context,
     })
-}
-
-fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|timestamp| timestamp.to_utc())
 }
 
 fn recency(timestamp: Option<DateTime<Utc>>, now: DateTime<Utc>, settings: &Settings) -> f64 {
@@ -454,6 +498,8 @@ mod tests {
             one_per_parent: false,
             max_tokens: None,
             budget_encoding: BudgetEncoding::Json,
+            time: TimeFilter::default(),
+            neighbor_window: None,
         };
         let filter = Filter::new(&repo, &roots, &options)?;
         assert_eq!(filter.kind, None);

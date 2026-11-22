@@ -21,6 +21,8 @@ nunc search "Why did authentication fail in staging?"
 nunc search "authentication" --context parent --max-tokens 2000 --json
 nunc search "authentication" --format markdown --max-tokens 2000 > context.md
 nunc search --json --type source --source docs "time synchronization"
+nunc timeline --yesterday --group-by day
+nunc search "token rotation" --related-by time --window 2h --json
 ```
 
 Capture works as soon as the binary is installed. `nunc log` (or `nunc "a note"`) saves a durable Markdown file and returns its ID and path. `nunc serve` optionally accepts multiline messages from a repository FIFO and keeps the index current. In another shell, use `nunc write --stdin` to send a message or `nunc write "a note"` for a one-liner.

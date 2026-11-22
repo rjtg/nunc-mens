@@ -8,7 +8,9 @@ use crate::ledger::{self, Guard, Ledger};
 use crate::model::{self, LocalModel, MODEL};
 use crate::repo::Repo;
 use crate::search::{self, ContextMode, Sort};
+use crate::timeline::{self, DatedEvent, Event, EventKind, NeighborReport, TimeFilter};
 use anyhow::{Context, Result, ensure};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read, Write};
@@ -82,9 +84,9 @@ enum Action {
         #[arg(long)]
         source: Vec<PathBuf>,
     },
-    /// Search the local index by semantic similarity.
+    /// Search by semantic similarity or list recorded activities by date.
     Search {
-        #[arg(required = true, num_args = 1..)]
+        #[arg(required_unless_present_any = ["yesterday", "date", "since", "from", "to"], num_args = 1..)]
         query: Vec<String>,
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=1000))]
         limit: u32,
@@ -116,6 +118,35 @@ enum Action {
         explain: bool,
         #[arg(long)]
         raw: bool,
+        #[command(flatten)]
+        dates: DateArgs,
+        /// Find recorded activities around the semantic matches.
+        #[arg(long, value_enum, requires = "query", conflicts_with_all = ["ids", "format", "max_tokens"])]
+        related_by: Option<RelatedBy>,
+        /// Radius around each match, such as 2h.
+        #[arg(long, requires = "related_by")]
+        window: Option<String>,
+    },
+    /// List recorded memory and Git events in chronological order.
+    Timeline {
+        #[command(flatten)]
+        dates: DateArgs,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
+        #[arg(long, value_enum)]
+        entry_kind: Option<EventKind>,
+        #[arg(long)]
+        raw: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, conflicts_with = "json")]
+        ids: bool,
+        #[arg(long, value_enum, conflicts_with = "around")]
+        group_by: Option<TimelineGroup>,
+        #[arg(long)]
+        around: Option<Uuid>,
+        #[arg(long, requires = "around")]
+        window: Option<String>,
     },
     /// Import Git commits and manage the optional local post-commit hook.
     Git {
@@ -168,6 +199,49 @@ enum Action {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum SearchFormat {
     Markdown,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum RelatedBy {
+    Time,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TimelineGroup {
+    Day,
+}
+
+#[derive(Args)]
+struct DateArgs {
+    /// Use yesterday's date in the local timezone.
+    #[arg(long, conflicts_with_all = ["date", "since", "from", "to"])]
+    yesterday: bool,
+    /// Select a local calendar day (YYYY-MM-DD).
+    #[arg(long, conflicts_with_all = ["since", "from", "to"])]
+    date: Option<NaiveDate>,
+    /// Select a trailing duration such as 7d or 2h.
+    #[arg(long, conflicts_with_all = ["from", "to"])]
+    since: Option<String>,
+    /// Start at this local calendar date or RFC 3339 instant.
+    #[arg(long)]
+    from: Option<String>,
+    /// Include this local calendar date or stop before this RFC 3339 instant.
+    #[arg(long)]
+    to: Option<String>,
+}
+
+impl DateArgs {
+    fn filter(&self, now: DateTime<Utc>) -> Result<TimeFilter> {
+        if self.yesterday {
+            TimeFilter::yesterday(now.with_timezone(&Local).date_naive())
+        } else if let Some(date) = self.date {
+            TimeFilter::day(date)
+        } else if let Some(since) = &self.since {
+            TimeFilter::since(now, since)
+        } else {
+            TimeFilter::between(self.from.as_deref(), self.to.as_deref())
+        }
+    }
 }
 
 #[derive(Args)]
@@ -401,31 +475,53 @@ fn execute(action: Action) -> Result<ExitCode> {
             recency_boost,
             explain,
             raw,
+            dates,
+            related_by,
+            window,
         } => {
             let markdown = matches!(format, Some(SearchFormat::Markdown));
-            let found = search::search(
-                &repo,
-                &query.join(" "),
-                search::Options {
-                    limit: limit as usize,
-                    kind,
-                    sources: &source,
-                    source_files: &source_file,
-                    context: if ids { ContextMode::Chunk } else { context },
-                    sort,
-                    recency_boost,
-                    explain,
-                    raw,
-                    one_per_parent: ids || markdown,
-                    max_tokens: max_tokens.map(|value| value as usize),
-                    budget_encoding: if markdown {
-                        search::BudgetEncoding::Markdown
-                    } else {
-                        search::BudgetEncoding::Json
-                    },
+            let options = search::Options {
+                limit: limit as usize,
+                kind,
+                sources: &source,
+                source_files: &source_file,
+                context: if ids { ContextMode::Chunk } else { context },
+                sort,
+                recency_boost,
+                explain,
+                raw,
+                one_per_parent: ids || markdown,
+                max_tokens: max_tokens.map(|value| value as usize),
+                budget_encoding: if markdown {
+                    search::BudgetEncoding::Markdown
+                } else {
+                    search::BudgetEncoding::Json
                 },
-            )?;
+                time: dates.filter(Utc::now())?,
+                neighbor_window: related_by
+                    .map(|_| timeline::duration(window.as_deref().unwrap_or("2h")))
+                    .transpose()?,
+            };
             let mut out = io::stdout().lock();
+            if query.is_empty() {
+                ensure!(
+                    options.time.restricted(),
+                    "provide a query or a date filter"
+                );
+                ensure!(
+                    !markdown
+                        && !explain
+                        && max_tokens.is_none()
+                        && recency_boost.is_none()
+                        && !matches!(sort, Sort::Recent)
+                        && matches!(context, ContextMode::Chunk),
+                    "context, formatting, score and budget options require a semantic query"
+                );
+                let events = search::dated(&repo, &options)?;
+                print_events(events, limit as usize, json, ids, false, &mut out)?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            let found = search::search(&repo, &query.join(" "), options)?;
             if json {
                 serde_json::to_writer(&mut out, &found)?;
                 writeln!(out)?;
@@ -519,6 +615,80 @@ fn execute(action: Action) -> Result<ExitCode> {
                     }
                 }
                 print_context_usage(found.budget.as_ref());
+                if let Some(report) = &found.temporal_context {
+                    print_neighbors(report, &mut out)?;
+                }
+            }
+        }
+        Action::Timeline {
+            dates,
+            limit,
+            entry_kind,
+            raw,
+            json,
+            ids,
+            group_by,
+            around,
+            window,
+        } => {
+            let guard = Guard::acquire(&repo, false)?;
+            let events = timeline::events(
+                &repo,
+                &guard.ledger,
+                raw,
+                dates.filter(Utc::now())?,
+                entry_kind,
+            )?;
+            let mut out = io::stdout().lock();
+            if let Some(id) = around {
+                let archives = guard.ledger.archives()?;
+                ensure!(!guard.ledger.forgotten(id), "entry {id} was forgotten");
+                ensure!(
+                    raw || !guard.ledger.hidden(&archives, id),
+                    "anchor {id} is archived; use --raw to include it"
+                );
+                let anchor = guard.ledger.read_entry(&repo, id)?;
+                let timestamp = anchor.metadata.timestamp;
+                let path = entries::path(&repo, id);
+                let path = path
+                    .strip_prefix(&repo.root)
+                    .context("anchor path is outside the repository")?;
+                let window = timeline::duration(window.as_deref().unwrap_or("2h"))?;
+                let report = timeline::neighbors(
+                    events,
+                    &[(id.to_string(), timestamp.to_utc())],
+                    window,
+                    limit as usize,
+                );
+                if json {
+                    serde_json::to_writer(
+                        &mut out,
+                        &serde_json::json!({
+                            "anchor": {
+                                "id": id, "timestamp": timestamp, "path": path,
+                                "entry_kind": anchor.metadata.kind, "git": anchor.metadata.commit,
+                            },
+                            "temporal_context": report,
+                        }),
+                    )?;
+                    writeln!(out)?;
+                } else if ids {
+                    for neighbor in report.activities {
+                        writeln!(out, "{}", neighbor.event.source.id)?;
+                    }
+                } else {
+                    writeln!(out, "Anchor {id} at {timestamp} {}", path.display())?;
+                    print_neighbors(&report, &mut out)?;
+                }
+            } else {
+                print_events(
+                    events,
+                    limit as usize,
+                    json,
+                    ids,
+                    group_by.is_some(),
+                    &mut out,
+                )?;
             }
         }
         Action::Git { command } => git_action(&repo, command)?,
@@ -560,6 +730,101 @@ fn print_context_usage(budget: Option<&search::BudgetUsage>) {
             budget.omitted_candidates,
         );
     }
+}
+
+fn print_events(
+    events: Vec<DatedEvent>,
+    limit: usize,
+    json: bool,
+    ids: bool,
+    group_by_day: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    let skip = events.len().saturating_sub(limit);
+    let events: Vec<_> = events
+        .into_iter()
+        .skip(skip)
+        .map(|event| event.event)
+        .collect();
+    if json {
+        let mut report = serde_json::json!({"mode_used": "temporal", "results": events});
+        if group_by_day {
+            let mut groups = BTreeMap::<_, Vec<_>>::new();
+            for event in &events {
+                groups
+                    .entry(event.local_day)
+                    .or_default()
+                    .push(&event.source.id);
+            }
+            report["days"] = serde_json::to_value(groups)?;
+        }
+        serde_json::to_writer(&mut *out, &report)?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    let mut day = None;
+    for event in &events {
+        if ids {
+            writeln!(out, "{}", event.source.id)?;
+            continue;
+        }
+        if group_by_day && day != Some(event.local_day) {
+            writeln!(out, "{}", event.local_day)?;
+            day = Some(event.local_day);
+        }
+        print_event(event, out)?;
+    }
+    if events.is_empty() && !ids {
+        writeln!(out, "No recorded activities")?;
+    }
+    Ok(())
+}
+
+fn print_event(event: &Event, out: &mut impl Write) -> Result<()> {
+    let source = &event.source;
+    let kind = match source.entry_kind {
+        Some(entries::EntryKind::GitCommit) => "git-commit",
+        Some(entries::EntryKind::Consolidation) => "consolidation",
+        _ => "memory",
+    };
+    write!(
+        out,
+        "{} {} {} [{}]",
+        source.timestamp.as_deref().unwrap_or(""),
+        kind,
+        source.path,
+        source.id
+    )?;
+    if let Some(commit) = &source.git {
+        write!(out, " commit {}", commit.sha)?;
+    }
+    if let Some(visibility) = &source.visibility {
+        write!(out, " {}", visibility.status)?;
+    }
+    writeln!(out, " {}", event.title)?;
+    Ok(())
+}
+
+fn print_neighbors(report: &NeighborReport, out: &mut impl Write) -> Result<()> {
+    writeln!(
+        out,
+        "\nOther recorded activities within {} seconds of an anchor (time proximity)",
+        report.window_seconds
+    )?;
+    for neighbor in &report.activities {
+        print_event(&neighbor.event, out)?;
+        for relation in &neighbor.anchors {
+            writeln!(
+                out,
+                "  {:+} ms from {}",
+                relation.delta_millis, relation.anchor_id
+            )?;
+        }
+    }
+    if report.activities.is_empty() {
+        writeln!(out, "No neighboring activities")?;
+    }
+    Ok(())
 }
 
 fn print_receipt(receipt: entries::Receipt) {
@@ -705,6 +970,8 @@ fn consolidate(repo: &Repo, command: Consolidation) -> Result<()> {
                     one_per_parent: true,
                     max_tokens: None,
                     budget_encoding: search::BudgetEncoding::Json,
+                    time: TimeFilter::default(),
+                    neighbor_window: None,
                 },
             )?;
             if json {

@@ -171,7 +171,7 @@ impl Snapshot {
     }
 }
 
-fn memories(repo: &Repo, ledger: &Ledger) -> Result<Vec<Document>> {
+pub(crate) fn memories(repo: &Repo, ledger: &Ledger) -> Result<Vec<Document>> {
     let dir = repo.entries();
     match fs::symlink_metadata(&dir) {
         Ok(_) => private_dir(&dir)?,

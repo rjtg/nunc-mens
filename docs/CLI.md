@@ -16,7 +16,8 @@
 | `nunc unarchive ID... [--dry-run] [--json]` | Restores manually archived memories. |
 | `nunc forget ID... [--dry-run\|--yes] [--json]` | Deletes only the specified entries after warning about dependencies. |
 | `nunc reindex [--full] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
-| `nunc search QUERY... [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Ranks compatible indexed vectors by cosine similarity and optionally caps context. |
+| `nunc search [QUERY...] [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Searches indexed vectors with a query or lists original events for a time filter. |
+| `nunc timeline [--yesterday\|--date DATE\|--since DURATION\|--from START --to END] [--group-by day] [--entry-kind KIND] [--around ID --window DURATION] [--json\|--ids] [--raw]` | Lists recorded activity or finds neighboring records around a known ID. |
 | `nunc models download` | Explicitly downloads and validates the pinned model and tokenizer. |
 | `nunc status` | Shows repository, server, sources, cache, and index paths. |
 | `nunc doctor` | Also compares index freshness against the current repository snapshot. |
@@ -99,7 +100,31 @@ The bundle uses one section per ranked parent and accepts the same context, visi
 
 This format estimates usage as the sum of `ceil(UTF-8 bytes in the rendered section / 4)`. It charges every byte on stdout, including result headings, metadata, delimiters, separators, and requested explanation. Budget totals and warnings go to stderr. If no result fits, stdout is empty. `--format markdown` conflicts with `--json` and `--ids`.
 
-### Configuration
+## Calendar search and timeline
+
+```sh
+nunc search --yesterday --json
+nunc timeline --since 7d --group-by day
+nunc timeline --from 2026-11-01 --to 2026-11-15 --entry-kind git-commit --ids
+nunc search "SQLite concurrency" --since 7d
+```
+
+Only events with an original timestamp match a time filter. Journal events use their recorded timestamps, and Git events use the original committer time. Source documents are currently undated.
+
+`--yesterday` and dates use the local timezone. Calendar ranges include both date endpoints, and daylight-saving days include all instants with the given local date. An RFC 3339 start instant is inclusive and an RFC 3339 end instant is exclusive. `--since 7d` is an elapsed duration ending at the time the command starts. Durations use positive integers with `s`, `m`, `h`, `d`, or `w`.
+
+Date-only search and ordinary timelines read the journal and ledger directly. Their JSON has `mode_used: "temporal"` and a `results` array containing IDs, original timestamps, local days, kind, paths, titles, excerpts, visibility, and Git provenance when available. The latest records up to `--limit` are shown oldest first, with ties ordered by ID. `--group-by day` adds a date-to-ID map in JSON and headings in text. `--entry-kind` selects `memory`, `git-commit`, or `consolidation`. A Git entry and a manual note remain separately attributed records even when they describe the same work. Topic grouping is tracked in [#15](https://github.com/rjtg/nunc-mens/issues/15).
+
+```sh
+nunc search "SQLite locking" --related-by time --window 2h --json
+nunc timeline --around "$memory_id" --window 2h --json
+```
+
+The first command ranks semantic anchors, then reports nearby records separately under `temporal_context`. The second uses one known ID and works without embeddings. The default window is two hours in either direction, inclusive. A search date filter applies to anchors, so neighbors can cross that filter boundary. A timeline date filter or entry-kind filter applies to the neighbor list. An activity appears once even when it overlaps several anchors, and each relation records the anchor ID and signed millisecond delta. Neighbors are limited separately and ordered by closest absolute delta, then event time and ID. Every anchor is excluded from those results. Time proximity describes when records occurred and carries no claim about what connects them.
+
+Default results hide archived and undone entries. `--raw` includes those records, and forgotten entries remain omitted. `timeline --ids` prints the displayed IDs only. A query with `--related-by time` supports text or JSON output. Context budgets and Markdown bundles apply to ordinary semantic retrieval.
+
+### Search configuration
 
 ```toml
 sources = ["docs", "src"]

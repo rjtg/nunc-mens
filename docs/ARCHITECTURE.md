@@ -19,6 +19,7 @@ CLI → Repo + Config
 - `index` serializes writers and protects database readers against same-directory replacement with a shared lock. `search` filters candidates by provenance, computes cosine in Rust with f64 accumulation, and retains the best K. Storage, capture, and indexing failures retain their own error context.
 - The optional search context budget operates after ranking and visibility checks. It loads parents through the same index read guard, reserves matched blocks across distinct sources and uses the remaining budget to expand contiguous excerpts. The existing chunk metadata identifies the match and a separate window identifies the actual returned text. No index migration is required.
 - Markdown bundles use the same ranked candidates and window allocator. The budget counter runs the same section writer used for stdout, so it includes the full attribution and literal excerpt framing.
+- Temporal filters compare original event instants or local calendar dates before ranking. Timelines and date-only search read durable entries with the same ledger visibility rules. Temporal neighbors run under that shared guard and report time deltas separately from retrieval scores. The index and original Markdown need no migration.
 
 ## SQLite and recovery
 

@@ -82,3 +82,17 @@ The next revision adds an index on `documents(path)` and binds explicit file uni
 `EXPLAIN QUERY PLAN` on the fixture changed the exact equality predicate from `SCAN documents` to `SEARCH documents USING INDEX chunk_path (path=?)`. The bound file-list predicate also uses `chunk_path`, and lexical matching retains the FTS virtual-table plan. `--explain` still uses full type-scope traversal for its precise filter counts. Directory and mixed scopes keep the component-aware filter. Freshness still checks about 0.9 seconds of source metadata at this size. Reads after a change still fall back to the content digest.
 
 The after binary SHA-256 was `f44b47301a0d84cfe767ab01b889111b20b6ac3d35e249210c6207ac2d951c13`.
+
+### Changed source metadata
+
+A follow-up touched the exact source file's mtime while preserving its contents. The previous build would confirm the unchanged result by rereading the full corpus. The source manifest allowed the new build to confirm it by rereading the file with the changed stamp. A unit test counts the bodies reopened during a manifest comparison. [Touch samples](../benchmarks/performance/results/source-manifest-touch-100000-linux-x86_64.jsonl) · [Unchanged samples](../benchmarks/performance/results/source-manifest-steady-100000-linux-x86_64.jsonl)
+
+| Mode | Freshness after touch, prior build | Freshness after touch, manifest |
+| --- | ---: | ---: |
+| Semantic | 3.166 s | 1.307 s |
+| Keyword | 3.078 s | 1.415 s |
+| Hybrid | 3.184 s | 1.426 s |
+
+All three modes returned byte-identical JSON for both the touch and unchanged comparisons. Unchanged-source freshness moved from 0.863–0.888 s to 0.890–0.947 s in these single pairs. The SQLite manifest occupied 22.2 MiB of pages on this 100,000-chunk fixture and is decoded only when the aggregate fingerprint cannot confirm freshness. Search still hashes the journal. These measurements are from the same host and corpus as the earlier comparisons.
+
+The after binary SHA-256 was `f558d0d8f1cf0a0219b7e65680cf7c8312e2df6dec2cde66ccc8c55173a9df05`.

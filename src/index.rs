@@ -1,5 +1,5 @@
 use crate::chunk::{self, Chunk, Strategy};
-use crate::documents::{Document, Kind, MatchedChunk, Provenance, Snapshot};
+use crate::documents::{Document, Kind, MatchedChunk, Provenance, Snapshot, SourceManifest};
 use crate::entries::{Commit, EntryKind};
 use crate::fs::{effective_uid, lockfile, private_dir, sync_dir};
 use crate::ledger::Guard;
@@ -333,6 +333,11 @@ fn store_search_metadata(tx: &Transaction<'_>, snapshot: &Snapshot) -> Result<()
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             digest TEXT NOT NULL,
             stamps TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS snapshot_source_manifest (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            digest TEXT NOT NULL,
+            manifest TEXT NOT NULL
         ) STRICT;",
     )?;
     if let Some(freshness) = &snapshot.freshness {
@@ -345,6 +350,15 @@ fn store_search_metadata(tx: &Transaction<'_>, snapshot: &Snapshot) -> Result<()
     } else {
         tx.execute("DELETE FROM snapshot_freshness", [])?;
     }
+    tx.execute(
+        "INSERT INTO snapshot_source_manifest VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET digest=excluded.digest, manifest=excluded.manifest
+         WHERE digest != excluded.digest OR manifest != excluded.manifest",
+        params![
+            snapshot.digest,
+            serde_json::to_string(&snapshot.source_manifest)?
+        ],
+    )?;
     Ok(())
 }
 
@@ -680,6 +694,28 @@ impl Reader {
                 .optional()?);
         }
         Ok(None)
+    }
+
+    pub(crate) fn source_manifest(&self) -> Result<Option<SourceManifest>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='snapshot_source_manifest')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let manifest: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT manifest FROM snapshot_source_manifest WHERE singleton=1 AND digest=?1",
+                [&self.digest],
+                |row| row.get(0),
+            )
+            .optional()?;
+        manifest
+            .map(|data| serde_json::from_str(&data).context("decode source manifest"))
+            .transpose()
     }
 
     pub(crate) fn chunk<T>(

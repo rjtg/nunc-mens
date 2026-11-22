@@ -1100,7 +1100,7 @@ fn freshness_detects_changed_sources_with_restored_mtime_and_handles_legacy_inde
         .path();
     {
         let conn = rusqlite::Connection::open(index.join("index.sqlite3"))?;
-        conn.execute("DROP TABLE snapshot_freshness", [])?;
+        conn.execute_batch("DROP TABLE snapshot_freshness; DROP TABLE snapshot_source_manifest;")?;
     }
     assert_eq!(search()?, original);
     fixture.run(&["reindex", "--keyword-only"])?;

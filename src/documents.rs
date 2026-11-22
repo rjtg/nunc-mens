@@ -8,7 +8,7 @@ use clap::ValueEnum;
 use rustix::fs::{Mode, OFlags, openat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -127,6 +127,7 @@ pub(crate) struct Snapshot {
     pub digest: String,
     pub chunking: Settings,
     pub freshness: Option<String>,
+    pub source_manifest: SourceManifest,
 }
 
 impl Snapshot {
@@ -136,20 +137,35 @@ impl Snapshot {
         let mut documents = memories(repo, &ledger)?;
         documents.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
         let mut fingerprint = Freshness::new(&config, &documents)?;
+        let mut source_manifest = SourceManifest {
+            basis: fingerprint.basis.clone(),
+            files: BTreeMap::new(),
+        };
         let mut sources = Sources::open(repo)?;
         for path in source_files(repo, &config.sources)? {
-            if let Some(file) = sources.file(&path)? {
+            let state = if let Some(file) = sources.file(&path)? {
                 let meta = file.metadata()?;
-                let stamp = stamp(&meta);
-                if let Some(text) = source_text(&file, &meta, &path)? {
-                    documents.push(source_document(&path, text)?);
-                }
+                let before = stamp(&meta);
+                let document = source_text(&file, &meta, &path)?
+                    .map(|text| source_document(&path, text))
+                    .transpose()?;
+                let revision = document.as_ref().map(|doc| doc.hash.clone());
+                documents.extend(document);
                 // A racing read still gets a content digest. It cannot seed the shortcut.
-                fingerprint.reliable &= stamp == self::stamp(&file.metadata()?);
-                fingerprint.record(&path, Some(stamp));
+                let stable = before == stamp(&file.metadata()?);
+                fingerprint.reliable &= stable;
+                SourceState {
+                    stamp: stable.then_some(before),
+                    revision,
+                }
             } else {
-                fingerprint.record(&path, None);
-            }
+                SourceState {
+                    stamp: None,
+                    revision: None,
+                }
+            };
+            fingerprint.record(&path, state.stamp.as_ref());
+            source_manifest.files.insert(path, state);
         }
         documents.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
         let mut digest = configuration_digest(&config)?;
@@ -159,6 +175,7 @@ impl Snapshot {
             digest: format!("{:x}", digest.finalize()),
             chunking: config.chunking,
             freshness: fingerprint.finish(),
+            source_manifest,
         })
     }
 }
@@ -178,6 +195,7 @@ fn configuration_digest(config: &Config) -> Result<Sha256> {
 }
 
 struct Freshness {
+    basis: String,
     digest: Sha256,
     reliable: bool,
 }
@@ -186,14 +204,16 @@ impl Freshness {
     fn new(config: &Config, memories: &[Document]) -> Result<Self> {
         let mut digest = configuration_digest(config)?;
         hash_documents(&mut digest, memories)?;
+        let basis = format!("{:x}", digest.clone().finalize());
         digest.update(b"nunc-source-stamps-v1");
         Ok(Self {
+            basis,
             digest,
             reliable: true,
         })
     }
 
-    fn record(&mut self, path: &Path, stamp: Option<SourceStamp>) {
+    fn record(&mut self, path: &Path, stamp: Option<&SourceStamp>) {
         let path = path.as_os_str().as_bytes();
         self.digest.update((path.len() as u64).to_le_bytes());
         self.digest.update(path);
@@ -222,20 +242,106 @@ impl Freshness {
     }
 }
 
-pub(crate) fn source_freshness(repo: &Repo, ledger: &Ledger) -> Result<Option<String>> {
-    let config = repo.config()?;
-    let mut memories = memories(repo, ledger)?;
-    memories.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
-    let mut fingerprint = Freshness::new(&config, &memories)?;
-    let mut sources = Sources::open(repo)?;
-    for path in source_files(repo, &config.sources)? {
-        let stamp = sources
-            .file(&path)?
-            .map(|file| file.metadata().map(|metadata| stamp(&metadata)))
-            .transpose()?;
-        fingerprint.record(&path, stamp);
+#[derive(Deserialize, Serialize)]
+pub(crate) struct SourceManifest {
+    basis: String,
+    files: BTreeMap<PathBuf, SourceState>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SourceState {
+    stamp: Option<SourceStamp>,
+    revision: Option<String>,
+}
+
+struct SourceInputs {
+    basis: String,
+    fingerprint: Option<String>,
+    observed: Vec<(PathBuf, Option<SourceStamp>)>,
+}
+
+impl SourceInputs {
+    fn read(repo: &Repo, ledger: &Ledger) -> Result<Self> {
+        let config = repo.config()?;
+        let mut memories = memories(repo, ledger)?;
+        memories.sort_unstable_by(|a, b| a.provenance.id.cmp(&b.provenance.id));
+        let mut fingerprint = Freshness::new(&config, &memories)?;
+        let paths = source_files(repo, &config.sources)?;
+        let mut sources = Sources::open(repo)?;
+        let mut observed = Vec::with_capacity(paths.len());
+        for path in paths {
+            let stamp = sources
+                .file(&path)?
+                .map(|file| file.metadata().map(|metadata| stamp(&metadata)))
+                .transpose()?;
+            fingerprint.record(&path, stamp.as_ref());
+            observed.push((path, stamp));
+        }
+        Ok(Self {
+            basis: fingerprint.basis.clone(),
+            fingerprint: fingerprint.finish(),
+            observed,
+        })
     }
-    Ok(fingerprint.finish())
+
+    fn matches_manifest(
+        self,
+        mut manifest: SourceManifest,
+        mut revision_for: impl FnMut(&Path) -> Result<Option<String>>,
+    ) -> Result<bool> {
+        let mut unchanged = self.basis == manifest.basis;
+        for (path, observed) in self.observed {
+            let expected = manifest.files.remove(&path);
+            if observed.as_ref().is_some_and(|stamp| stamp.changed.1 != 0)
+                && expected
+                    .as_ref()
+                    .is_some_and(|state| state.stamp == observed)
+            {
+                continue;
+            }
+            let revision = if observed.is_some() {
+                revision_for(&path)?
+            } else {
+                None
+            };
+            unchanged &= revision == expected.and_then(|state| state.revision);
+        }
+        Ok(unchanged && manifest.files.values().all(|file| file.revision.is_none()))
+    }
+}
+
+pub(crate) fn snapshot_is_current(
+    repo: &Repo,
+    ledger: &Ledger,
+    digest: &str,
+    fingerprint: Option<&str>,
+    load_manifest: impl FnOnce() -> Result<Option<SourceManifest>>,
+) -> Result<bool> {
+    let observed = fingerprint
+        .map(|_| SourceInputs::read(repo, ledger))
+        .transpose()?;
+    if let Some(observed) = &observed
+        && fingerprint == observed.fingerprint.as_deref()
+    {
+        return Ok(true);
+    }
+    if let Some(manifest) = load_manifest()? {
+        let observed = match observed {
+            Some(observed) => observed,
+            None => SourceInputs::read(repo, ledger)?,
+        };
+        let mut sources = Sources::open(repo)?;
+        return observed.matches_manifest(manifest, |path| {
+            // Reopen safely. A changed path can have changed again since enumeration.
+            Ok(sources
+                .file(path)?
+                .map(|file| source_text(&file, &file.metadata()?, path))
+                .transpose()?
+                .flatten()
+                .map(|text| hash(text.as_bytes())))
+        });
+    }
+    Ok(Snapshot::read(repo)?.digest == digest)
 }
 
 pub(crate) fn reference_source(repo: &Repo, path: &Path) -> Result<Option<Document>> {
@@ -434,7 +540,7 @@ impl Sources {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
 struct SourceStamp {
     fields: [u64; 6],
     changed: (i64, i64),
@@ -470,6 +576,57 @@ fn source_text(file: &File, metadata: &fs::Metadata, path: &Path) -> Result<Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_manifest_rereads_only_changed_or_unreliable_files() -> Result<()> {
+        let stable = || SourceStamp {
+            fields: [0; 6],
+            changed: (0, 1),
+            modified: (0, 1),
+        };
+        let seen = SourceInputs {
+            basis: "basis".into(),
+            fingerprint: None,
+            observed: vec![
+                ("good.md".into(), Some(stable())),
+                ("touched.md".into(), Some(stable())),
+                ("new-empty.md".into(), Some(stable())),
+            ],
+        };
+        let manifest = SourceManifest {
+            basis: "basis".into(),
+            files: BTreeMap::from([
+                (
+                    "good.md".into(),
+                    SourceState {
+                        stamp: Some(stable()),
+                        revision: Some("good".into()),
+                    },
+                ),
+                (
+                    "touched.md".into(),
+                    SourceState {
+                        stamp: None,
+                        revision: Some("same".into()),
+                    },
+                ),
+                (
+                    "removed-empty.md".into(),
+                    SourceState {
+                        stamp: Some(stable()),
+                        revision: None,
+                    },
+                ),
+            ]),
+        };
+        let mut opened = Vec::new();
+        assert!(seen.matches_manifest(manifest, |path| {
+            opened.push(path.to_path_buf());
+            Ok((path == Path::new("touched.md")).then(|| "same".into()))
+        })?);
+        assert_eq!(opened, [PathBuf::from("touched.md"), "new-empty.md".into()]);
+        Ok(())
+    }
 
     #[test]
     fn paths_ignore_git_ignored_files_and_symlinks_and_deduplicate() -> Result<()> {

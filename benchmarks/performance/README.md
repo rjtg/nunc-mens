@@ -66,3 +66,5 @@ python3 -B -m benchmarks.performance.compare_freshness \
 ```
 
 The comparator seeds the new additive fingerprint via a keyword-only reindex, then requires current and byte-identical results from both executables in all three modes. It records total wall time and timed stages. Increase `--samples` for a larger comparison. [Measured result](../../docs/BENCHMARK_SCALE.md#source-freshness-shortcut-at-100000-chunks)
+
+Pass `--touch-source` to test one metadata-only mismatch on the isolated fixture. The harness temporarily changes and restores the selected file's mtime. The filesystem's ctime records the change. The query must still return current, identical JSON. [Recorded comparison](../../docs/BENCHMARK_SCALE.md#changed-source-metadata)

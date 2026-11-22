@@ -1,5 +1,5 @@
 use crate::chunk::Strategy;
-use crate::documents::{Kind, Provenance, Snapshot, source_freshness};
+use crate::documents::{Kind, Provenance, snapshot_is_current};
 use crate::index::{Index, IndexedRow, ReadCache, Reader};
 use crate::ledger::Guard;
 use crate::model::{LocalModel, MODEL, SharedModel};
@@ -771,13 +771,22 @@ pub(crate) fn search_with(
     let stored_freshness = reader.freshness()?;
     drop(reader);
     checkpoint()?;
-    let current = profile::measure(Stage::Freshness, || -> Result<bool> {
-        if let Some(expected) = stored_freshness
-            && source_freshness(repo, &guard.ledger)?.as_ref() == Some(&expected)
-        {
-            return Ok(true);
-        }
-        Ok(Snapshot::read(repo)?.digest == digest)
+    let current = profile::measure(Stage::Freshness, || {
+        snapshot_is_current(
+            repo,
+            &guard.ledger,
+            &digest,
+            stored_freshness.as_deref(),
+            || {
+                // Reopen only on mismatch and never pair a new index manifest with older results.
+                if let Some(reader) = index.read_mode(MODEL, false, false, read_cache)?
+                    && reader.digest == digest
+                {
+                    return reader.source_manifest();
+                }
+                Ok(None)
+            },
+        )
     });
     let (freshness, warning) = match current {
         Ok(true) => ("current", None),

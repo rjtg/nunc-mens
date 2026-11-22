@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from stat import S_ISREG
 
 from benchmarks.performance.run import MODES, read_profile
 from benchmarks.process import measure_command
@@ -16,6 +17,7 @@ def main():
     parser.add_argument("--query", required=True)
     parser.add_argument("--source-file", required=True)
     parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument("--touch-source", action="store_true", help="trigger validation with a metadata-only change")
     args = parser.parse_args()
     if args.samples < 1:
         parser.error("--samples must be positive")
@@ -30,26 +32,43 @@ def main():
     # Seed the auxiliary freshness metadata for existing indexes. The old
     # binary ignores the additive table and checks the same content digest.
     measure_command([after, "reindex", "--keyword-only"], args.repo, env)
-    with args.output.open("x", encoding="utf-8") as output:
-        for mode in MODES:
-            command = ["search", "--mode", mode, "--source-file", args.source_file,
-                       "--json", "--", args.query]
-            for sample in range(args.samples):
-                baseline = None
-                for tag, binary in (("before", args.before.resolve()), ("after", after)):
-                    stdout, stderr, timing = measure_command([binary, *command], args.repo, env)
-                    result = json.loads(stdout)
-                    if not result["results"] or result["warnings"]:
-                        raise ValueError("expected matches from a current index")
-                    if baseline is None:
-                        baseline = stdout
-                    elif stdout != baseline:
-                        raise ValueError(f"{mode} results differ between versions")
-                    print(json.dumps({
-                        "version": tag, "sample": sample, "mode": mode,
-                        "scope": "file", "path": args.source_file,
-                        **timing, "stages_ns": read_profile(stderr),
-                    }), file=output, flush=True)
+    root = args.repo.resolve()
+    source = root / args.source_file
+    stat = None
+    if args.touch_source:
+        if not source.is_relative_to(root) or source.resolve() != source:
+            parser.error("--touch-source requires an ordinary path inside the fixture")
+        stat = source.stat()
+        if not S_ISREG(stat.st_mode):
+            parser.error("--touch-source requires a regular file")
+    if stat:
+        os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    try:
+        with args.output.open("x", encoding="utf-8") as output:
+            for mode in MODES:
+                command = ["search", "--mode", mode, "--source-file", args.source_file,
+                           "--json", "--", args.query]
+                for sample in range(args.samples):
+                    baseline = None
+                    for tag, binary in (("before", args.before.resolve()), ("after", after)):
+                        stdout, stderr, timing = measure_command([binary, *command], args.repo, env)
+                        result = json.loads(stdout)
+                        if not result["results"] or result["warnings"]:
+                            raise ValueError("expected matches from a current index")
+                        if baseline is None:
+                            baseline = stdout
+                        elif stdout != baseline:
+                            raise ValueError(f"{mode} results differ between versions")
+                        print(json.dumps({
+                            "version": tag, "sample": sample, "mode": mode,
+                            "scope": "file", "path": args.source_file,
+                            **({"metadata_only_touch": True} if args.touch_source else {}),
+                            **timing, "stages_ns": read_profile(stderr),
+                        }), file=output, flush=True)
+    finally:
+        if stat:
+            os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
 
 
 if __name__ == "__main__":

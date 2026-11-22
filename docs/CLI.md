@@ -77,6 +77,17 @@ Choose paths inside a registered source. Absolute paths, parent traversal, symli
 
 `--json` returns `mode_used`, `repo_id`, `warnings` and `results`. The original hit fields are retained. `matched_chunk` adds its ID, parent ID, chunk and parent SHA-256, heading hierarchy, one-based inclusive lines and zero-based half-open byte range. Memory locations are relative to the body after front matter. Memory rows keep their parent UUID as `id`. Git results include original commit provenance under `git` and `entry_kind: "git-commit"`. Memory rows expose status, optional archive target and originating source IDs. Search reports stale or unverifiable snapshots in `warnings`.
 
+### Diagnose retrieval
+
+```sh
+nunc search "SQLite lock" --source docs/design --explain
+nunc search "SQLite lock" --since 7d --limit 10 --max-tokens 1000 --explain --json
+```
+
+With `--explain`, console and Markdown pipeline diagnostics go to stderr. JSON adds a `pipeline` object with the retrieval mode, stage availability, index freshness and exact counts from the current scan. Counts start with indexed chunks in the selected type scope. The source filter runs first, followed by reference exclusion, ledger visibility and time filtering. After scoring, the report identifies the ranking unit, the count removed by parent deduplication, the count beyond the top-K limit, and budget omissions. Stage exclusions count chunks. Limit and budget counts use the named ranking unit.
+
+Compare the type-scope and source-filter counts to diagnose path scope. Compare the scored, ranked, and returned counts to distinguish limits from budget omissions. A stale index can omit durable entries that the scan never saw. Use `nunc doctor --deep` or `nunc reindex` to check freshness. Diagnostics report aggregate counts for examined rows and never expose forgotten text or IDs. Keyword, fusion and reranking stages report unavailable in the current semantic pipeline.
+
 ### Context budget
 
 ```sh

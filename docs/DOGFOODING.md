@@ -167,3 +167,9 @@ Formatting, Clippy, 53 default tests, and the real stored-vector integration tes
 An isolated Git fixture reused seven real development notes and indexed two excerpts from the CLI and architecture documentation. `nunc search --similar-to "$budget_id" --type memory --limit 3 --json` ranked the other budget allocation decision first at cosine 0.923. `nunc search --similar-to docs/context-budget.md --limit 4 --max-tokens 1500 --json` used two reference passages and returned the original budget decision first at cosine 0.928. Both runs excluded the reference and used an empty model-cache path.
 
 Formatting, Clippy, and 55 default tests passed. The real search-by-example and topic regression tests passed. They checked distinct parent ranking, Markdown, IDs, source filtering, stored-vector operation, and the archived, forgotten, changed and unindexed reference cases. Cargo verified files where Rust LSP diagnostics timed out.
+
+## Retrieval diagnostics
+
+In the search-by-example fixture, searching with `--source-file docs/context-budget.md --limit 1 --max-tokens 1 --explain --json` counted four chunks in the source type scope and two after the path filter. It scored both and deduplicated them to one parent. That parent survived top-K and was omitted by the one-token budget. The trace matched the empty result and the index reported current.
+
+Formatting, Clippy, all 55 default tests, and the targeted ONNX CLI test passed. The CLI test restored a stale index in an isolated fixture to confirm that the pipeline counts a forgotten row without exposing its ID or text. It also checked temporal filtering, reference exclusion, archive visibility, empty scope, top-K, and Markdown diagnostics on stderr. Cargo verified files where LSP diagnostics timed out.

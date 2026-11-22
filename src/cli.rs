@@ -550,6 +550,9 @@ fn execute(action: Action) -> Result<ExitCode> {
                 for warning in found.warnings {
                     eprintln!("nunc: {warning}");
                 }
+                if let Some(pipeline) = &found.pipeline {
+                    pipeline.write(&mut io::stderr().lock())?;
+                }
                 if markdown {
                     for hit in &found.results {
                         search::markdown::write_hit(&mut out, hit)?;

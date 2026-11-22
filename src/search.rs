@@ -17,6 +17,7 @@ use std::path::{Component, Path, PathBuf};
 mod budget;
 mod example;
 pub(crate) mod markdown;
+mod pipeline;
 pub(crate) use budget::{Encoding as BudgetEncoding, Usage as BudgetUsage};
 
 #[derive(Serialize)]
@@ -31,6 +32,8 @@ pub(crate) struct Results {
     pub temporal_context: Option<NeighborReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<example::Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<pipeline::Diagnostics>,
 }
 
 #[derive(Clone, Copy)]
@@ -290,21 +293,44 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         None => (text_vector.context("missing query embedding")?, None, None),
     };
     let query_norm = vectors::norm(&query, MODEL.dimensions)?;
+    let one_per_parent = options.one_per_parent
+        || options.max_tokens.is_some()
+        || options.neighbor_window.is_some()
+        || reference.is_some();
+    let source_counts = options.explain.then(pipeline::SourceCounts::default);
+    let mut counts = options
+        .explain
+        .then(|| pipeline::RankingCounts::new(one_per_parent));
     let mut best: Vec<Ranked> = Vec::with_capacity(options.limit);
     reader.scan(
         filter.kind,
-        |path| filter.includes(path),
+        |path| {
+            let included = filter.includes(path);
+            if let Some(counts) = &source_counts {
+                counts.check(included);
+            }
+            included
+        },
         |row, vector| {
             let parent = row.parent_id()?;
             if reference.as_ref().is_some_and(|source| source.id == parent) {
+                if let Some(counts) = &mut counts {
+                    counts.reference += 1;
+                }
                 return Ok(());
             }
             let entry = uuid::Uuid::parse_str(parent).ok();
             let visibility = if let Some(id) = entry {
                 if guard.ledger.forgotten(id) {
+                    if let Some(counts) = &mut counts {
+                        counts.forgotten += 1;
+                    }
                     return Ok(());
                 }
                 if !options.raw && guard.ledger.hidden(&archives, id) {
+                    if let Some(counts) = &mut counts {
+                        counts.archived += 1;
+                    }
                     return Ok(());
                 }
                 Some(guard.ledger.visibility(&archives, id))
@@ -316,19 +342,22 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
             if !options.time.includes(timestamp)
                 || (options.neighbor_window.is_some() && timestamp.is_none())
             {
+                if let Some(counts) = &mut counts {
+                    counts.temporal += 1;
+                }
                 return Ok(());
             }
             let similarity = cosine(&query, query_norm, vector)?;
+            if let Some(counts) = &mut counts {
+                counts.scored(parent);
+            }
             let boost = recency(timestamp, now, &settings);
             let score = similarity + boost;
             let order = |item: &Ranked| {
                 recent_order(options.sort, item.timestamp, timestamp)
                     .then_with(|| compare(item.hit.score, &item.chunk, score, id))
             };
-            if (options.one_per_parent
-                || options.max_tokens.is_some()
-                || options.neighbor_window.is_some()
-                || reference.is_some())
+            if one_per_parent
                 && let Some(existing) = best.iter().position(|hit| hit.parent == parent)
             {
                 if order(&best[existing]).is_le() {
@@ -400,6 +429,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
     for (offset, item) in best.iter_mut().enumerate() {
         item.hit.rank = offset + 1;
     }
+    let before_budget = best.len();
     let (results, budget) = match options.max_tokens {
         Some(limit) => {
             let (results, usage) = budget::pack(
@@ -419,10 +449,16 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         Some(digest) => Ok(digest),
         None => Snapshot::read(repo).map(|snapshot| snapshot.digest),
     };
-    let warning = match current {
-        Ok(snapshot_digest) if snapshot_digest == digest => None,
-        Ok(_) => Some("Index needs refresh; run nunc reindex or wait for nunc serve".to_owned()),
-        Err(error) => Some(format!("Cannot verify index freshness: {error:#}")),
+    let (freshness, warning) = match current {
+        Ok(snapshot_digest) if snapshot_digest == digest => ("current", None),
+        Ok(_) => (
+            "stale",
+            Some("Index needs refresh; run nunc reindex or wait for nunc serve".to_owned()),
+        ),
+        Err(error) => (
+            "unknown",
+            Some(format!("Cannot verify index freshness: {error:#}")),
+        ),
     };
     let temporal_context = if let Some(window) = options.neighbor_window {
         let anchors: Vec<_> = results
@@ -447,6 +483,15 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
     } else {
         None
     };
+    let pipeline = counts.zip(source_counts).map(|(counts, source)| {
+        counts.finish(
+            source,
+            freshness,
+            options.limit,
+            before_budget,
+            results.len(),
+        )
+    });
     Ok(Results {
         mode_used: "semantic",
         repo_id: repo.id.clone(),
@@ -455,6 +500,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         budget,
         temporal_context,
         reference,
+        pipeline,
     })
 }
 

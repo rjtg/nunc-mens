@@ -1008,6 +1008,113 @@ fn real_search_by_example_reuses_indexed_passages_and_filters_distinct_parents()
 
 #[test]
 #[ignore = "requires the explicitly prepared ONNX model cache"]
+fn real_explain_reports_only_examined_chunks_and_candidate_limits() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let anchor = fixture
+        .log_id("# SQLite mutex\n\nSerialize writes.\n\n## Recovery\n\nInspect the journal.")?;
+    let target = fixture
+        .log_id("# Writer lock\n\nSerialize publication.\n\n## Exit\n\nRelease the mutex.")?;
+    let other = fixture.log_id("Testing database write coordination.")?;
+    let old = fixture.log_id("An older writer note.")?;
+    let archived = fixture.log_id("An archived writer note.")?;
+    let forgotten = fixture.log_id("Discarded fixture body that should stay private.")?;
+    for id in [&anchor, &target, &other, &archived, &forgotten] {
+        fixture.event_time(id, "2026-01-06T00:00:00Z")?;
+    }
+    fixture.event_time(&old, "2026-01-04T00:00:00Z")?;
+    fs::create_dir_all(fixture.repo.join("docs/empty"))?;
+    fs::write(
+        fixture.repo.join("docs/a.md"),
+        "How the mutex protects writes.",
+    )?;
+    fs::write(
+        fixture.repo.join("docs/b.md"),
+        "How tests validate the reader.",
+    )?;
+    fixture.run(&["archive", &archived])?;
+    fixture.run(&["reindex", "--source", "docs"])?;
+    let index = fs::read_dir(&fixture.state)?
+        .next()
+        .context("missing state")??
+        .path()
+        .join("index.sqlite3");
+    let stale = fs::read(&index)?;
+    fixture.run(&["forget", &forgotten, "--yes"])?;
+    // Restore only the disposable pre-forget index in this isolated fixture.
+    fs::write(index, stale)?;
+    let flags = [
+        "search",
+        "--similar-to",
+        &anchor,
+        "--type",
+        "memory",
+        "--from",
+        "2026-01-05T00:00:00Z",
+        "--limit",
+        "1",
+        "--json",
+    ];
+    let plain = fixture.json(&flags)?;
+    assert!(plain.get("pipeline").is_none());
+    let explained = fixture.json(&[&flags[..], &["--explain"]].concat())?;
+    let pipeline = &explained["pipeline"];
+    assert_eq!(pipeline["mode"], "semantic");
+    assert_eq!(pipeline["exact"], true);
+    assert_eq!(pipeline["index_freshness"], "stale");
+    assert_eq!(pipeline["chunks_after_type_scope"], 8);
+    assert_eq!(pipeline["excluded_reference_chunks"], 2);
+    assert_eq!(pipeline["excluded_archived_or_undone_chunks"], 1);
+    assert_eq!(pipeline["excluded_forgotten_chunks"], 1);
+    assert_eq!(pipeline["excluded_temporal_chunks"], 1);
+    assert_eq!(pipeline["scored_chunks"], 3);
+    assert_eq!(pipeline["deduplicated_chunks"], 1);
+    assert_eq!(pipeline["ranking_unit"], "parent");
+    assert_eq!(pipeline["ranked"], 2);
+    assert_eq!(pipeline["beyond_limit"], 1);
+    assert_eq!(pipeline["returned"], 1);
+    let explained = serde_json::to_string(&explained)?;
+    assert!(!explained.contains(&forgotten));
+    assert!(!explained.contains("Discarded fixture body"));
+    let budget = fixture.json(&[&flags[..], &["--explain", "--max-tokens", "1"]].concat())?;
+    assert_eq!(budget["pipeline"]["omitted_by_budget"], 1);
+    assert_eq!(budget["pipeline"]["returned"], 0);
+
+    for (filter, path, passed) in [
+        ("--source-file", "docs/a.md", 1),
+        ("--source", "docs/empty", 0),
+    ] {
+        let report = fixture.json(&[
+            "search",
+            "--similar-to",
+            &anchor,
+            filter,
+            path,
+            "--json",
+            "--explain",
+        ])?;
+        assert_eq!(report["pipeline"]["chunks_after_type_scope"], 2);
+        assert_eq!(report["pipeline"]["chunks_after_source_filter"], passed);
+        assert_eq!(report["pipeline"]["scored_chunks"], passed);
+        assert_eq!(report["pipeline"]["returned"], passed);
+    }
+    let markdown = fixture.run(&[
+        "search",
+        "--similar-to",
+        &anchor,
+        "--source",
+        "docs",
+        "--format",
+        "markdown",
+        "--explain",
+    ])?;
+    assert!(String::from_utf8(markdown.stdout)?.starts_with("## Result 1"));
+    assert!(String::from_utf8(markdown.stderr)?.contains("Exact chunk counts"));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
 fn real_topics_group_distinct_workstreams_using_only_stored_vectors() -> Result<()> {
     let mut fixture = Fixture::new()?;
     fixture.cache = real_model_cache()?;

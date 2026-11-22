@@ -22,6 +22,7 @@ CLI → Repo + Config
 - Temporal filters compare original event instants or local calendar dates before ranking. Timelines and date-only search read durable entries with the same ledger visibility rules. Temporal neighbors run under that shared guard and report time deltas separately from retrieval scores. The index and original Markdown need no migration.
 - Topic views reuse the timeline selection and the current parent hashes to check indexed passage vectors. A complete-link cutoff prevents groups from merging through a chain of weak links. Groups and labels are derived from the selected records on each invocation.
 - Search by example and topic grouping share indexed passage pooling. Search resolves a durable reference and verifies its body hash, then averages up to 64 stored passage vectors. It excludes the reference parent and uses the same ranking, filters and context formats as text search.
+- Search explanation counts are collected during the existing scan, when requested. The source-scope counters observe SQLite rows after type selection. Ranking counters track visibility, dates and scored parents. The report separates top-K truncation from post-ranking budget omissions.
 
 ## SQLite and recovery
 

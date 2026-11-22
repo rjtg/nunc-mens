@@ -667,6 +667,7 @@ fn timeline_respects_commit_time_neighbors_and_nested_visibility() -> Result<()>
     let git = &git_only["results"][0];
     assert_eq!(git["timestamp"], "2024-07-04T02:00:00+00:00");
     assert_eq!(git["entry_kind"], "git-commit");
+    assert_eq!(git["title"], "Historical worker change");
     assert_eq!(git["git"]["sha"].as_str().map(str::len), Some(40));
     let nearby = fixture.log_id("Manual evidence about the same worker.")?;
     fixture.event_time(&nearby, "2024-07-04T01:30:00Z")?;
@@ -801,6 +802,123 @@ fn real_temporal_search_separates_ranked_anchors_from_overlapping_windows() -> R
         before,
         fixture.json(&["timeline", "--around", &earlier, "--raw", "--json"])?
     );
+    Ok(())
+}
+
+#[test]
+fn topic_listing_handles_unindexed_events_and_ledger_visibility() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let first = fixture.log_id("Reason for deferred topic assignment.")?;
+    let second = fixture.log_id("Another recorded decision.")?;
+    fixture.run(&["archive", &second])?;
+    let args = ["topics", "--since", "1h", "--json"];
+    let report = fixture.json(&args)?;
+    assert_eq!(report["topics"], serde_json::json!([]));
+    assert_eq!(report["ungrouped"][0]["id"], first);
+    assert_eq!(report["ungrouped"][0]["reason"], "missing-embedding");
+    assert!(
+        !report["warnings"]
+            .as_array()
+            .context("missing warnings")?
+            .is_empty()
+    );
+    assert_eq!(
+        report,
+        fixture.json(&["timeline", "--since", "1h", "--group-by", "topic", "--json"])?
+    );
+    let raw = fixture.json(&["topics", "--since", "1h", "--raw", "--json"])?;
+    assert_eq!(raw["ungrouped"].as_array().map(Vec::len), Some(2));
+    assert_eq!(raw["ungrouped"][1]["status"], "archived");
+    let ids = fixture.run(&[
+        "topics", "--around", &first, "--window", "1h", "--raw", "--ids",
+    ])?;
+    assert_eq!(ids.stdout, format!("{second}\n").as_bytes());
+    assert!(ids.stderr.is_empty());
+    fixture.run(&["forget", &second, "--yes"])?;
+    assert_eq!(
+        fixture.json(&["topics", "--since", "1h", "--raw", "--json"])?["ungrouped"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn real_topics_group_distinct_workstreams_using_only_stored_vectors() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let note = |body, min| -> Result<String> {
+        let id = fixture.log_id(body)?;
+        fixture.event_time(&id, &format!("2026-02-02T12:{min:02}:00Z"))?;
+        Ok(id)
+    };
+    let sql = [
+        note(
+            "# SQLite writer serialization\n\nUse a mutex to serialize SQLite transactions and lock the writer during database publication.",
+            0,
+        )?,
+        note(
+            "# SQLite write transactions\n\nLock the SQLite writer with a mutex to serialize database transactions and publication.",
+            5,
+        )?,
+    ];
+    let tls = [
+        note(
+            "# Renewal of TLS certificates\n\nRotate expired TLS certificates and refresh the issuer chain after certificate renewal.",
+            10,
+        )?,
+        note(
+            "# TLS certificate renewal\n\nRenew expired TLS certificates and update the certificate issuer chain.",
+            15,
+        )?,
+    ];
+    let anchor = note("Document the retry protocol for a Unix FIFO reader.", 20)?;
+    fixture.run(&["reindex"])?;
+    let stale = note("A new note without vectors yet.", 25)?;
+    // Grouping can still run with the installed model unavailable after indexing.
+    fixture.cache = fixture.state.join("absent-model");
+    let args = [
+        "topics",
+        "--around",
+        &anchor,
+        "--window",
+        "30m",
+        "--threshold",
+        "0.88",
+        "--json",
+    ];
+    let result = fixture.json(&args)?;
+    assert_eq!(result, fixture.json(&args)?);
+    assert_eq!(result["scope"]["anchor"]["id"], anchor);
+    let groups = result["topics"].as_array().context("missing groups")?;
+    assert_eq!(groups.len(), 2, "{result}");
+    for (group, expected) in groups.iter().zip([sql, tls]) {
+        let ids: Vec<_> = group["members"]
+            .as_array()
+            .context("missing members")?
+            .iter()
+            .filter_map(|event| event["id"].as_str())
+            .collect();
+        assert_eq!(ids, expected);
+        assert!(
+            group["members"]
+                .as_array()
+                .context("missing members")?
+                .iter()
+                .any(|event| event["title"] == group["label"]
+                    && event["id"] == group["representative_id"])
+        );
+        assert!(
+            group["minimum_similarity"]
+                .as_f64()
+                .is_some_and(|score| score >= 0.88)
+        );
+    }
+    assert_eq!(result["ungrouped"][0]["id"], stale);
+    assert_eq!(result["ungrouped"][0]["reason"], "missing-embedding");
+    assert!(!fixture.cache.exists());
     Ok(())
 }
 

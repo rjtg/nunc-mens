@@ -153,3 +153,11 @@ Formatting, Clippy, 48 default Rust tests, and the targeted ONNX integration tes
 In an isolated Git repository, the compiled CLI recorded decisions about local calendar bounds and explicit anchor deltas. `nunc search --since 1h --ids` returned both IDs in original event order. `nunc timeline --around "$anchor" --window 1h --json` returned only the other decision and recorded its signed delta as +24 ms. The repository used empty state and model paths, and neither directory was created. The CLI suite also exercised New York's 23-hour and 25-hour days and an imported Git commit dated in 2024.
 
 Formatting, Clippy, and all 51 default Rust tests passed. The targeted real ONNX test passed in 20.19 s. It found two SQLite anchors with a date filter, reported one other activity from both overlapping windows, and preserved the ID-based timeline through a full rebuild. Cargo verified sources where Rust LSP diagnostics timed out.
+
+## Dynamic topic discovery
+
+An isolated repository grouped seven real development records from the context budget, Markdown bundle, and temporal-search work. It indexed them once and then ran `nunc topics --from 2026-11-21 --threshold N --json` with an empty model path. The default 0.90 threshold grouped the two budget allocation decisions at a minimum cosine of 0.923 and left five records ungrouped. At 0.85, the view mixed budgeting with some calendar and Markdown framing notes, and one calendar note was marked ambiguous. At 0.80, all seven landed in one group. These results support the conservative default and show why the groups need to be read as heuristics.
+
+`nunc topics --around "$calendar_id" --window 18h --threshold 0.85 --json` returned six other records, omitted the anchor from membership, and kept the time-window scope separate. The deterministic fixture tests also cover overlapping semantic workstreams, an unavailable model with usable vectors, a newly captured record without vectors, and archive and forget visibility.
+
+Formatting, Clippy, 53 default tests, and the real stored-vector integration test passed. The latter found separate SQLite and TLS groups without loading the model and completed in 7.78 s. Cargo verified files where Rust LSP diagnostics were stale or timed out.

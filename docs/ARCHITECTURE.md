@@ -20,6 +20,7 @@ CLI → Repo + Config
 - The optional search context budget operates after ranking and visibility checks. It loads parents through the same index read guard, reserves matched blocks across distinct sources and uses the remaining budget to expand contiguous excerpts. The existing chunk metadata identifies the match and a separate window identifies the actual returned text. No index migration is required.
 - Markdown bundles use the same ranked candidates and window allocator. The budget counter runs the same section writer used for stdout, so it includes the full attribution and literal excerpt framing.
 - Temporal filters compare original event instants or local calendar dates before ranking. Timelines and date-only search read durable entries with the same ledger visibility rules. Temporal neighbors run under that shared guard and report time deltas separately from retrieval scores. The index and original Markdown need no migration.
+- Topic views reuse the timeline selection and the current parent hashes to check indexed passage vectors. A complete-link cutoff prevents groups from merging through a chain of weak links. Groups and labels are derived from the selected records on each invocation.
 
 ## SQLite and recovery
 

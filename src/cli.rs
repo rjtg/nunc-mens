@@ -8,7 +8,8 @@ use crate::ledger::{self, Guard, Ledger};
 use crate::model::{self, LocalModel, MODEL};
 use crate::repo::Repo;
 use crate::search::{self, ContextMode, Sort};
-use crate::timeline::{self, DatedEvent, Event, EventKind, NeighborReport, TimeFilter};
+use crate::timeline::{self, Anchor, DatedEvent, Event, EventKind, NeighborReport, TimeFilter};
+use crate::topics;
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -130,24 +131,12 @@ enum Action {
     /// List recorded memory and Git events in chronological order.
     Timeline {
         #[command(flatten)]
-        dates: DateArgs,
-        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=1000))]
-        limit: u32,
+        activity: ActivityArgs,
         #[arg(long, value_enum)]
-        entry_kind: Option<EventKind>,
-        #[arg(long)]
-        raw: bool,
-        #[arg(long)]
-        json: bool,
-        #[arg(long, conflicts_with = "json")]
-        ids: bool,
-        #[arg(long, value_enum, conflicts_with = "around")]
         group_by: Option<TimelineGroup>,
-        #[arg(long)]
-        around: Option<Uuid>,
-        #[arg(long, requires = "around")]
-        window: Option<String>,
     },
+    /// Group recorded activity using existing indexed embeddings.
+    Topics(ActivityArgs),
     /// Import Git commits and manage the optional local post-commit hook.
     Git {
         #[command(subcommand)]
@@ -209,6 +198,30 @@ enum RelatedBy {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum TimelineGroup {
     Day,
+    Topic,
+}
+
+#[derive(Args)]
+struct ActivityArgs {
+    #[command(flatten)]
+    dates: DateArgs,
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    limit: u32,
+    #[arg(long, value_enum)]
+    entry_kind: Option<EventKind>,
+    #[arg(long)]
+    raw: bool,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, conflicts_with = "json")]
+    ids: bool,
+    #[arg(long)]
+    around: Option<Uuid>,
+    #[arg(long, requires = "around")]
+    window: Option<String>,
+    /// Minimum cosine for topic grouping.
+    #[arg(long)]
+    threshold: Option<f64>,
 }
 
 #[derive(Args)]
@@ -620,77 +633,8 @@ fn execute(action: Action) -> Result<ExitCode> {
                 }
             }
         }
-        Action::Timeline {
-            dates,
-            limit,
-            entry_kind,
-            raw,
-            json,
-            ids,
-            group_by,
-            around,
-            window,
-        } => {
-            let guard = Guard::acquire(&repo, false)?;
-            let events = timeline::events(
-                &repo,
-                &guard.ledger,
-                raw,
-                dates.filter(Utc::now())?,
-                entry_kind,
-            )?;
-            let mut out = io::stdout().lock();
-            if let Some(id) = around {
-                let archives = guard.ledger.archives()?;
-                ensure!(!guard.ledger.forgotten(id), "entry {id} was forgotten");
-                ensure!(
-                    raw || !guard.ledger.hidden(&archives, id),
-                    "anchor {id} is archived; use --raw to include it"
-                );
-                let anchor = guard.ledger.read_entry(&repo, id)?;
-                let timestamp = anchor.metadata.timestamp;
-                let path = entries::path(&repo, id);
-                let path = path
-                    .strip_prefix(&repo.root)
-                    .context("anchor path is outside the repository")?;
-                let window = timeline::duration(window.as_deref().unwrap_or("2h"))?;
-                let report = timeline::neighbors(
-                    events,
-                    &[(id.to_string(), timestamp.to_utc())],
-                    window,
-                    limit as usize,
-                );
-                if json {
-                    serde_json::to_writer(
-                        &mut out,
-                        &serde_json::json!({
-                            "anchor": {
-                                "id": id, "timestamp": timestamp, "path": path,
-                                "entry_kind": anchor.metadata.kind, "git": anchor.metadata.commit,
-                            },
-                            "temporal_context": report,
-                        }),
-                    )?;
-                    writeln!(out)?;
-                } else if ids {
-                    for neighbor in report.activities {
-                        writeln!(out, "{}", neighbor.event.source.id)?;
-                    }
-                } else {
-                    writeln!(out, "Anchor {id} at {timestamp} {}", path.display())?;
-                    print_neighbors(&report, &mut out)?;
-                }
-            } else {
-                print_events(
-                    events,
-                    limit as usize,
-                    json,
-                    ids,
-                    group_by.is_some(),
-                    &mut out,
-                )?;
-            }
-        }
+        Action::Timeline { activity, group_by } => print_activity(&repo, activity, group_by)?,
+        Action::Topics(activity) => print_activity(&repo, activity, Some(TimelineGroup::Topic))?,
         Action::Git { command } => git_action(&repo, command)?,
         Action::Consolidate { command } => consolidate(&repo, command)?,
         Action::Archive(args) => archive(&repo, args, true)?,
@@ -732,6 +676,141 @@ fn print_context_usage(budget: Option<&search::BudgetUsage>) {
     }
 }
 
+fn print_activity(repo: &Repo, args: ActivityArgs, group: Option<TimelineGroup>) -> Result<()> {
+    let topic_view = matches!(group, Some(TimelineGroup::Topic));
+    let by_day = matches!(group, Some(TimelineGroup::Day));
+    ensure!(
+        !by_day || args.around.is_none(),
+        "--group-by day requires an ordinary timeline"
+    );
+    ensure!(
+        topic_view || args.threshold.is_none(),
+        "--threshold requires a topic view"
+    );
+    let threshold = args.threshold.unwrap_or(topics::DEFAULT_THRESHOLD);
+    topics::validate_threshold(threshold)?;
+    let filter = args.dates.filter(Utc::now())?;
+    let guard = Guard::acquire(repo, false)?;
+    let around = args
+        .around
+        .map(|id| -> Result<_> {
+            let window = timeline::duration(args.window.as_deref().unwrap_or("2h"))?;
+            let anchor = Anchor::load(repo, &guard.ledger, id, args.raw)?;
+            Ok((anchor, window))
+        })
+        .transpose()?;
+    let events = timeline::events(repo, &guard.ledger, args.raw, filter, args.entry_kind)?;
+    let mut out = io::stdout().lock();
+    let limit = args.limit as usize;
+    if let Some((anchor, window)) = around {
+        let anchors = [(anchor.id.to_string(), anchor.timestamp.to_utc())];
+        if topic_view || args.ids {
+            let selected = timeline::nearby(events, &anchors, window, limit);
+            let scope = topics::Scope {
+                anchor,
+                window_seconds: window.num_seconds(),
+            };
+            return print_topics(
+                repo,
+                selected,
+                threshold,
+                Some(scope),
+                args.json,
+                args.ids,
+                &mut out,
+            );
+        }
+        let report = timeline::neighbors(events, &anchors, window, limit);
+        if args.json {
+            serde_json::to_writer(
+                &mut out,
+                &serde_json::json!({
+                    "anchor": anchor, "temporal_context": report,
+                }),
+            )?;
+            writeln!(out)?;
+        } else {
+            print_anchor(&anchor, &mut out)?;
+            print_neighbors(&report, &mut out)?;
+        }
+    } else if topic_view {
+        let selected = timeline::latest(events, limit);
+        print_topics(
+            repo, selected, threshold, None, args.json, args.ids, &mut out,
+        )?;
+    } else {
+        print_events(events, limit, args.json, args.ids, by_day, &mut out)?;
+    }
+    Ok(())
+}
+
+fn print_anchor(anchor: &Anchor, out: &mut impl Write) -> Result<()> {
+    writeln!(
+        out,
+        "Anchor {} at {} {}",
+        anchor.id,
+        anchor.timestamp,
+        anchor.path.display()
+    )?;
+    Ok(())
+}
+
+fn print_topics(
+    repo: &Repo,
+    events: Vec<DatedEvent>,
+    threshold: f64,
+    scope: Option<topics::Scope>,
+    json: bool,
+    ids: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    if ids {
+        for event in events {
+            writeln!(out, "{}", event.event.source.id)?;
+        }
+        return Ok(());
+    }
+    let report = topics::group(repo, events, threshold, scope)?;
+    if json {
+        serde_json::to_writer(&mut *out, &report)?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    for warning in &report.warnings {
+        eprintln!("nunc: {warning}");
+    }
+    if let Some(scope) = &report.scope {
+        print_anchor(&scope.anchor, out)?;
+        writeln!(
+            out,
+            "Other recorded activities within {} seconds (time proximity)",
+            scope.window_seconds
+        )?;
+    }
+    writeln!(
+        out,
+        "Heuristic topics (minimum cosine {:.2})",
+        report.threshold
+    )?;
+    for topic in &report.topics {
+        writeln!(out, "\n{}", topic.label)?;
+        for event in &topic.members {
+            print_event(event, out)?;
+        }
+    }
+    if !report.ungrouped.is_empty() {
+        writeln!(out, "\nUngrouped")?;
+        for entry in &report.ungrouped {
+            print_event(&entry.event, out)?;
+            writeln!(out, "  {}", entry.reason)?;
+        }
+    }
+    if report.topics.is_empty() && report.ungrouped.is_empty() {
+        writeln!(out, "No recorded activities")?;
+    }
+    Ok(())
+}
+
 fn print_events(
     events: Vec<DatedEvent>,
     limit: usize,
@@ -740,10 +819,8 @@ fn print_events(
     group_by_day: bool,
     out: &mut impl Write,
 ) -> Result<()> {
-    let skip = events.len().saturating_sub(limit);
-    let events: Vec<_> = events
+    let events: Vec<_> = timeline::latest(events, limit)
         .into_iter()
-        .skip(skip)
         .map(|event| event.event)
         .collect();
     if json {

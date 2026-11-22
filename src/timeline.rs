@@ -1,11 +1,12 @@
 use crate::documents::{self, Provenance};
-use crate::entries::EntryKind;
+use crate::entries::{self, Commit, EntryKind};
 use crate::ledger::Ledger;
 use crate::repo::Repo;
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{DateTime, Days, Local, NaiveDate, TimeDelta, Utc};
+use chrono::{DateTime, Days, FixedOffset, Local, NaiveDate, TimeDelta, Utc};
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Default)]
@@ -165,6 +166,7 @@ pub(crate) struct Event {
 pub(crate) struct DatedEvent {
     pub at: DateTime<Utc>,
     pub event: Event,
+    pub content_hash: String,
 }
 
 pub(crate) fn events(
@@ -189,14 +191,16 @@ pub(crate) fn events(
             continue;
         }
         source.visibility = Some(ledger.visibility(&archives, id));
-        let title = document
-            .text
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("")
-            .trim_start_matches('#')
-            .trim();
+        let title = if source.git.is_some() {
+            document
+                .text
+                .split_once("\n\n")
+                .and_then(|(_, body)| first_line(body))
+                .filter(|line| *line != "## Changes")
+                .or_else(|| first_line(&document.text).map(markdown_title))
+        } else {
+            first_line(&document.text).map(markdown_title)
+        };
         let excerpt = document
             .text
             .split_whitespace()
@@ -204,10 +208,11 @@ pub(crate) fn events(
             .join(" ");
         events.push(DatedEvent {
             at,
+            content_hash: document.hash,
             event: Event {
                 source,
                 local_day: at.with_timezone(&Local).date_naive(),
-                title: shorten(title, 120),
+                title: shorten(title.unwrap_or(""), 120),
                 excerpt: shorten(&excerpt, 240),
             },
         });
@@ -217,6 +222,55 @@ pub(crate) fn events(
             .then_with(|| a.event.source.id.cmp(&b.event.source.id))
     });
     Ok(events)
+}
+
+fn first_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn markdown_title(line: &str) -> &str {
+    let rest = line.trim_start_matches('#');
+    if rest.starts_with([' ', '\t']) {
+        rest.trim_start()
+    } else {
+        line
+    }
+}
+
+pub(crate) fn latest(mut events: Vec<DatedEvent>, limit: usize) -> Vec<DatedEvent> {
+    events.split_off(events.len().saturating_sub(limit))
+}
+
+#[derive(Serialize)]
+pub(crate) struct Anchor {
+    pub id: Uuid,
+    pub timestamp: DateTime<FixedOffset>,
+    pub path: PathBuf,
+    entry_kind: EntryKind,
+    git: Option<Commit>,
+}
+
+impl Anchor {
+    pub fn load(repo: &Repo, ledger: &Ledger, id: Uuid, raw: bool) -> Result<Self> {
+        ensure!(!ledger.forgotten(id), "entry {id} was forgotten");
+        let archives = ledger.archives()?;
+        ensure!(
+            raw || !ledger.hidden(&archives, id),
+            "anchor {id} is archived; use --raw to include it"
+        );
+        let anchor = ledger.read_entry(repo, id)?;
+        let path = entries::path(repo, id);
+        Ok(Self {
+            id,
+            timestamp: anchor.metadata.timestamp,
+            path: path
+                .strip_prefix(&repo.root)
+                .context("anchor path is outside the repository")?
+                .into(),
+            entry_kind: anchor.metadata.kind,
+            git: anchor.metadata.commit,
+        })
+    }
 }
 
 fn shorten(text: &str, limit: usize) -> String {
@@ -245,12 +299,12 @@ pub(crate) struct Relation {
     pub delta_millis: i64,
 }
 
-pub(crate) fn neighbors(
+pub(crate) fn nearby(
     events: Vec<DatedEvent>,
     anchors: &[(String, DateTime<Utc>)],
     window: TimeDelta,
     limit: usize,
-) -> NeighborReport {
+) -> Vec<DatedEvent> {
     let ids: BTreeSet<_> = anchors.iter().map(|(id, _)| id.as_str()).collect();
     let mut times: Vec<_> = anchors.iter().map(|(_, at)| *at).collect();
     times.sort_unstable();
@@ -276,11 +330,20 @@ pub(crate) fn neighbors(
             .then_with(|| left.event.source.id.cmp(&right.event.source.id))
     });
     nearby.truncate(limit);
+    nearby.into_iter().map(|(_, event)| event).collect()
+}
+
+pub(crate) fn neighbors(
+    events: Vec<DatedEvent>,
+    anchors: &[(String, DateTime<Utc>)],
+    window: TimeDelta,
+    limit: usize,
+) -> NeighborReport {
     NeighborReport {
         window_seconds: window.num_seconds(),
-        activities: nearby
+        activities: nearby(events, anchors, window, limit)
             .into_iter()
-            .map(|(_, event)| {
+            .map(|event| {
                 let anchors = anchors
                     .iter()
                     .filter_map(|(id, at)| {

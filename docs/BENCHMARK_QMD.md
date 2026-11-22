@@ -102,3 +102,40 @@ For [#11](https://github.com/rjtg/nunc-mens/issues/11), the release CLI ran the 
 | 2,000 estimated tokens | 8,221 | 1.000 | 3 of 3 | 2.186 s | 2.167 s |
 
 The 2,000-token run kept all judged evidence and reduced median JSON bytes by 84%. It returned five distinct parents for each query. The 800-token run missed the backlog threshold. Its response used more bytes than four times the estimated budget because the policy excludes the JSON response envelope. All budgeted results stayed within their charged estimate. The 2,000-token sample took about 0.1 s longer at the median. There were only three timings per pass, and startup dominated, so the sample is too small to isolate the allocator's latency. [Raw budget runs](../benchmarks/retrieval/results/sparrow-context-budget.jsonl.gz)
+
+## Follow-up on keyword and hybrid retrieval
+
+Issue [#9](https://github.com/rjtg/nunc-mens/issues/9) compares the three nunc retrieval modes on the same 17 labeled Sparrow queries, with a fourth configuration that has no model cache. The regular semantic, keyword, and hybrid cases share one structural, tokenizer-based index. The offline keyword case uses byte-budget structural chunks and its own index. The supplemental flag uses the same separately versioned query as the original QMD run.
+
+The runner uses a fresh CLI process for each query following index construction. This follow-up measures the local feature and uses the earlier QMD run as reference. The release build, exact binary hash, per-query results, and platform are recorded in the raw benchmark data. [Reproduction commands](../benchmarks/retrieval/README.md)
+
+The first pass exposed a gap in keyword provenance lookup. The prompt was `design/patch-review.md`, relative to QMD's collection root. nunc indexed the file as `docs/design/patch-review.md`. After adding component-aligned source path suffix matching, the same prompt resolved to that canonical path. The final comparison uses the original judgments and query text.
+
+The release build from `b5b4be0` ran 68 judged queries and four supplemental flag queries. The standalone repeats from the first pass used the prototype with the path gap. The final results below use one corrected pass on Linux x86-64 with the same Intel i7-4710MQ CPU, Rust 1.98.1, and pinned E5 model as the original comparison. [Main measurements](../benchmarks/retrieval/results/sparrow-nunc-modes.jsonl.gz) · [Flag measurements](../benchmarks/retrieval/results/sparrow-nunc-modes-technical.jsonl.gz)
+
+| Mode | Recall@1 | Recall@5 | Recall@10 | MRR@10 | nDCG@10 | Evidence@5 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Semantic | 0.618 | 1.000 | 1.000 | 0.882 | 0.910 | 1.000 |
+| Keyword | 0.735 | 0.941 | 0.941 | 0.917 | 0.853 | 0.938 |
+| Hybrid | 0.765 | 0.941 | 1.000 | 0.971 | 0.918 | 0.938 |
+| Keyword, model-free index | 0.735 | 0.941 | 0.941 | 0.917 | 0.853 | 0.938 |
+
+- The default returned the same ordered document labels for all 17 queries as the earlier comparison. Keyword and hybrid ranked all five exact targets first. Semantic ranked three first and placed the path and full SHA second.
+- All four configurations ranked the right runbook first for `--from-checkpoint`. Keyword and hybrid supplied the reset command in their first hit, at lines 37–48. Semantic's first hit pointed to lines 5–8 and the first five results omitted the command.
+- Hybrid improved overall MRR. Semantic retained perfect Recall@5 and Evidence@5. Hybrid lost part of the judged auth incident evidence and returned several chunks of the same runbook before a supporting record on a long-context query. Keep semantic as the default on the current evidence.
+
+| Mode | Process p50 s | Process p95 s | Max RSS MiB |
+| --- | ---: | ---: | ---: |
+| Semantic | 3.978 | 5.721 | 1448.5 |
+| Keyword | 0.014 | 0.058 | 25.1 |
+| Hybrid | 3.637 | 5.737 | 1450.4 |
+| Keyword, model-free index | 0.019 | 0.115 | 25.1 |
+
+The timings include CLI startup and use a fresh process per query with the system page cache undisturbed. This small serial run cannot resolve a steady-state latency difference between semantic and hybrid. Keyword queries skip model initialization.
+
+| Index | Full rebuild s | One-file refresh s | SQLite size KiB |
+| --- | ---: | ---: | ---: |
+| Shared vectors and keyword terms | 6.388 | 5.338 | 220 |
+| Offline keyword | 0.030 | 0.139 | 132 |
+
+Both layouts stored 32 chunks. The shared layout embedded 31 unique passages on build and one on refresh. The keyword-only layout embedded zero. SQLite's `dbstat` attributed 32 KiB in each final file to FTS5 tables and the readiness table (`name GLOB 'chunk_terms*' OR name = 'retrieval_state'`). The original vector-only comparison recorded a 180 KiB full database on the same corpus. File sizes include page allocation and unused space. The timings and sizes exclude model artifacts.

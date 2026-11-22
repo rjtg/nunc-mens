@@ -975,6 +975,85 @@ fn context_budget_rejects_zero_and_ids_mode_before_loading_the_model() -> Result
 }
 
 #[test]
+fn markdown_bundle_rejects_conflicting_output_flags() -> Result<()> {
+    let fixture = Fixture::new()?;
+    for option in ["--json", "--ids"] {
+        let output = fixture
+            .nunc(&["search", "lease", "--format", "markdown", option])
+            .output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the explicitly prepared ONNX model cache"]
+fn real_markdown_bundle_preserves_fences_budgets_and_visibility() -> Result<()> {
+    use pulldown_cmark::{Event, Parser, Tag};
+    let mut fixture = Fixture::new()?;
+    fixture.cache = real_model_cache()?;
+    let body = "# Café lease\n\nA writer lease protects publication.\n\n## Recovery\n\n```rust\nreopenLease();\n```\n\n~~~text\nOnly the current lease holder may write.\n~~~\n";
+    let visible = fixture.log_id(body)?;
+    let archived = fixture.log_id("An archived decision on writer lease recovery.")?;
+    let forgotten = fixture.log_id("A forgotten note about writer lease recovery.")?;
+    fixture.run(&["archive", &archived])?;
+    fixture.run(&["reindex"])?;
+    fixture.run(&["forget", &forgotten, "--yes"])?;
+    let args = [
+        "search",
+        "writer lease publication",
+        "--format",
+        "markdown",
+        "--context",
+        "parent",
+        "--limit",
+        "10",
+    ];
+    let stale = fixture.run(&args)?;
+    assert!(String::from_utf8(stale.stderr)?.contains("Index needs refresh"));
+    fixture.run(&["reindex"])?;
+    let result = fixture.run(&args)?;
+    assert!(result.stderr.is_empty());
+    assert_eq!(result.stdout, stale.stdout);
+    let stdout = String::from_utf8(result.stdout)?;
+    assert!(stdout.starts_with("## Result 1\n"));
+    assert!(stdout.contains(body));
+    assert_eq!(stdout.matches(&visible).count(), 2); // Entry filename and parent ID.
+    assert!(!stdout.contains(&archived));
+    assert!(!stdout.contains(&forgotten));
+    let events: Vec<_> = Parser::new(&stdout).collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::Start(Tag::Heading { .. })))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::Start(Tag::CodeBlock(_))))
+            .count(),
+        1
+    );
+    let raw = fixture.run(&[&args[..], &["--raw", "--explain", "--max-tokens", "500"]].concat())?;
+    assert!(String::from_utf8(raw.stderr)?.contains("context budget used"));
+    assert!(raw.stdout.len() <= 500 * 4);
+    let raw = String::from_utf8(raw.stdout)?;
+    assert!(raw.contains(&visible));
+    assert!(raw.contains(&archived));
+    assert!(raw.contains("Status ` archived `"));
+    assert!(!raw.contains(&forgotten));
+    assert!(raw.contains("Returned lines"));
+    assert!(raw.contains("Model revision"));
+    let tiny = fixture.run(&[&args[..], &["--max-tokens", "1"]].concat())?;
+    assert!(tiny.stdout.is_empty());
+    assert!(String::from_utf8(tiny.stderr)?.contains("1 omitted"));
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires the explicitly prepared ONNX model cache"]
 fn real_search_budget_keeps_distinct_attributed_context() -> Result<()> {
     let mut fixture = Fixture::new()?;

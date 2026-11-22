@@ -14,6 +14,8 @@ use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
 mod budget;
+pub(crate) mod markdown;
+pub(crate) use budget::{Encoding as BudgetEncoding, Usage as BudgetUsage};
 
 #[derive(Serialize)]
 pub(crate) struct Results {
@@ -84,6 +86,7 @@ pub(crate) struct Options<'a> {
     pub raw: bool,
     pub one_per_parent: bool,
     pub max_tokens: Option<usize>,
+    pub budget_encoding: BudgetEncoding,
 }
 
 #[derive(Serialize)]
@@ -339,8 +342,13 @@ pub(crate) fn search(repo: &Repo, query: &str, options: Options<'_>) -> Result<R
     }
     let (results, budget) = match options.max_tokens {
         Some(limit) => {
-            let (results, usage) =
-                budget::pack(best, limit, options.context, |parent| reader.parent(parent))?;
+            let (results, usage) = budget::pack(
+                best,
+                limit,
+                options.context,
+                options.budget_encoding,
+                |parent| reader.parent(parent),
+            )?;
             (results, Some(usage))
         }
         None => (best.into_iter().map(|item| item.hit).collect(), None),
@@ -445,6 +453,7 @@ mod tests {
             raw: false,
             one_per_parent: false,
             max_tokens: None,
+            budget_encoding: BudgetEncoding::Json,
         };
         let filter = Filter::new(&repo, &roots, &options)?;
         assert_eq!(filter.kind, None);

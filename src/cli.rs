@@ -93,6 +93,9 @@ enum Action {
         /// Print ranked parent IDs, one per line.
         #[arg(long, conflicts_with_all = ["json", "explain"])]
         ids: bool,
+        /// Render one source-attributed Markdown document.
+        #[arg(long, value_enum, conflicts_with_all = ["json", "ids"])]
+        format: Option<SearchFormat>,
         /// Cap estimated context tokens, including per-result provenance.
         #[arg(long, conflicts_with = "ids", value_parser = clap::value_parser!(u32).range(1..))]
         max_tokens: Option<u32>,
@@ -160,6 +163,11 @@ enum Action {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SearchFormat {
+    Markdown,
 }
 
 #[derive(Args)]
@@ -383,6 +391,7 @@ fn execute(action: Action) -> Result<ExitCode> {
             limit,
             json,
             ids,
+            format,
             max_tokens,
             kind,
             source,
@@ -393,6 +402,7 @@ fn execute(action: Action) -> Result<ExitCode> {
             explain,
             raw,
         } => {
+            let markdown = matches!(format, Some(SearchFormat::Markdown));
             let found = search::search(
                 &repo,
                 &query.join(" "),
@@ -406,8 +416,13 @@ fn execute(action: Action) -> Result<ExitCode> {
                     recency_boost,
                     explain,
                     raw,
-                    one_per_parent: ids,
+                    one_per_parent: ids || markdown,
                     max_tokens: max_tokens.map(|value| value as usize),
+                    budget_encoding: if markdown {
+                        search::BudgetEncoding::Markdown
+                    } else {
+                        search::BudgetEncoding::Json
+                    },
                 },
             )?;
             let mut out = io::stdout().lock();
@@ -417,6 +432,13 @@ fn execute(action: Action) -> Result<ExitCode> {
             } else {
                 for warning in found.warnings {
                     eprintln!("nunc: {warning}");
+                }
+                if markdown {
+                    for hit in &found.results {
+                        search::markdown::write_hit(&mut out, hit)?;
+                    }
+                    print_context_usage(found.budget.as_ref());
+                    return Ok(ExitCode::SUCCESS);
                 }
                 if ids {
                     for hit in found.results {
@@ -496,15 +518,7 @@ fn execute(action: Action) -> Result<ExitCode> {
                         }
                     }
                 }
-                if let Some(budget) = found.budget {
-                    eprintln!(
-                        "nunc: context budget used {}/{} estimated tokens ({} shortened, {} omitted)",
-                        budget.estimated_tokens,
-                        budget.max_tokens,
-                        budget.truncated_results,
-                        budget.omitted_candidates,
-                    );
-                }
+                print_context_usage(found.budget.as_ref());
             }
         }
         Action::Git { command } => git_action(&repo, command)?,
@@ -534,6 +548,18 @@ fn execute(action: Action) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_context_usage(budget: Option<&search::BudgetUsage>) {
+    if let Some(budget) = budget {
+        eprintln!(
+            "nunc: context budget used {}/{} estimated tokens ({} shortened, {} omitted)",
+            budget.estimated_tokens,
+            budget.max_tokens,
+            budget.truncated_results,
+            budget.omitted_candidates,
+        );
+    }
 }
 
 fn print_receipt(receipt: entries::Receipt) {
@@ -678,6 +704,7 @@ fn consolidate(repo: &Repo, command: Consolidation) -> Result<()> {
                     raw: false,
                     one_per_parent: true,
                     max_tokens: None,
+                    budget_encoding: search::BudgetEncoding::Json,
                 },
             )?;
             if json {

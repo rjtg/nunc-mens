@@ -16,7 +16,7 @@
 | `nunc unarchive ID... [--dry-run] [--json]` | Restores manually archived memories. |
 | `nunc forget ID... [--dry-run\|--yes] [--json]` | Deletes only the specified entries after warning about dependencies. |
 | `nunc reindex [--full] [--source PATH]...` | Reconciles changes or publishes a separately staged full rebuild. |
-| `nunc search QUERY... [--limit N] [--max-tokens N] [--json\|--ids] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Ranks compatible indexed vectors by cosine similarity and optionally caps context. |
+| `nunc search QUERY... [--limit N] [--max-tokens N] [--json\|--ids\|--format markdown] [--type memory\|source] [--source PATH]... [--source-file FILE]...` | Ranks compatible indexed vectors by cosine similarity and optionally caps context. |
 | `nunc models download` | Explicitly downloads and validates the pinned model and tokenizer. |
 | `nunc status` | Shows repository, server, sources, cache, and index paths. |
 | `nunc doctor` | Also compares index freshness against the current repository snapshot. |
@@ -83,11 +83,21 @@ nunc search "FIFO concurrency" --context parent --max-tokens 2000 --json
 
 Use a positive `--max-tokens` with chunk, section, or parent context. Search considers the highest-scoring chunk per parent, up to `--limit`. It reserves a matched excerpt for ranked parents before expanding nearby context with the remaining budget. A result that cannot fit can leave a gap in the original ranks. Type and source filters, archive visibility, and `--sort` still apply. `--ids` conflicts with `--max-tokens`.
 
-The estimate is the sum of `ceil((UTF-8 bytes in the compact JSON result + 1) / 4)` for each returned result. This includes text, provenance, window fields, and any explanation. The extra byte allows for a result separator. It excludes the response envelope, warnings, and console presentation. Both output formats select the same context using this estimate, which will differ from the count reported by an LLM tokenizer.
+JSON and ordinary console output use the sum of `ceil((UTF-8 bytes in the compact JSON result + 1) / 4)` for each returned result. This includes text, provenance, window fields, and any explanation. The extra byte allows for a result separator. It excludes the response envelope, warnings, and console presentation. The estimate will differ from the count reported by an LLM tokenizer.
 
 A budgeted JSON response adds a `budget` object with `max_tokens`, `estimated_tokens`, `truncated_results`, `omitted_candidates`, and the estimate identifier. The omitted count refers to candidates considered after ranking and the unique-parent limit. Each result adds a `context_window` with the returned text's original byte and line ranges and a `truncated` flag. `matched_chunk` continues to describe the original match. With `--explain`, the matched text is the intersection of the original chunk and returned window. Text mode labels shortened results and reports aggregate budget usage on stderr.
 
 Markdown windows use complete top-level blocks and may extend a partial chunk to include its enclosing block. The budget still applies. A Markdown block that cannot fit is skipped whole, including oversized fenced code or very long paragraphs. Other sources use complete lines. When provenance and a matched excerpt cannot fit for any candidate, search succeeds with empty results and reports the omission count.
+
+### Markdown context bundle
+
+```sh
+nunc search "SQLite concurrency" --format markdown --context section --max-tokens 2000 > context.md
+```
+
+The bundle uses one section per ranked parent and accepts the same context, visibility, and source filters as ordinary search. A section gives the path, parent and matched chunk IDs, matched lines, heading path, and available timestamp or Git origin. Retrieved text is a literal fenced excerpt. Its outer fence is sized to preserve any fences and headings from the original. Budgeted sections include returned line ranges and label shortened context.
+
+This format estimates usage as the sum of `ceil(UTF-8 bytes in the rendered section / 4)`. It charges every byte on stdout, including result headings, metadata, delimiters, separators, and requested explanation. Budget totals and warnings go to stderr. If no result fits, stdout is empty. `--format markdown` conflicts with `--json` and `--ids`.
 
 ### Configuration
 

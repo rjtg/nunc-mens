@@ -19,6 +19,7 @@ nunc models download
 nunc reindex
 nunc search "Why did authentication fail in staging?"
 nunc search "authentication" --context parent --max-tokens 2000 --json
+nunc search "authentication" --format markdown --max-tokens 2000 > context.md
 nunc search --json --type source --source docs "time synchronization"
 ```
 

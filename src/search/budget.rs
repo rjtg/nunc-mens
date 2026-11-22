@@ -6,6 +6,33 @@ use std::io::{self, Write};
 use std::ops::Range;
 use std::path::Path;
 
+#[derive(Clone, Copy)]
+pub(crate) enum Encoding {
+    Json,
+    Markdown,
+}
+
+impl Encoding {
+    fn cost(self, hit: &Match) -> Result<usize> {
+        let mut counter = ByteCount(0);
+        match self {
+            Self::Json => {
+                counter.0 += 1;
+                serde_json::to_writer(&mut counter, hit)?;
+            }
+            Self::Markdown => super::markdown::write_hit(&mut counter, hit)?,
+        }
+        Ok(counter.0.div_ceil(4))
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Json => "ceil((json-utf8-bytes+1)/4)-per-result",
+            Self::Markdown => "ceil(markdown-utf8-bytes/4)-per-result",
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct Usage {
     pub max_tokens: usize,
@@ -28,6 +55,7 @@ pub(super) fn pack(
     mut ranked: Vec<Ranked>,
     max_tokens: usize,
     mode: ContextMode,
+    encoding: Encoding,
     read_parent: impl Fn(&str) -> Result<String>,
 ) -> Result<(Vec<Match>, Usage)> {
     let mut remaining = max_tokens;
@@ -40,7 +68,7 @@ pub(super) fn pack(
         } else {
             remaining
         };
-        if let Some(cost) = fit(hit, mode, share, false, &read_parent)? {
+        if let Some(cost) = fit(hit, mode, encoding, share, false, &read_parent)? {
             costs[index] = cost;
             remaining -= cost;
         }
@@ -50,7 +78,7 @@ pub(super) fn pack(
     // If the initial shares were too small, try to admit a single match first.
     if costs.iter().all(|cost| *cost == 0) {
         for (hit, spent) in ranked.iter_mut().zip(&mut costs) {
-            if let Some(cost) = fit(hit, mode, remaining, false, &read_parent)? {
+            if let Some(cost) = fit(hit, mode, encoding, remaining, false, &read_parent)? {
                 *spent = cost;
                 remaining -= cost;
                 break;
@@ -66,7 +94,14 @@ pub(super) fn pack(
             {
                 continue;
             }
-            if let Some(cost) = fit(hit, mode, remaining + *spent, !missing, &read_parent)? {
+            if let Some(cost) = fit(
+                hit,
+                mode,
+                encoding,
+                remaining + *spent,
+                !missing,
+                &read_parent,
+            )? {
                 remaining = remaining + *spent - cost;
                 *spent = cost;
             }
@@ -85,7 +120,7 @@ pub(super) fn pack(
             .iter()
             .filter(|hit| hit.context_window.is_some_and(|window| window.truncated))
             .count(),
-        estimate: "ceil((json-utf8-bytes+1)/4)-per-result",
+        estimate: encoding.name(),
     };
     Ok((results, usage))
 }
@@ -93,6 +128,7 @@ pub(super) fn pack(
 fn fit(
     candidate: &mut Ranked,
     mode: ContextMode,
+    encoding: Encoding,
     allowance: usize,
     expand: bool,
     read_parent: &impl Fn(&str) -> Result<String>,
@@ -100,17 +136,13 @@ fn fit(
     if allowance == 0 {
         return Ok(None);
     }
-    let mut metadata = ByteCount(1);
     // The initial candidate is text-free. If provenance alone is oversized,
     // avoid loading the source body or repeatedly attempting to truncate it.
-    if candidate.hit.context_window.is_none() {
-        serde_json::to_writer(&mut metadata, &candidate.hit)?;
-        if metadata.0.div_ceil(4) >= allowance {
-            return Ok(None);
-        }
+    if candidate.hit.context_window.is_none() && encoding.cost(&candidate.hit)? >= allowance {
+        return Ok(None);
     }
     let body = read_parent(&candidate.parent)?;
-    let window = Window::new(candidate, &body, mode)?;
+    let window = Window::new(candidate, &body, mode, encoding)?;
     let old = candidate.hit.context_window;
     let chosen = window.choose(&mut candidate.hit, allowance, expand)?;
     if let Some((span, cost)) = chosen
@@ -132,6 +164,7 @@ fn fit(
 }
 
 struct Window<'a> {
+    encoding: Encoding,
     body: &'a str,
     matched: Range<usize>,
     requested: Range<usize>,
@@ -140,7 +173,12 @@ struct Window<'a> {
 }
 
 impl<'a> Window<'a> {
-    fn new(candidate: &Ranked, body: &'a str, mode: ContextMode) -> Result<Self> {
+    fn new(
+        candidate: &Ranked,
+        body: &'a str,
+        mode: ContextMode,
+        encoding: Encoding,
+    ) -> Result<Self> {
         let attribution = candidate
             .hit
             .source
@@ -173,6 +211,7 @@ impl<'a> Window<'a> {
             .chain(body.match_indices('\n').map(|(offset, _)| offset + 1))
             .collect();
         Ok(Self {
+            encoding,
             body,
             matched,
             requested,
@@ -257,9 +296,7 @@ impl<'a> Window<'a> {
             return Ok(None);
         }
         self.render(hit, span);
-        let mut bytes = ByteCount(1);
-        serde_json::to_writer(&mut bytes, hit)?;
-        let used = bytes.0.div_ceil(4);
+        let used = self.encoding.cost(hit)?;
         Ok((used <= allowance).then_some(used))
     }
 
@@ -298,6 +335,15 @@ impl Write for ByteCount {
 mod tests {
     use super::*;
     use crate::documents::{Kind, MatchedChunk, Provenance};
+
+    fn pack(
+        ranked: Vec<Ranked>,
+        max_tokens: usize,
+        mode: ContextMode,
+        read_parent: impl Fn(&str) -> Result<String>,
+    ) -> Result<(Vec<Match>, Usage)> {
+        super::pack(ranked, max_tokens, mode, Encoding::Json, read_parent)
+    }
 
     fn candidate(rank: usize, parent: &str, body: &str, evidence: &str) -> Ranked {
         let start = body.find(evidence).expect("fixture evidence");
@@ -438,6 +484,30 @@ mod tests {
         assert!(hits[0].text.contains(command));
         assert_eq!(hits[0].text, body);
         assert!(usage.estimated_tokens <= 1_100);
+        Ok(())
+    }
+
+    #[test]
+    fn markdown_budget_charges_every_byte_of_the_bundle() -> Result<()> {
+        let body = "# Café\n\n```rust\nlet value = 1;\n```\n";
+        let ranked = vec![
+            candidate(1, "first", body, "let value"),
+            candidate(2, "second", body, "let value"),
+        ];
+        let (hits, usage) =
+            super::pack(ranked, 180, ContextMode::Parent, Encoding::Markdown, |_| {
+                Ok(body.into())
+            })?;
+        assert_eq!(hits.len(), 2);
+        let mut rendered = Vec::new();
+        let mut estimated = 0;
+        for hit in &hits {
+            let before = rendered.len();
+            super::super::markdown::write_hit(&mut rendered, hit)?;
+            estimated += (rendered.len() - before).div_ceil(4);
+        }
+        assert_eq!(usage.estimated_tokens, estimated);
+        assert!(rendered.len() <= 180 * 4);
         Ok(())
     }
 }

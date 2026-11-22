@@ -58,6 +58,8 @@ The existing foreground server publishes `.nunc/search-runtime/search.sock` when
 
 The client and server share search options and rendering for text, JSON, Markdown, IDs, and timelines. The socket keeps at most eight waiting clients and one active search. Busy requests return a retryable error. The client allows up to 60 seconds for admission and results. Request input and response output each have a two-second I/O deadline. Use `--limit` or `--max-tokens` when a result exceeds the 8 MiB socket response limit.
 
+The server can reuse a semantic query vector when the exact query text repeats in the same model session. Ranking, source selection and visibility are evaluated for every request. The cache stays in process memory and is discarded on model reload or server exit.
+
 Closing the connection cancels queued work and stops active work at search checkpoints. An ONNX operation, SQLite operation, or snapshot read in progress may finish before the next checkpoint. The endpoint shares the [read-after-write contract](#read-after-write-across-processes). Use a successful reindex when a caller needs the next query to consider a durable write.
 
 ### Keyword search

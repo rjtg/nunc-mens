@@ -466,7 +466,7 @@ pub(crate) fn search_with(
                     profile::measure(Stage::EmbedQuery, || model.query(text))
                 };
                 Some(if let Some(shared) = shared_model {
-                    shared.with(repo, embed)?
+                    shared.query(repo, text)?
                 } else {
                     embed(&mut profile::measure(Stage::ModelLoad, || {
                         LocalModel::load(repo)

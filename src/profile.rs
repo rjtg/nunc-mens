@@ -69,6 +69,7 @@ mod enabled {
 
     thread_local! {
         static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        static CACHE: Cell<Option<(bool, bool)>> = const { Cell::new(None) };
         static SAMPLES: RefCell<[Sample; Stage::ALL.len()]> = const {
             RefCell::new([Sample { nanoseconds: 0, calls: 0 }; Stage::ALL.len()])
         };
@@ -82,6 +83,12 @@ mod enabled {
         }
         ACTIVE.set(true);
         Some(Session(Instant::now()))
+    }
+
+    pub(crate) fn query_cache(hit: bool, cacheable: bool) {
+        if ACTIVE.get() {
+            CACHE.set(Some((hit, cacheable)));
+        }
     }
 
     impl Drop for Session {
@@ -101,8 +108,15 @@ mod enabled {
                 report.insert("cli", total);
                 report
             });
+            let mut err = io::stderr().lock();
             if let Ok(json) = serde_json::to_string(&report) {
-                let _ = writeln!(io::stderr().lock(), "nunc-profile {json}");
+                let _ = writeln!(err, "nunc-profile {json}");
+            }
+            if let Some((hit, cacheable)) = CACHE.take() {
+                let _ = writeln!(
+                    err,
+                    "nunc-cache {{\"hit\":{hit},\"cacheable\":{cacheable}}}"
+                );
             }
         }
     }
@@ -126,7 +140,7 @@ mod enabled {
 }
 
 #[cfg(feature = "search-profile")]
-pub(crate) use enabled::{begin, span};
+pub(crate) use enabled::{begin, query_cache, span};
 
 #[cfg(not(feature = "search-profile"))]
 pub(crate) struct Disabled;
@@ -142,6 +156,9 @@ pub(crate) fn begin() -> Disabled {
 pub(crate) fn span(_: Stage) -> Disabled {
     Disabled
 }
+
+#[cfg(not(feature = "search-profile"))]
+pub(crate) fn query_cache(_: bool, _: bool) {}
 
 pub(crate) fn measure<T>(stage: Stage, f: impl FnOnce() -> T) -> T {
     let _span = span(stage);

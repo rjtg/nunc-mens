@@ -50,3 +50,5 @@ python3 -B -m benchmarks.performance.compare_socket \
 ```
 
 The output includes separate client wall times and server stages. The first socket request is marked cold. Socket publication happens before a model load necessarily finishes, so the first query includes any wait for model initialization. Later samples each start a fresh CLI client while the server stays alive. Use a fixture path short enough for the platform's Unix socket pathname limit.
+
+Add `--measure-cache` for a vector-mode run that starts with a distinct primer, then measures one warm miss and repeated exact hits. The comparator validates cache events against the embedding timing stage and compares the measured query's JSON against standalone output. Server profiling emits one `nunc-cache` record per embedding lookup with boolean `hit` and `cacheable` fields. The record contains no query text.

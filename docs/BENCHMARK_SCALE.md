@@ -46,3 +46,9 @@ A profiling-enabled release binary ran the unfiltered query “Verifying downloa
 Socket publication took 21 ms. The first request waited for the watcher to initialize the shared model. Standalone model load took 1.803 s at the median. The warm server traces have no model-load stage, and they still record query embedding and freshness checks. The same process retained its SQLite connection across requests. These timings cover one query at one size, with warmed operating-system caches. The client peak RSS in the socket records excludes the resident server.
 
 The profiling binary SHA-256 was `cd973ad777bbb1a307491ffade103e1022ef75f626bec7ea24f03cd855635e4d`.
+
+### Query-vector cache probe
+
+The 1,000-chunk semantic comparator used `--measure-cache` and sent a distinct primer before the first measured query. The primer and the warm miss each embedded a query. The next five exact repetitions returned the same standalone JSON and skipped embedding. The warm miss spent 8.312 ms in inference and 38.803 ms in the server. Hit median server time was 30.816 ms. Client wall time was 69.150 ms for the single warm miss and 49.901 ms at the hit median. One miss is enough to show that inference ran and gives a limited latency comparison. This workload exercises a query-vector cache. The server still performs index eligibility, visibility and snapshot validation on every request. [Raw cache comparison](../benchmarks/performance/results/cache-1000-linux-x86_64.jsonl)
+
+The profiling binary SHA-256 was `18bde79beb4388a1a9a77f013e2a6af90d0f58d6c5ba02dcf142ced1b1cfb1c4`.

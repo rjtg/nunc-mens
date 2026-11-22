@@ -7,6 +7,7 @@ use fastembed::{
     InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -65,7 +66,49 @@ const ARTIFACTS: &[Artifact] = &[WEIGHTS, TOKENIZER, CONFIG, SPECIAL, TOK_CONFIG
 pub(crate) struct LocalModel(TextEmbedding, tokenizers::Tokenizer);
 
 #[derive(Default)]
-pub(crate) struct SharedModel(Mutex<Option<(ModelFiles, LocalModel)>>);
+pub(crate) struct SharedModel(Mutex<Option<LoadedModel>>);
+
+struct LoadedModel {
+    files: ModelFiles,
+    model: LocalModel,
+    queries: QueryCache,
+}
+
+const MAX_CACHED_QUERIES: usize = 64;
+const MAX_CACHED_QUERY_BYTES: usize = 4096;
+
+#[derive(Default)]
+struct QueryCache(VecDeque<(String, Vec<f32>)>);
+
+impl QueryCache {
+    fn embed(
+        &mut self,
+        text: &str,
+        compute: impl FnOnce() -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
+        let cacheable = text.len() <= MAX_CACHED_QUERY_BYTES;
+        if let Some(entry) = self
+            .0
+            .iter()
+            .position(|(key, _)| key == text)
+            .and_then(|index| self.0.remove(index))
+        {
+            let vector = entry.1.clone();
+            self.0.push_back(entry);
+            profile::query_cache(true, true);
+            return Ok(vector);
+        }
+        profile::query_cache(false, cacheable);
+        let vector = compute()?;
+        if cacheable {
+            if self.0.len() == MAX_CACHED_QUERIES {
+                self.0.pop_front();
+            }
+            self.0.push_back((text.to_owned(), vector.clone()));
+        }
+        Ok(vector)
+    }
+}
 
 #[derive(PartialEq, Eq)]
 struct ModelFiles {
@@ -87,6 +130,22 @@ impl SharedModel {
         repo: &Repo,
         use_model: impl FnOnce(&mut LocalModel) -> Result<T>,
     ) -> Result<T> {
+        self.with_loaded(repo, |loaded| use_model(&mut loaded.model))
+    }
+
+    pub(crate) fn query(&self, repo: &Repo, text: &str) -> Result<Vec<f32>> {
+        self.with_loaded(repo, |loaded| {
+            loaded.queries.embed(text, || {
+                profile::measure(Stage::EmbedQuery, || loaded.model.query(text))
+            })
+        })
+    }
+
+    fn with_loaded<T>(
+        &self,
+        repo: &Repo,
+        use_model: impl FnOnce(&mut LoadedModel) -> Result<T>,
+    ) -> Result<T> {
         let mut cached = self
             .0
             .lock()
@@ -100,13 +159,16 @@ impl SharedModel {
             }
         };
         let files = ModelFiles { dir, artifacts };
-        if cached.as_ref().is_none_or(|(known, _)| known != &files) {
+        if cached.as_ref().is_none_or(|loaded| loaded.files != files) {
             *cached = None;
             let model = profile::measure(Stage::ModelLoad, || LocalModel::from_dir(&files.dir))?;
-            *cached = Some((files, model));
+            *cached = Some(LoadedModel {
+                files,
+                model,
+                queries: QueryCache::default(),
+            });
         }
-        let (_, model) = cached.as_mut().context("no cached ONNX session")?;
-        use_model(model)
+        use_model(cached.as_mut().context("no cached ONNX session")?)
     }
 }
 
@@ -304,6 +366,64 @@ impl Artifact {
             );
         }
         file.sync_all()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn replacing_an_artifact_changes_the_resident_cache_identity() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for artifact in ARTIFACTS {
+            File::create(dir.path().join(artifact.name))?.set_len(artifact.size as u64)?;
+        }
+        let before = ready(dir.path())?;
+        let staged = dir.path().join("replacement");
+        File::create(&staged)?.set_len(TOKENIZER.size as u64)?;
+        fs::rename(staged, dir.path().join(TOKENIZER.name))?;
+        assert!(ready(dir.path())? != before);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_cache_keys_promote_entries_and_evict_the_least_recently_used() -> Result<()> {
+        let mut cache = QueryCache::default();
+        for index in 0..MAX_CACHED_QUERIES {
+            cache.embed(&format!("query {index}"), || Ok(vec![index as f32]))?;
+        }
+        assert_eq!(
+            cache.embed("query 0", || anyhow::bail!("already cached"))?,
+            [0.0]
+        );
+        cache.embed("query 0 ", || Ok(vec![2.0]))?;
+        assert_eq!(cache.0.len(), MAX_CACHED_QUERIES);
+        assert_eq!(
+            cache.embed("query 0", || anyhow::bail!("recently used"))?,
+            [0.0]
+        );
+        assert_eq!(cache.embed("query 1", || Ok(vec![10.0]))?, [10.0]);
+        assert_eq!(
+            cache.embed("query 0 ", || anyhow::bail!("already cached"))?,
+            [2.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_and_oversize_queries_do_not_enter_the_cache() -> Result<()> {
+        let mut cache = QueryCache::default();
+        assert!(
+            cache
+                .embed("failed", || anyhow::bail!("inference error"))
+                .is_err()
+        );
+        let long = "x".repeat(MAX_CACHED_QUERY_BYTES + 1);
+        assert_eq!(cache.embed(&long, || Ok(vec![1.0]))?, [1.0]);
+        assert_eq!(cache.embed(&long, || Ok(vec![2.0]))?, [2.0]);
+        assert!(cache.0.is_empty());
         Ok(())
     }
 }

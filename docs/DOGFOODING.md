@@ -203,3 +203,9 @@ The development journal captured the decision to share the watcher’s ONNX sess
 The local benchmark used a profiling-enabled release build and compared the same real semantic query across five standalone invocations, one cold socket request, and five warm socket requests. All returned byte-identical JSON. Warm requests had a median of 50 ms and each trace embedded the query without loading the model again. [Resident benchmark](BENCHMARK_SCALE.md#resident-semantic-search-at-1000-chunks)
 
 Formatting, Clippy in both feature configurations, all 63 default Rust tests, the opt-in real-ONNX socket parity test, and six Python benchmark tests passed. Socket integration covered concurrent clients and FIFO writes, index replacement, archive and forget, framing errors, queue bounds, and stale socket recovery. The sandbox restricted socket binding. The executable tests and benchmark ran with local socket access outside that sandbox. Cargo checked the Rust files where LSP diagnostics were stale. The Python language server was unavailable.
+
+## Resident query-vector cache
+
+The profiling-enabled real executable compared a distinct primer, one warm miss, and five exact hits using the pinned model and 1,000-chunk scale fixture. Each measured query returned byte-identical standalone JSON. Cache diagnostics showed two misses followed by five hits. The embedding timer ran only on misses. The opt-in socket test verified that repeated, previously warmed queries immediately respect archive and forget, including after a full rebuild.
+
+Formatting, Clippy in both feature configurations, 66 default Rust tests, the targeted real ONNX socket test and six Python benchmark tests passed. The Rust LSP diagnostics timed out, and the Python language server was unavailable. Cargo and the executable runs verified the changes.

@@ -1244,6 +1244,19 @@ fn socket_search_matches_standalone_with_real_embeddings() -> Result<()> {
             );
         }
     }
+    let search = |raw: bool| {
+        let mut args = vec!["search", "--server", "--json", "WriterLock"];
+        if raw {
+            args.push("--raw");
+        }
+        fixture.json(&args)
+    };
+    fixture.run(&["archive", &id])?;
+    assert_eq!(search(false)?["results"], serde_json::json!([]));
+    assert_eq!(search(true)?["results"][0]["id"], id);
+    fixture.run(&["forget", &id, "--yes"])?;
+    fixture.run(&["reindex", "--full"])?;
+    assert_eq!(search(true)?["results"], serde_json::json!([]));
     server.stop()?;
     Ok(())
 }

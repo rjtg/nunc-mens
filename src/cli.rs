@@ -6,6 +6,7 @@ use crate::git;
 use crate::index::Index;
 use crate::ledger::{self, Guard, Ledger};
 use crate::model::{self, LocalModel, MODEL};
+use crate::profile::{self, Stage};
 use crate::repo::Repo;
 use crate::search::{self, ContextMode, Sort};
 use crate::timeline::{self, Anchor, DatedEvent, Event, EventKind, NeighborReport, TimeFilter};
@@ -390,6 +391,7 @@ pub fn run() -> ExitCode {
     } else {
         ExitCode::FAILURE
     };
+    let _session = matches!(cli.command, Action::Search { .. }).then(profile::begin);
     match execute(cli.command) {
         Ok(status) => status,
         Err(error) => {
@@ -400,7 +402,7 @@ pub fn run() -> ExitCode {
 }
 
 fn execute(action: Action) -> Result<ExitCode> {
-    let repo = Repo::discover()?;
+    let repo = profile::measure(Stage::Repository, Repo::discover)?;
     match action {
         Action::Init { source } => {
             repo.configure(&source, true)?;
@@ -560,6 +562,7 @@ fn execute(action: Action) -> Result<ExitCode> {
                 .as_deref()
                 .map_or(search::Query::Text(&text), search::Query::Example);
             let found = search::search(&repo, query, options)?;
+            let _format = profile::span(Stage::Format);
             if json {
                 serde_json::to_writer(&mut out, &found)?;
                 writeln!(out)?;

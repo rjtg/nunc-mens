@@ -11,11 +11,13 @@ from pathlib import Path
 import platform
 import re
 import shutil
-import subprocess
-import tempfile
-import time
+import sys
 
 from prepare import HERE, prepare
+
+# Also support direct execution as documented in the benchmark README.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from benchmarks.process import measure_command, total_bytes
 
 
 NUNC_CASES = {
@@ -47,36 +49,8 @@ def read_json(path):
 
 
 def measure(command, cwd, env):
-    """Capture Linux wait4 peak RSS for each CLI invocation."""
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        started = time.perf_counter()
-        with subprocess.Popen(
-            command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-        ) as child:
-            try:
-                _, status, usage = os.wait4(child.pid, 0)
-            except KeyboardInterrupt:
-                child.terminate()
-                raise
-            child.returncode = os.waitstatus_to_exitcode(status)
-            seconds = time.perf_counter() - started
-        stdout.seek(0)
-        stderr.seek(0)
-        output = stdout.read()
-        if child.returncode:
-            raise RuntimeError(
-                f"{command!r} exited {child.returncode}\n"
-                f"{stderr.read().decode('utf-8', errors='replace')}\n"
-                f"{output.decode('utf-8', errors='replace')}"
-            )
-        return output, {"seconds": seconds, "peak_rss_kib": usage.ru_maxrss}
-
-
-def total_bytes(root):
-    return sum(
-        path.stat().st_size for path in root.rglob("*")
-        if path.is_file() and path.suffix in {".sqlite", ".sqlite3", ".db"}
-    )
+    output, _, timing = measure_command(command, cwd, env)
+    return output, timing
 
 
 def duplicate_safe_metrics(hits, grades):

@@ -1056,6 +1056,43 @@ fn keyword_index_upgrades_to_shared_semantic_chunks() -> Result<()> {
 }
 
 #[test]
+fn search_profiling_preserves_stdout_and_requires_opt_in() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.log_id("WriterLock serializes concurrent commits.")?;
+    fixture.run(&["reindex", "--keyword-only"])?;
+    let command = ["search", "--mode", "keyword", "WriterLock", "--json"];
+    let ordinary = checked(
+        fixture
+            .nunc(&command)
+            .env_remove("NUNC_SEARCH_PROFILE")
+            .output()?,
+    )?;
+    let profiled = checked(
+        fixture
+            .nunc(&command)
+            .env("NUNC_SEARCH_PROFILE", "1")
+            .output()?,
+    )?;
+    assert_eq!(ordinary.stdout, profiled.stdout);
+    assert!(ordinary.stderr.is_empty());
+    let stderr = String::from_utf8(profiled.stderr)?;
+    if cfg!(feature = "search-profile") {
+        let report: Value = serde_json::from_str(
+            stderr
+                .strip_prefix("nunc-profile ")
+                .context("missing stderr profile")?,
+        )?;
+        for stage in ["cli", "keyword_scan", "source_filter", "context", "format"] {
+            assert!(report[stage].is_u64());
+        }
+        assert!(report.get("model_load").is_none());
+    } else {
+        assert!(stderr.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn similar_to_rejects_invalid_references_and_text_conflicts_without_inference() -> Result<()> {
     let fixture = Fixture::new()?;
     let conflict = fixture

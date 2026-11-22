@@ -187,3 +187,11 @@ The real executable logged the RRF normalization and recency decision in the sam
 The first Sparrow pass found that `design/patch-review.md` returned no keyword results even though the fixture indexed `docs/design/patch-review.md`. Indexed source path suffixes now match on whole components when a full path is absent. Repeating the exact query in that fixture returned the expected path at rank one with no warnings and a metadata-only exact match.
 
 Formatting, Clippy, all 58 default Rust tests, and four benchmark harness tests passed. Two opt-in E5 tests passed. The hybrid integration checked repeatable rankings, missing branch evidence, archive and forget, full reindex, and filter and budget counts. The semantic diagnostics regression checked stale forgotten rows, temporal filters, exact-file scope, and Markdown stderr. LSP returned stale or incomplete feedback for several files, so Cargo verified the final source.
+
+## Search scale profiling
+
+In the isolated development journal, the executable logged the decision to time the durable snapshot check separately. `nunc reindex --keyword-only` indexed five chunks with zero embeddings. `nunc search --mode keyword --limit 1 --json 'freshness profiling'` retrieved that decision at rank one.
+
+On the generated 1,000-chunk fixture, a profiled model-free keyword query returned ordinary search JSON on stdout and a tagged timing record on stderr. The trace measured about 4.6 ms in the keyword scan and 33 ms in the snapshot freshness check. The fixture and timing process run independently of the development journal.
+
+Formatting, Clippy with both feature settings, all 59 default Rust tests, the targeted profiling executable test with the feature enabled, and six Python benchmark tests passed. The profiling test compares stdout byte for byte with opt-in disabled and confirms that the default build leaves stderr quiet. Cargo checked files where Rust LSP timed out. The Python language server was unavailable, and the Python tests exercised the changed scripts.

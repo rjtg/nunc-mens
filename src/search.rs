@@ -3,6 +3,7 @@ use crate::documents::{Kind, Provenance, Snapshot};
 use crate::index::{Index, IndexedRow, Reader};
 use crate::ledger::Guard;
 use crate::model::{LocalModel, MODEL};
+use crate::profile::{self, Stage};
 use crate::repo::{Repo, SourceLocation, source_path};
 use crate::timeline::{self, DatedEvent, NeighborReport, TimeFilter, parse_timestamp};
 use crate::vectors::{self, cosine};
@@ -424,6 +425,7 @@ pub(crate) fn dated(repo: &Repo, options: &Options<'_>) -> Result<Vec<DatedEvent
 }
 
 pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Result<Results> {
+    let setup = profile::span(Stage::SearchSetup);
     let config = repo.config()?;
     let filter = Filter::new(repo, &config.sources, &options)?;
     let mut settings = config.search;
@@ -436,17 +438,20 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         options.mode == Mode::Semantic || matches!(query, Query::Text(_)),
         "--similar-to requires semantic mode"
     );
+    drop(setup);
     let text_vector = match query {
         Query::Text(text) => {
             ensure!(!text.trim().is_empty(), "search query must be nonblank");
             if options.mode != Mode::Keyword {
-                Some(LocalModel::load(repo)?.query(text)?)
+                let mut model = profile::measure(Stage::ModelLoad, || LocalModel::load(repo))?;
+                Some(profile::measure(Stage::EmbedQuery, || model.query(text))?)
             } else {
                 None
             }
         }
         Query::Example(_) => None,
     };
+    let index_read = profile::span(Stage::IndexRead);
     let guard = Guard::acquire(repo, false)?;
     let archives = guard.ledger.archives()?;
     let example = match query {
@@ -484,6 +489,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         .as_ref()
         .map(|vector| vectors::norm(vector, MODEL.dimensions))
         .transpose()?;
+    drop(index_read);
     let one_per_parent = options.one_per_parent
         || options.max_tokens.is_some()
         || options.neighbor_window.is_some()
@@ -503,6 +509,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
     let keyword_scope = options.explain.then(pipeline::SourceCounts::default);
     let mut keyword_eligible = 0;
     let include = |path: &str| {
+        let _filter = profile::span(Stage::SourceFilter);
         let included = filter.includes(path);
         if let Some(counts) = &source_counts {
             counts.check(included);
@@ -510,6 +517,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         included
     };
     let mut visit = |row: IndexedRow<'_, '_>, evidence: Evidence<'_>| -> Result<()> {
+        let filter_span = profile::span(Stage::VisibilityFilter);
         let keyword_branch = matches!(evidence, Evidence::Keyword { .. });
         let counts = if hybrid && keyword_branch {
             None
@@ -551,6 +559,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
             }
             return Ok(());
         }
+        drop(filter_span);
         let (base, similarity, bm25, exact_match) = match evidence {
             Evidence::Vector(candidate) => {
                 let similarity = cosine(
@@ -616,11 +625,13 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         Ok(())
     };
     if options.mode != Mode::Keyword {
+        let _scan = profile::span(Stage::VectorScan);
         reader.scan(filter.kind, include, |row, vector| {
             visit(row, Evidence::Vector(vector))
         })?;
     }
     if options.mode != Mode::Semantic {
+        let _scan = profile::span(Stage::KeywordScan);
         let Query::Text(text) = query else {
             anyhow::bail!("keyword and hybrid modes require a text query")
         };
@@ -629,6 +640,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
             text,
             |path| {
                 if hybrid {
+                    let _filter = profile::span(Stage::SourceFilter);
                     let included = filter.includes(path);
                     if let Some(counts) = &keyword_scope {
                         counts.check(included);
@@ -643,6 +655,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
     }
     let mut fusion_counts = None;
     let candidates = if hybrid {
+        let _fusion = profile::span(Stage::Fusion);
         fusion_counts = keyword_scope.map(|scope| {
             pipeline::FusionCounts::new(
                 branch_limit,
@@ -675,6 +688,7 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
     } else {
         semantic
     };
+    let context = profile::span(Stage::Context);
     let best = candidates
         .into_iter()
         .enumerate()
@@ -694,11 +708,14 @@ pub(crate) fn search(repo: &Repo, query: Query<'_>, options: Options<'_>) -> Res
         }
         None => (best.into_iter().map(|item| item.hit).collect(), None),
     };
+    drop(context);
     let digest = reader.digest.clone();
     drop(reader);
     let current = match snapshot_digest {
         Some(digest) => Ok(digest),
-        None => Snapshot::read(repo).map(|snapshot| snapshot.digest),
+        None => profile::measure(Stage::Freshness, || {
+            Snapshot::read(repo).map(|snapshot| snapshot.digest)
+        }),
     };
     let (freshness, warning) = match current {
         Ok(snapshot_digest) if snapshot_digest == digest => ("current", None),

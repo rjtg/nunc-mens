@@ -13,6 +13,7 @@ mod git;
 mod index;
 mod ledger;
 mod model;
+mod profile;
 mod protocol;
 pub mod repo;
 mod search;

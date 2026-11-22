@@ -159,7 +159,7 @@ impl<'a> Index<'a> {
                 if digest == snapshot.digest && (keyword_only || semantic_ready(&connection)?) {
                     let tx = connection.transaction()?;
                     ensure_keyword_schema(&tx)?;
-                    store_freshness(&tx, &snapshot)?;
+                    store_search_metadata(&tx, &snapshot)?;
                     tx.commit()?;
                     return Ok(Refresh {
                         documents: connection.query_row(
@@ -326,9 +326,10 @@ impl<'a> Index<'a> {
     }
 }
 
-fn store_freshness(tx: &Transaction<'_>, snapshot: &Snapshot) -> Result<()> {
+fn store_search_metadata(tx: &Transaction<'_>, snapshot: &Snapshot) -> Result<()> {
     tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS snapshot_freshness (
+        "CREATE INDEX IF NOT EXISTS chunk_path ON documents(path);
+        CREATE TABLE IF NOT EXISTS snapshot_freshness (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             digest TEXT NOT NULL,
             stamps TEXT NOT NULL
@@ -581,7 +582,7 @@ fn update_rows(
             serde_json::to_string(&snapshot.chunking.strategy)?
         ],
     )?;
-    store_freshness(&transaction, &snapshot)?;
+    store_search_metadata(&transaction, &snapshot)?;
     transaction.commit()?;
     Ok(report)
 }
@@ -699,6 +700,7 @@ impl Reader {
         &self,
         kind: Option<Kind>,
         query: &str,
+        exact_files: Option<&str>,
         include: impl Fn(&str) -> bool,
         mut visit: impl FnMut(IndexedRow<'_, '_>, Option<f64>, bool) -> Result<()>,
     ) -> Result<()> {
@@ -716,19 +718,20 @@ impl Reader {
             && query.bytes().all(|ch| ch.is_ascii_hexdigit()))
         .then(|| format!("{}*", query.to_ascii_lowercase()));
         let literal = single.then_some(query);
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "WITH lexical AS MATERIALIZED (
-                SELECT rowid, bm25(chunk_terms) AS quality FROM chunk_terms WHERE chunk_terms MATCH ?1
+                SELECT rowid, bm25(chunk_terms) AS quality FROM chunk_terms
+                WHERE chunk_terms MATCH ?1 AND (?7 IS NULL OR rowid IN (
+                    SELECT rowid FROM documents WHERE path IN (SELECT value FROM json_each(?7))
+                ))
              ), exact AS MATERIALIZED (
                 SELECT d.rowid FROM documents d WHERE ?2 IS NOT NULL AND d.parent_id=?2
                 UNION
-                SELECT d.rowid FROM documents d WHERE ?3 IS NOT NULL AND (
-                    d.path=?3 OR (
-                        d.kind='source' AND instr(?3,'/') > 0
-                        AND substr(d.path,-length(?3)-1)='/' || ?3
-                        AND NOT EXISTS (SELECT 1 FROM documents WHERE path=?3)
-                    )
-                )
+                SELECT d.rowid FROM documents d WHERE d.path=?3
+                UNION
+                SELECT d.rowid FROM documents d
+                WHERE instr(?3,'/') > 0 AND NOT EXISTS (SELECT 1 FROM documents WHERE path=?3)
+                    AND d.kind='source' AND substr(d.path,-length(?3)-1)='/' || ?3
                 UNION
                 SELECT d.rowid FROM parents p JOIN documents d ON d.parent_id=p.id
                     WHERE ?4 IS NOT NULL AND json_extract(p.origin,'$[1].sha') GLOB ?4
@@ -740,7 +743,8 @@ impl Reader {
                     (e.rowid IS NOT NULL OR (?5 IS NOT NULL AND instr(lower(d.text),lower(?5)) > 0))
              FROM hits h JOIN documents d ON d.rowid=h.rowid
              LEFT JOIN lexical l ON l.rowid=h.rowid LEFT JOIN exact e ON e.rowid=h.rowid
-             WHERE ?6 IS NULL OR d.kind=?6",
+             WHERE (?6 IS NULL OR d.kind=?6)
+                AND (?7 IS NULL OR d.path IN (SELECT value FROM json_each(?7)))",
         )?;
         let mut rows = stmt.query(params![
             expression,
@@ -749,6 +753,7 @@ impl Reader {
             sha,
             literal,
             kind.map(Kind::as_str),
+            exact_files,
         ])?;
         while let Some(row) = rows.next()? {
             let path = row.get_ref(2)?.as_str()?;
@@ -835,13 +840,33 @@ impl Reader {
         &self,
         kind: Option<Kind>,
         include: impl Fn(&str) -> bool,
+        visit: impl FnMut(IndexedRow<'_, '_>, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_scoped(kind, None, include, visit)
+    }
+
+    pub(crate) fn scan_scoped(
+        &self,
+        kind: Option<Kind>,
+        exact_files: Option<&str>,
+        include: impl Fn(&str) -> bool,
         mut visit: impl FnMut(IndexedRow<'_, '_>, &[f32]) -> Result<()>,
     ) -> Result<()> {
-        let mut stmt = self.conn.prepare(
+        let kind = kind.map(Kind::as_str);
+        let (predicate, argument) = match exact_files {
+            Some(files) => (
+                "kind='source' AND path IN (SELECT value FROM json_each(?1))",
+                Some(files),
+            ),
+            None => ("?1 IS NULL OR kind = ?1", kind),
+        };
+        // Only fixed predicates are assembled here. File scopes stay bound parameters.
+        let sql = format!(
             "SELECT id, kind, path, timestamp, line_start, line_end, text, vector, parent_id, chunk, section_start, section_end
-             FROM documents WHERE ?1 IS NULL OR kind = ?1",
-        )?;
-        let mut rows = stmt.query([kind.map(Kind::as_str)])?;
+             FROM documents WHERE {predicate}"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query([argument])?;
         while let Some(row) = rows.next()? {
             let path: &str = row.get_ref(2)?.as_str()?;
             if !include(path) {
@@ -1048,6 +1073,7 @@ mod tests {
         reader.scan_keyword(
             None,
             "WriterLock",
+            None,
             |_| true,
             |_, bm25, exact| {
                 assert!(bm25.is_some_and(|score| score < 0.0));

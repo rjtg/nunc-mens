@@ -400,6 +400,17 @@ impl Filter {
         Ok(())
     }
 
+    fn exact_files(&self) -> Result<Option<String>> {
+        if self.kind == Some(Kind::Source)
+            && !self.sources.is_empty()
+            && self.sources.iter().all(|source| !source.recursive)
+        {
+            let files: Vec<_> = self.sources.iter().map(|source| &source.path).collect();
+            return Ok(Some(serde_json::to_string(&files)?));
+        }
+        Ok(None)
+    }
+
     fn includes(&self, path: &str) -> bool {
         let path = Path::new(path);
         (!self.memory && self.sources.is_empty())
@@ -660,11 +671,20 @@ pub(crate) fn search_with(
         }
         Ok(())
     };
+    // Explain must still count the complete type scope before the path filter.
+    let exact_files = if options.explain {
+        None
+    } else {
+        filter.exact_files()?
+    };
     if options.mode != Mode::Keyword {
         let _scan = profile::span(Stage::VectorScan);
-        reader.scan(filter.kind, include, |row, vector| {
-            visit(row, Evidence::Vector(vector))
-        })?;
+        reader.scan_scoped(
+            filter.kind,
+            exact_files.as_deref(),
+            include,
+            |row, vector| visit(row, Evidence::Vector(vector)),
+        )?;
     }
     if options.mode != Mode::Semantic {
         let _scan = profile::span(Stage::KeywordScan);
@@ -674,6 +694,7 @@ pub(crate) fn search_with(
         reader.scan_keyword(
             filter.kind,
             text,
+            exact_files.as_deref(),
             |path| {
                 if hybrid {
                     let _filter = profile::span(Stage::SourceFilter);

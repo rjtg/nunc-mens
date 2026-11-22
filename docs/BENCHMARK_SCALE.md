@@ -65,6 +65,20 @@ A controlled comparison ran the exact-file query `SPW-000000` against `docs/deci
 
 These are individual before/after samples from a later run of the same fixture, with both paths measured together. The new path still enumerates eligible source names and checks file metadata. A mismatch falls back to comparing the full content digest. Ranking and SQL plans stayed the same for this change.
 
-The exact-path predicate `kind=? AND path=?` currently plans as a scan of `documents`. The chunk-ID lookup uses the primary-key index, the parent lookup uses `chunk_parent`, and the lexical `MATCH` uses the FTS virtual-table index. Exact source filter pushdown and its impact on ranking and pipeline counts remain part of [#32](https://github.com/rjtg/nunc-mens/issues/32).
+The exact-path predicate `kind=? AND path=?` planned as a scan of `documents` before the path index. The chunk-ID lookup uses the primary-key index, the parent lookup uses `chunk_parent`, and the lexical `MATCH` uses the FTS virtual-table index. The next comparison measures exact-file filter pushdown.
 
 The profiling binary SHA-256 values were `18bde79beb4388a1a9a77f013e2a6af90d0f58d6c5ba02dcf142ced1b1cfb1c4` before and `cfed3a68eca97171b08280e8ab1a5156d496a8cedc792a21a9b0e11edd645efc` after.
+
+### Indexed exact-file scope
+
+The next revision adds an index on `documents(path)` and binds explicit file unions before ranking. The same 100,000-chunk query returned byte-identical before and after JSON in three pairs per mode. The baseline already had the freshness shortcut. [Raw measurements](../benchmarks/performance/results/exact-file-100000-linux-x86_64.jsonl)
+
+| Mode | Median total before / after | Vector scan before / after | Keyword scan before / after |
+| --- | ---: | ---: | ---: |
+| Semantic | 3.085 / 2.814 s | 192.329 / 0.115 ms | — |
+| Keyword | 1.086 / 0.933 s | — | 146.088 / 2.484 ms |
+| Hybrid | 3.203 / 2.863 s | 186.553 / 0.115 ms | 142.685 / 2.205 ms |
+
+`EXPLAIN QUERY PLAN` on the fixture changed the exact equality predicate from `SCAN documents` to `SEARCH documents USING INDEX chunk_path (path=?)`. The bound file-list predicate also uses `chunk_path`, and lexical matching retains the FTS virtual-table plan. `--explain` still uses full type-scope traversal for its precise filter counts. Directory and mixed scopes keep the component-aware filter. Freshness still checks about 0.9 seconds of source metadata at this size. Reads after a change still fall back to the content digest.
+
+The after binary SHA-256 was `f44b47301a0d84cfe767ab01b889111b20b6ac3d35e249210c6207ac2d951c13`.

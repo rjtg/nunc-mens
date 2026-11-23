@@ -1,4 +1,4 @@
-"""Measure standalone nunc retrieval across reproducible scale fixtures on Linux."""
+"""Measure standalone and resident nunc retrieval across reproducible scale fixtures on Linux."""
 
 import argparse
 from datetime import datetime, timezone
@@ -8,12 +8,12 @@ from pathlib import Path
 import platform
 
 from benchmarks.performance.generate import generate
+from benchmarks.performance.resident import PROFILE_PREFIX, resident
 from benchmarks.process import measure_command, total_bytes
 
 
 MODES = ("semantic", "keyword", "hybrid")
 SIZES = (1000, 10000, 50000, 100000)
-PROFILE_PREFIX = b"nunc-profile "
 
 
 def read_profile(stderr):
@@ -26,28 +26,86 @@ def read_profile(stderr):
     return stages
 
 
-def probe(binary, repo, env, mode, query):
-    command = [binary, "search", "--mode", mode, "--json", *query["args"], "--", query["query"]]
+def execute(binary, repo, env, mode, query, remote=False):
+    command = [binary, "search", "--mode", mode, "--json", *query["args"]]
+    if remote:
+        command.append("--server")
+    command.extend(["--", query["query"]])
     output, stderr, timing = measure_command(command, repo, env)
     response = json.loads(output)
     if response["mode_used"] != mode or response["warnings"]:
         raise ValueError(f"unexpected benchmark response in {mode}: {response['warnings']}")
     if query["filter"] == "file" and any(hit["path"] != query["args"][1] for hit in response["results"]):
         raise ValueError("file-filtered search returned a foreign path")
+    return output, stderr, {**timing, "hits": len(response["results"])}
+
+
+def probe(binary, repo, env, mode, query):
+    _, stderr, timing = execute(binary, repo, env, mode, query)
     stages = read_profile(stderr)
     return {
         **timing, "stages_ns": stages,
         "outside_cli_ns": round(timing["seconds"] * 1e9) - stages["cli"],
-        "hits": len(response["results"]),
     }
+
+
+def paired_requests(args, chunks, repo, env, queries, emit):
+    # Distinct whitespace creates independent exact cache keys for one prompt
+    # used with several scopes. The standalone reference uses the same bytes.
+    cases = [{**query, "query": query["query"] + " " * index}
+             for index, query in enumerate(queries)]
+    primer = {**cases[0], "query": queries[0]["query"] + " " * len(cases)}
+    for mode in args.mode:
+        references = []
+        for query in cases:
+            output, stderr, timing = execute(args.nunc, repo, env, mode, query)
+            references.append(output)
+            stages = read_profile(stderr)
+            emit({
+                "record": "paired_query", "chunks": chunks, "mode": mode, "phase": "standalone",
+                "sample": 0, **query, **timing, "stages_ns": stages,
+                "outside_cli_ns": round(timing["seconds"] * 1e9) - stages["cli"],
+            })
+
+        measured = []
+        with resident(args.nunc, repo, env) as server:
+            _, _, timing = execute(args.nunc, repo, env, mode, primer, remote=True)
+            measured.append({
+                "record": "primer", "chunks": chunks, "mode": mode, "phase": "cold-server",
+                "startup_to_socket_seconds": server.startup_seconds, **primer, **timing,
+            })
+            for query, expected in zip(cases, references):
+                for sample in range(args.rounds + 1):
+                    output, _, timing = execute(args.nunc, repo, env, mode, query, remote=True)
+                    if output != expected:
+                        raise ValueError(f"{chunks}/{mode}/{query['filter']} socket output differs")
+                    phase = "warm" if mode == "keyword" else ("hit" if sample else "miss")
+                    measured.append({
+                        "record": "paired_query", "chunks": chunks, "mode": mode,
+                        "phase": phase, "sample": sample, **query, **timing,
+                    })
+        emit({
+            "record": "resident", "chunks": chunks, "mode": mode,
+            "peak_rss_kib": server.peak_rss_kib,
+        })
+        for item, (stages, cache) in zip(measured, server.profiles(mode, len(measured))):
+            if cache is not None and (not cache["cacheable"] or cache["hit"] != (item["phase"] == "hit")):
+                raise ValueError("unexpected query embedding cache sequence")
+            emit({
+                **item, "stages_ns": stages, "query_cache": cache,
+                "outside_cli_ns": round(item["seconds"] * 1e9) - stages["cli"],
+            })
 
 
 def run_size(args, chunks, emit):
     root = args.root / str(chunks)
-    root.mkdir()
     repo = root / "repo"
     state = root / "state"
-    generate(repo, chunks, args.unique_text)
+    if not args.reuse_fixtures:
+        root.mkdir()
+        generate(repo, chunks, args.unique_text)
+    elif not (repo / "queries.json").is_file() or not state.is_dir():
+        raise ValueError(f"missing existing isolated benchmark fixture for {chunks} chunks")
     env = {
         **os.environ,
         "NUNC_REPO_ROOT": str(repo),
@@ -56,16 +114,21 @@ def run_size(args, chunks, emit):
         "NUNC_SEARCH_PROFILE": "1",
     }
     output, _, timing = measure_command(
-        [args.nunc, "reindex", "--full", "--source", "docs"], repo, env,
+        [args.nunc, "reindex", *(["--full"] if not args.reuse_fixtures else []), "--source", "docs"],
+        repo, env,
     )
     index_message = output.decode().strip()
     if not index_message.startswith(f"Indexed {chunks} chunks "):
         raise ValueError(f"wrong index size: {index_message}")
     emit({
         "record": "index", "chunks": chunks, "message": index_message,
+        "operation": "refresh" if args.reuse_fixtures else "full",
         "database_bytes": total_bytes(state), **timing,
     })
     queries = json.loads((repo / "queries.json").read_text())[:6 * args.topics]
+    if args.transport == "paired":
+        paired_requests(args, chunks, repo, env, queries, emit)
+        return
     for round_index in range(args.rounds):
         for mode in args.mode:
             if round_index == 1:
@@ -103,6 +166,8 @@ def main():
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--topics", type=int, choices=range(1, 5), default=4)
     parser.add_argument("--unique-text", action="store_true")
+    parser.add_argument("--transport", choices=("standalone", "paired"), default="standalone")
+    parser.add_argument("--reuse-fixtures", action="store_true", help="refresh existing isolated scale fixtures")
     args = parser.parse_args()
     for name in ("root", "output", "nunc", "model_cache"):
         setattr(args, name, getattr(args, name).resolve())
@@ -114,7 +179,10 @@ def main():
         parser.error("the profiling executable and existing model cache are required")
     if len(set(sizes)) != len(sizes) or len(set(args.mode)) != len(args.mode):
         parser.error("sizes and modes must be unique")
-    args.root.mkdir()
+    if not args.reuse_fixtures:
+        args.root.mkdir()
+    elif args.unique_text or not args.root.is_dir():
+        parser.error("--reuse-fixtures needs an existing root and reads its existing journal corpus")
     version, _, _ = measure_command([args.nunc, "--version"], args.root, os.environ)
     with args.output.open("x", encoding="utf-8") as out:
         def emit(record):
@@ -126,7 +194,7 @@ def main():
             "sizes": sizes, "modes": args.mode, "rounds": args.rounds,
             "topics": args.topics, "unique_text": args.unique_text,
             "model": "intfloat/multilingual-e5-small@614241f622f53c4eeff9890bdc4f31cfecc418b3",
-            "transport": "standalone", "concurrency": 1,
+            "transport": args.transport, "concurrency": 1, "reused_fixtures": args.reuse_fixtures,
         })
         for size in sizes:
             print(f"Measuring {size:,} chunks", flush=True)

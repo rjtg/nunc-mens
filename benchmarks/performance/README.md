@@ -1,6 +1,6 @@
 # Search performance fixtures
 
-This fixture is for the standalone scale experiments in [#29](https://github.com/rjtg/nunc-mens/issues/29). For labeled quality judgments and comparisons with QMD, see the [retrieval benchmark](../retrieval/README.md).
+This fixture is for the standalone and resident scale experiments in [#29](https://github.com/rjtg/nunc-mens/issues/29). For labeled quality judgments and comparisons with QMD, see the [retrieval benchmark](../retrieval/README.md).
 
 ```sh
 scratch=$(mktemp -d)
@@ -13,7 +13,7 @@ python3 -B benchmarks/performance/generate.py "$scratch/repo" 1000
 
 Generate 1,000, 10,000, 50,000, and 100,000 files in separate scratch repositories for a scaling run. Each source contains one short paragraph. The generator cycles through 256 distinct bodies with four distributed topics so embedding reuse keeps initial corpus construction practical. Report this as a search-scaling fixture with embedding reuse. `--unique-text` gives each document its own indexed body and is suitable for measuring indexing cost with much less reuse.
 
-Every generated repository includes `queries.json` with conceptual prompts and exact ticket identifiers. Both query kinds have unfiltered, directory, and exact-file variants. At 1,000 chunks, the conceptual prompt “parallel writes” found a runbook in semantic and hybrid modes and had zero keyword matches. Exact identifiers exercise keyword scoring on the same fixture. The query file is outside the indexed `docs` tree. Peak memory, per-stage profiling, and the scaling baseline are still tracked in #29.
+Every generated repository includes `queries.json` with conceptual prompts and exact ticket identifiers. Both query kinds have unfiltered, directory, and exact-file variants. At 1,000 chunks, the conceptual prompt “parallel writes” found a runbook in semantic and hybrid modes and had zero keyword matches. Exact identifiers exercise keyword scoring on the same fixture. The query file is outside the indexed `docs` tree.
 
 ## Standalone scale benchmark
 
@@ -30,7 +30,7 @@ python3 -B -m benchmarks.performance.summarize "$scratch/scale.jsonl"
 
 The runner defaults to all four sizes, all three modes, four topics, and two rounds. Use repeated `--size` or `--mode` flags for targeted runs. Use `--topics 1` for one concept and one exact identifier per filter and mode. Increase `--rounds` for more stable percentile estimates. The summarizer reports nearest-rank p95 and p99, so tails from small samples are observed maxima. Throughput is serial queries divided by summed request time.
 
-Each request starts a new process. The first pass follows indexing. The repeated pass follows one recorded warm-up request per mode. The operating-system page cache stays in place throughout. These are first and repeated standalone samples. A persistent ONNX session, verified cache hits and misses, and concurrent throughput require the persistent endpoint from #30 and any later cache from #31.
+Each request starts a new process. The first pass follows indexing. The repeated pass follows one recorded warm-up request per mode. The operating-system page cache stays in place throughout. The paired runner below measures a persistent ONNX session and verifies query cache behavior.
 
 The profiling feature adds no CLI arguments. Setting `NUNC_SEARCH_PROFILE=1` emits one diagnostic JSON object tagged `nunc-profile` on stderr. Ordinary JSON and other stdout formats retain their existing contract. Scan spans include SQL retrieval, decoding or lexical scoring, and shortlist ranking. The source and visibility filter spans are measured inside them. `outside_cli` is the difference between process wall time and the post-argument-parse CLI span. It includes process startup, argument parsing and final shutdown. The remaining CLI time also includes cleanup between timed stages. The feature takes timestamps for each examined filter and adds some overhead. Default builds elide the timing spans.
 
@@ -39,6 +39,22 @@ Measurements include the machine, platform, model revision, index cost recorded 
 The [recorded baseline](../../docs/BENCHMARK_SCALE.md) links to the raw 1,000–100,000 chunk measurements. Recreate all of its tables with `python3 -B -m benchmarks.performance.summarize benchmarks/performance/results/standalone-linux-x86_64.jsonl.gz`.
 
 ## Resident endpoint comparison
+
+Use `--transport paired` to run the full size, mode, and scope matrix through standalone and resident transports. This Linux runner measures server high-water RSS via `/proc`. Every mode and corpus size starts a separate server and measures socket publication and a first query with a distinct primer. For each case, the runner measures one standalone request and then one warm miss plus `--rounds` repetitions on the resident server. Keyword mode sends the same number of warm requests and does zero inference. Distinct whitespace gives each case its own exact cache key. Standalone and resident responses must match byte for byte.
+
+```sh
+python3 -B -m benchmarks.performance.run --root "$scratch/fixtures" \
+  --reuse-fixtures --transport paired --topics 1 --rounds 2 \
+  --output "$scratch/paired.jsonl" --nunc target/release/nunc \
+  --model-cache "$NUNC_MODEL_CACHE_DIR"
+python3 -B -m benchmarks.performance.summarize "$scratch/paired.jsonl"
+```
+
+With `--reuse-fixtures`, indexing measurements describe a refresh of existing generated repositories and state. Omit the option and choose a fresh fixture root to measure full builds. The summarizer checks matrix and phase coverage. It reports request latency, serial throughput, and client RSS per scope, plus server RSS and cold primer latency per size and mode. In the paired report, `outside_cli` subtracts the measured CLI span on the standalone process or server from client wall time. It includes client startup and request transport for socket samples. Pages are left warm and requests run serially.
+
+Recreate the [paired baseline](../../docs/BENCHMARK_SCALE.md#paired-standalone-and-resident-scale-matrix) tables with `python3 -B -m benchmarks.performance.summarize benchmarks/performance/results/paired-linux-x86_64.jsonl.gz`.
+
+### Single-query probe
 
 Use a fresh scale fixture whose index has already been built with the pinned model. The comparator starts its own foreground server, requires byte-identical JSON from both transports, and checks that warm vector requests do not reload ONNX.
 

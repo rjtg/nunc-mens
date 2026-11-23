@@ -1,4 +1,4 @@
-# Standalone search performance baseline
+# Search performance baselines
 
 This run measures search at 1,000, 10,000, 50,000, and 100,000 indexed chunks. Each size tests semantic, keyword, and hybrid retrieval with no source filter, a directory filter, and an exact-file filter. A conceptual question and an exact ticket identifier exercise each combination in two passes. The second pass follows one warm-up per mode. All requests launch a fresh process.
 
@@ -31,7 +31,7 @@ The table shows median stage times in seconds on the repeated pass. Scan timers 
 
 The snapshot check revisits registered sources even when result eligibility is limited to one file. An exact-ticket keyword query restricted to one file at 10,000 chunks returned one match and spent 809 ms in freshness validation and 63 ms in the lexical scan. At the larger sizes snapshot validation dominates all three modes on this corpus. Model initialization also remains a substantial cost in standalone semantic and hybrid search. The measurements give [#30](https://github.com/rjtg/nunc-mens/issues/30) a baseline for model reuse and [#32](https://github.com/rjtg/nunc-mens/issues/32) a baseline for reducing snapshot work. They do not establish a workload that needs ANN.
 
-The repeated pass warms filesystem caches across independent invocations. Persistent-process latency and application cache hits and misses remain unmeasured until those paths exist. [Performance issue](https://github.com/rjtg/nunc-mens/issues/29)
+The repeated pass warms filesystem caches across independent invocations. The resident comparisons below measure ONNX reuse and application cache hits and misses. [Performance issue](https://github.com/rjtg/nunc-mens/issues/29)
 
 ## Resident semantic search at 1,000 chunks
 
@@ -52,6 +52,25 @@ The profiling binary SHA-256 was `cd973ad777bbb1a307491ffade103e1022ef75f626bec7
 The 1,000-chunk semantic comparator used `--measure-cache` and sent a distinct primer before the first measured query. The primer and the warm miss each embedded a query. The next five exact repetitions returned the same standalone JSON and skipped embedding. The warm miss spent 8.312 ms in inference and 38.803 ms in the server. Hit median server time was 30.816 ms. Client wall time was 69.150 ms for the single warm miss and 49.901 ms at the hit median. One miss is enough to show that inference ran and gives a limited latency comparison. This workload exercises a query-vector cache. The server still performs index eligibility, visibility and snapshot validation on every request. [Raw cache comparison](../benchmarks/performance/results/cache-1000-linux-x86_64.jsonl)
 
 The profiling binary SHA-256 was `18bde79beb4388a1a9a77f013e2a6af90d0f58d6c5ba02dcf142ced1b1cfb1c4`.
+
+## Paired standalone and resident scale matrix
+
+The paired run reused the generated repositories and their indexes. It refreshed each index separately, then ran one concept and one identifier in each of three source scopes. Each size and mode launched a fresh server. A distinct primer measured its first request. Each subsequent vector case had one warm cache miss and two exact hits. The keyword cases used three warm requests each and skipped query inference. Requests ran serially with the operating-system page cache left in place. The server's normal background index watcher remained active.
+
+The profiling binary was built at `838c675` with SHA-256 `56b4f67b02f6f44d1cf996f3e1dc1eaf3408c3c5eb73ecc55ecf70218cd6a3d4`. It used the pinned multilingual E5-small model at `614241f622f53c4eeff9890bdc4f31cfecc418b3` on Linux 6.6.158, glibc 2.44, and the same eight-thread i7-4710MQ host with 15.3 GiB RAM. Cold first-request wall time includes any wait for the watcher to load the shared model. Standalone searches time model loading directly. Server peak RSS includes the watcher and its model even in the keyword cases.
+
+Unfiltered median wall times are in seconds. The vector columns list standalone, warm miss, and warm hit. Keyword lists standalone and warm. Each standalone or miss median uses two requests, each hit median uses four, and each warm keyword median uses six.
+
+| Chunks | Semantic | Keyword | Hybrid |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 3.610 / 0.076 / 0.050 | 0.019 / 0.042 | 4.046 / 0.068 / 0.048 |
+| 10,000 | 3.113 / 0.675 / 0.263 | 0.236 / 0.340 | 4.482 / 0.332 / 0.192 |
+| 50,000 | 5.479 / 4.593 / 2.842 | 1.777 / 0.889 | 4.717 / 2.070 / 2.348 |
+| 100,000 | 6.597 / 8.826 / 7.497 | 2.563 / 7.143 | 5.594 / 7.689 / 7.323 |
+
+At 100,000 chunks, an unfiltered warm semantic hit spent a median 464 ms scanning vectors and 1.80 seconds checking freshness. Exact-file warm hits scanned vectors in about 0.11 ms and still took 7.11 seconds wall time. Warm keyword requests also show the larger latency. Four of six unfiltered requests spent 4.45–6.68 seconds in the index-read stage that acquires the ledger and index locks. The watcher takes both write locks and the shared model mutex while refreshing; the benchmark identifies contention around that path as the next investigation. Cache hits cut inference, while their wall times still vary with snapshot and refresh work.
+
+The matrix recorded 72 standalone requests, 216 warm requests with byte-identical JSON to their standalone references, and 12 cold primers. Warm vector requests produced 48 misses and 96 exact hits. At 100,000 chunks, the three servers peaked at 1,451–1,474 MiB RSS. The 509 MiB index refreshed in 27.04 seconds with zero new embeddings. The full report separates these measurements, breaks latency and serial throughput down by scope, and includes p50, p95, p99, client RSS, startup, and stage medians. With this sample count, p95 and p99 report the observed maxima. [Raw measurements](../benchmarks/performance/results/paired-linux-x86_64.jsonl.gz) · [Reproduction instructions](../benchmarks/performance/README.md#resident-endpoint-comparison)
 
 ## Source freshness shortcut at 100,000 chunks
 

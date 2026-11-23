@@ -1,4 +1,4 @@
-"""Render index and standalone search timings from scale benchmark JSONL."""
+"""Validate coverage and render search timings from scale benchmark JSONL."""
 
 import argparse
 from collections import defaultdict
@@ -17,6 +17,9 @@ def summarize(rows):
     if not rows or rows[0].get("record") != "metadata":
         raise ValueError("scale measurements must start with metadata")
     meta = rows[0]
+    if meta.get("transport") == "paired":
+        summarize_paired(meta, rows[1:])
+        return
     indexes = {}
     groups = defaultdict(list)
     stage_groups = defaultdict(list)
@@ -50,6 +53,11 @@ def summarize(rows):
         print(f"| {size} | {row['seconds']:.3f} | {row['peak_rss_kib']/1024:.1f} | "
               f"{row['database_bytes']/1024**2:.1f} |")
 
+    print_latencies(groups)
+    print_stages(stage_groups)
+
+
+def print_latencies(groups):
     print()
     print("| Chunks | Mode | Scope | Pass | N | p50 ms | p95 ms | p99 ms | Queries/s | Peak RSS MiB |")
     print("| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
@@ -61,6 +69,8 @@ def summarize(rows):
         rss = max(row["peak_rss_kib"] for row in samples) / 1024
         print(f"| {size} | {mode} | {scope} | {phase} | {len(seconds)} | {times} | {throughput:.2f} | {rss:.1f} |")
 
+
+def print_stages(stage_groups):
     print()
     print("Median stage milliseconds across all scopes. Scan spans include their filtering subspans.")
     print()
@@ -74,6 +84,81 @@ def summarize(rows):
                 durations[name].append(value)
         for stage, values in sorted(durations.items()):
             print(f"| {size} | {mode} | {phase} | {stage} | {median(values)/1e6:.3f} |")
+
+
+def summarize_paired(meta, rows):
+    indexes = {}
+    servers = {}
+    primers = {}
+    cases = defaultdict(dict)
+    latencies = defaultdict(list)
+    stages = defaultdict(list)
+    singleton = {"index": indexes, "resident": servers, "primer": primers}
+    for row in rows:
+        record = row["record"]
+        size = row["chunks"]
+        if record in singleton:
+            key = size if record == "index" else (size, row["mode"])
+            if key in singleton[record]:
+                raise ValueError(f"duplicate {record} record for {key}")
+            singleton[record][key] = row
+            continue
+        if record != "paired_query":
+            raise ValueError(f"unexpected paired report record {record}")
+        mode, scope, phase = row["mode"], row["filter"], row["phase"]
+        case = (size, mode, scope, row["query_kind"], row["query"])
+        sample = (phase, row["sample"])
+        if sample in cases[case]:
+            raise ValueError(f"duplicate paired sample for {case}")
+        cases[case][sample] = row
+        latencies[(size, mode, scope, phase)].append(row)
+        stages[(size, mode, phase)].append(row)
+
+    matrix = {(size, mode) for size in meta["sizes"] for mode in meta["modes"]}
+    if set(indexes) != set(meta["sizes"]) or set(servers) != matrix or set(primers) != matrix:
+        raise ValueError("incomplete index, resident RSS, or cold primer coverage")
+    coverage = defaultdict(int)
+    warm_rounds = range(meta["rounds"] + 1)
+    for (size, mode, scope, kind, query), samples in cases.items():
+        expected = {("standalone", 0)} | {
+            ("warm" if mode == "keyword" else ("hit" if sample else "miss"), sample)
+            for sample in warm_rounds
+        }
+        if set(samples) != expected:
+            raise ValueError(f"incomplete paired samples for {size}/{mode}/{scope}/{query!r}")
+        for (phase, _), row in samples.items():
+            cache = row.get("query_cache")
+            if mode != "keyword" and phase != "standalone":
+                if not cache or not cache["cacheable"] or cache["hit"] != (phase == "hit"):
+                    raise ValueError("incorrect paired cache classification")
+            elif cache is not None:
+                raise ValueError("unexpected cache result")
+        coverage[(size, mode, scope, kind)] += 1
+    expected_coverage = {
+        (size, mode, scope, kind): min(meta["topics"], size)
+        for size, mode in matrix
+        for scope in ("unfiltered", "directory", "file")
+        for kind in ("concept", "identifier")
+    }
+    if coverage != expected_coverage:
+        raise ValueError("incomplete paired query coverage")
+
+    print("| Chunks | Index operation | Seconds | Peak RSS MiB | Index MiB |")
+    print("| ---: | --- | ---: | ---: | ---: |")
+    for size, row in sorted(indexes.items()):
+        print(f"| {size} | {row['operation']} | {row['seconds']:.3f} | "
+              f"{row['peak_rss_kib']/1024:.1f} | {row['database_bytes']/1024**2:.1f} |")
+    print()
+    print("| Chunks | Mode | Socket ready ms | Cold first query ms | Model load ms | Resident peak RSS MiB |")
+    print("| ---: | --- | ---: | ---: | ---: | ---: |")
+    for (size, mode), row in sorted(primers.items()):
+        load_ns = row["stages_ns"].get("model_load")
+        load_ms = "—" if load_ns is None else f"{load_ns/1e6:.2f}"
+        print(f"| {size} | {mode} | {row['startup_to_socket_seconds']*1000:.2f} | "
+              f"{row['seconds']*1000:.2f} | {load_ms} | {servers[(size, mode)]['peak_rss_kib']/1024:.1f} |")
+        stages[(size, mode, "cold-server")].append(row)
+    print_latencies(latencies)
+    print_stages(stages)
 
 
 def main():

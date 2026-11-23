@@ -57,6 +57,22 @@ struct Section {
     headings: Vec<String>,
 }
 
+pub(crate) fn offline_token_offsets(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start == text.len() {
+            return None;
+        }
+        let mut end = (start + 4).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let span = (start, end);
+        start = end;
+        Some(span)
+    })
+}
+
 pub(crate) fn layout(
     text: &str,
     markdown: bool,
@@ -316,6 +332,16 @@ fn mark_breaks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_tokens_stay_on_utf8_boundaries() {
+        assert_eq!(offline_token_offsets("").count(), 0);
+        let text = "abcé🌱世界d";
+        let groups: Vec<&str> = offline_token_offsets(text)
+            .map(|(start, end)| &text[start..end])
+            .collect();
+        assert_eq!(groups, ["abc", "é", "🌱", "世", "界d"]);
+    }
     use crate::vectors::Model;
 
     struct Fake;

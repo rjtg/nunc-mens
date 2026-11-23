@@ -83,6 +83,17 @@ enum Action {
     },
     /// Compare two Markdown memories. Exit 1 if they differ.
     Diff { old: Uuid, new: Uuid },
+    /// List short active memories for manual review.
+    Short {
+        /// Maximum estimated body tokens, inclusive.
+        #[arg(long, default_value_t = crate::short::DEFAULT_MAX_TOKENS)]
+        max_tokens: usize,
+        #[arg(long)]
+        json: bool,
+        /// Print one memory ID per line.
+        #[arg(long, conflicts_with = "json")]
+        ids: bool,
+    },
     /// Refresh the semantic index from Markdown and registered sources.
     Reindex {
         /// Build a fresh database and publish it after successful inference.
@@ -506,6 +517,26 @@ fn execute(action: Action, argv: &[OsString]) -> Result<ExitCode> {
         Action::Diff { old, new } => {
             let different = crate::diff::compare(&repo, old, new, &mut io::stdout().lock())?;
             return Ok(ExitCode::from(u8::from(different)));
+        }
+        Action::Short {
+            max_tokens,
+            json,
+            ids,
+        } => {
+            let hits = crate::short::find(&repo, max_tokens)?;
+            let mut out = io::stdout().lock();
+            if json {
+                serde_json::to_writer(&mut out, &hits)?;
+                writeln!(out)?;
+            } else {
+                for hit in hits {
+                    if ids {
+                        writeln!(out, "{}", hit.id)?;
+                    } else {
+                        writeln!(out, "{}  ~{} tokens  {}", hit.id, hit.tokens, hit.preview)?;
+                    }
+                }
+            }
         }
         Action::Search(args) => {
             let mut out = io::stdout().lock();

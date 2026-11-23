@@ -9,6 +9,7 @@
 | `nunc write TEXT...` or `nunc write --stdin` | Queues capture via a live FIFO or saves directly when the server is unavailable. |
 | `nunc serve [--boundary TOKEN] [--search-socket] [--source PATH]...` | Runs the foreground FIFO and refreshes the index from local files. |
 | `nunc duplicates [ID] [--threshold N] [--limit N] [--exact] [--raw] [--json\|--forget-ids]` | Reviews duplicate groups or emits verified cleanup candidates. |
+| `nunc short [--max-tokens N] [--json\|--ids]` | Lists short active memories for manual review. |
 | `nunc diff OLD NEW` | Compares the original Markdown bodies of two selected memories. |
 | `nunc git ingest\|import\|sync\|hook` | Captures selected commit history or manages the post-commit hook. |
 | `nunc consolidate candidates\|apply\|undo` | Retrieves full candidate entries, commits an external summary, or undoes an archive. |
@@ -235,6 +236,20 @@ nunc duplicates --exact --forget-ids | xargs -r nunc forget --dry-run
 Cleanup candidates require an active ordinary journal entry with a body byte-identical to the active ordinary reference. References, source files, Git records, archived entries, and entries referenced by a consolidation are excluded from suggestions. The IDs output requires `--exact` and emits only UUIDs, one per line, with no output when none qualify. Read the preview before issuing an explicit forget. Even byte-identical bodies can have different capture metadata, and forgetting still uses its own dependency checks and confirmation.
 
 `nunc write --check-duplicates [--threshold N]` reports candidates on stderr before normal capture. Capture continues if the model or index is unavailable. Neither duplicate command suppresses entries. Semantic all-pairs comparisons scale quadratically with indexed chunks.
+
+### Short memory review
+
+```sh
+nunc short
+nunc short --max-tokens 100 --json
+nunc short --ids | xargs -r nunc forget --dry-run
+nunc search --similar-to "$memory_id"
+nunc consolidate candidates "related subject" --json
+```
+
+`short` reads whole durable memory bodies. Registered source files, archived memories, and forgotten memories are excluded. The inclusive threshold defaults to 50. Zero is valid and returns no hits because the entry format requires nonblank text. The estimate counts the same UTF-8 groups of up to four bytes used by offline structural indexing. Heading markers, list markers, code fences, and whitespace in the body count. Front matter is excluded. Review uses the same count with or without a model cache.
+
+Rows are ordered by estimated token count, then UUID. JSON returns an array with `id`, `tokens`, `preview`, and repository-relative `path`. Text and JSON previews fold whitespace and display up to 100 characters plus a truncation marker. `--ids` emits one UUID per line and conflicts with `--json`. Use the full Markdown to decide whether to retain, consolidate, or explicitly forget a memory.
 
 ## Git history
 

@@ -51,6 +51,7 @@ Version 0.2.0 adds semantic retrieval of Markdown chunks with section and parent
 nunc search --context section --explain "Why did authentication fail?"
 nunc duplicates --json
 nunc duplicates --exact --forget-ids | xargs -r nunc forget --dry-run
+nunc short --max-tokens 50
 nunc diff "$old_id" "$new_id"
 nunc git import --all --dry-run
 nunc git import --limit 100
@@ -58,6 +59,8 @@ nunc consolidate candidates "deploy clock synchronization" --json
 ```
 
 Use `consolidate apply` to save a summary you provide and archive its originals. Use `archive` and `unarchive` to change retrieval visibility while preserving original Markdown. Use `search --raw` to inspect archived history. `forget --dry-run` shows dependencies before an explicit deletion. To back up these relationships, retain both your Markdown entries and `.nunc/ledger.json`. [CLI reference](docs/CLI.md)
+
+`nunc short` lists short active memories for review using a model-free estimate of the whole Markdown body.
 
 If the disposable index is out of sync, run `nunc doctor --deep` or preview repair with `nunc repair --dry-run`.
 

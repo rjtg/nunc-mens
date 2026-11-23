@@ -17,6 +17,54 @@ struct Fixture {
     cache: PathBuf,
 }
 
+#[test]
+fn short_filters_whole_active_memories_and_emits_stable_ids() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let smallest = fixture.log_id("🌱")?;
+    let markdown = "# H\n\n- ü\n\n```\nx\n```";
+    let first = fixture.log_id(markdown)?;
+    let second = fixture.log_id(markdown)?;
+    let archived = fixture.log_id("old")?;
+    let forgotten = fixture.log_id("gone")?;
+    fixture.log_id(&format!("# H\n\n{}", "a much longer memory ".repeat(100)))?;
+    fs::write(fixture.repo.join("external.md"), "source")?;
+    fixture.run(&["init", "--source", "external.md"])?;
+    fixture.run(&["archive", &archived])?;
+    fixture.run(&["forget", &forgotten, "--yes"])?;
+    let mut tied = [first, second];
+    tied.sort();
+    let result = fixture.json(&["short", "--max-tokens", "6", "--json"])?;
+    let hits = result.as_array().context("expected short memory array")?;
+    assert_eq!(hits.len(), 3);
+    assert_eq!(hits[0]["id"], smallest);
+    assert_eq!(hits[0]["tokens"], 1);
+    assert_eq!(hits[0]["path"], format!(".nunc/entries/{smallest}.md"));
+    assert_eq!(hits[1]["id"], tied[0]);
+    assert_eq!(hits[2]["id"], tied[1]);
+    assert_eq!(hits[1]["tokens"], 6);
+    assert_eq!(hits[1]["preview"], "# H - ü ``` x ```");
+    let ids = fixture.run(&["short", "--ids"])?;
+    assert_eq!(
+        String::from_utf8(ids.stdout)?,
+        format!("{smallest}\n{}\n{}\n", tied[0], tied[1])
+    );
+    assert!(
+        fixture
+            .run(&["short", "--max-tokens", "0", "--ids"])?
+            .stdout
+            .is_empty()
+    );
+    for args in [
+        &["short", "--ids", "--json"][..],
+        &["short", "--max-tokens=-1"],
+        &["log", " "],
+    ] {
+        assert!(!fixture.nunc(args).output()?.status.success());
+    }
+    assert!(!fixture.cache.exists());
+    Ok(())
+}
+
 impl Fixture {
     fn new() -> Result<Self> {
         let dir = tempfile::tempdir()?;

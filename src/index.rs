@@ -400,18 +400,7 @@ impl Embedder for KeywordLayout {
     }
 
     fn token_offsets(&self, text: &str) -> Result<Vec<(usize, usize)>> {
-        let mut start = 0;
-        let mut offsets = Vec::new();
-        for (at, value) in text.char_indices() {
-            if at + value.len_utf8() - start > 4 {
-                offsets.push((start, at));
-                start = at;
-            }
-        }
-        if start < text.len() {
-            offsets.push((start, text.len()));
-        }
-        Ok(offsets)
+        Ok(chunk::offline_token_offsets(text).collect())
     }
 }
 
